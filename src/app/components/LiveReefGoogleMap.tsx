@@ -332,7 +332,7 @@ function StationSelectionPanel({ station, onClose }: { station: ReefStation; onC
   );
 }
 
-export function LiveReefGoogleMap({ onReefSelect }: LiveReefGoogleMapProps) {
+export function LiveReefGoogleMap({ onReefSelect: _onReefSelect }: LiveReefGoogleMapProps) {
   const apiKey = import.meta.env.VITE_GOOGLE_MAPS_API_KEY;
   const [reefs, setReefs] = useState<LiveReef[]>([]);
   const [stations, setStations] = useState<ReefStation[]>([]);
@@ -466,21 +466,6 @@ export function LiveReefGoogleMap({ onReefSelect }: LiveReefGoogleMapProps) {
               onClick={() => {
                 setSelectedReef(reef);
                 setSelectedStation(null);
-                onReefSelect({
-                  id: reef.id,
-                  name: reef.name,
-                  lat: reef.lat,
-                  lng: reef.lng,
-                  risk: reef.status,
-                  temperature: reef.seaSurfaceTemp,
-                  bleachingRisk: reef.riskScore,
-                  tempAnomaly: reef.tempAnomaly,
-                  degreeHeatingWeeks: reef.degreeHeatingWeeks,
-                  bleachingAlertLevel: reef.bleachingAlertLevel,
-                  source: reef.source,
-                  lastUpdated: reef.lastUpdated,
-                  error: reef.error,
-                });
               }}
             />
           ))}
