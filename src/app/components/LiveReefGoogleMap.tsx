@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { APIProvider, Map as GoogleMap, Marker } from '@vis.gl/react-google-maps';
 import { motion } from 'motion/react';
 import { AlertTriangle, Clock, Database, Droplet, MapPin, Radio, ThermometerSun, X } from 'lucide-react';
-import { fetchLiveReefs, type LiveReef } from '../services/reefApi';
+import { fetchLiveReefs, fetchReefStations, type LiveReef, type ReefStation } from '../services/reefApi';
 
 interface LiveReefGoogleMapProps {
   onReefSelect: (reef: {
@@ -11,8 +11,14 @@ interface LiveReefGoogleMapProps {
     lat: number;
     lng: number;
     risk: 'safe' | 'warning' | 'critical';
-    temperature: number;
+    temperature: number | null;
     bleachingRisk: number;
+    tempAnomaly?: number | null;
+    degreeHeatingWeeks?: number | null;
+    bleachingAlertLevel?: string;
+    source?: string;
+    lastUpdated?: string;
+    error?: string;
   }) => void;
 }
 
@@ -77,6 +83,21 @@ const createMarkerIcon = (status: LiveReef['status'] | 'fallback', selected: boo
   return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
 };
 
+const createStationIcon = (selected: boolean) => {
+  const size = selected ? 22 : 14;
+  const radius = selected ? 4 : 2.8;
+  const opacity = selected ? 0.9 : 0.48;
+  const svg = `
+    <svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" xmlns="http://www.w3.org/2000/svg">
+      <circle cx="${size / 2}" cy="${size / 2}" r="${radius + 3}" fill="#6fb7bf" opacity="0.12"/>
+      <circle cx="${size / 2}" cy="${size / 2}" r="${radius}" fill="#8fcfd6" opacity="${opacity}"/>
+      <circle cx="${size / 2}" cy="${size / 2}" r="${radius}" fill="none" stroke="#d7fbff" stroke-width="0.7" opacity="0.35"/>
+    </svg>
+  `;
+
+  return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
+};
+
 function ApiKeyFallback() {
   return (
     <div className="relative h-full w-full overflow-hidden bg-gradient-to-br from-ocean-deep via-ocean-dark to-blue-deep/70">
@@ -90,12 +111,12 @@ function ApiKeyFallback() {
           </p>
         </div>
       </div>
-      <MapOverlays reefCount={0} />
+      <MapOverlays activeCount={0} stationCount={0} />
     </div>
   );
 }
 
-function MapOverlays({ reefCount }: { reefCount: number }) {
+function MapOverlays({ activeCount, stationCount }: { activeCount: number; stationCount: number }) {
   const [timeRange, setTimeRange] = useState(100);
 
   return (
@@ -108,19 +129,19 @@ function MapOverlays({ reefCount }: { reefCount: number }) {
         <h4 className="mb-4 text-xs uppercase tracking-wider text-gray-muted">Risk Level</h4>
         <div className="space-y-3">
           <div className="flex items-center gap-3">
-            <div className="h-2.5 w-2.5 rounded-full bg-coral-safe" style={{ boxShadow: '0 0 10px rgba(0, 217, 163, 0.6)' }} />
+            <div className="h-3 w-3 rounded-full border border-white/35 bg-[#20f7c2]" style={{ boxShadow: '0 0 14px rgba(32, 247, 194, 0.95), 0 0 4px rgba(255,255,255,0.45)' }} />
             <span className="text-sm text-gray-light">Safe</span>
           </div>
           <div className="flex items-center gap-3">
-            <div className="h-2.5 w-2.5 rounded-full bg-coral-warning" style={{ boxShadow: '0 0 10px rgba(255, 136, 0, 0.6)' }} />
+            <div className="h-3 w-3 rounded-full border border-white/35 bg-[#ffb020]" style={{ boxShadow: '0 0 14px rgba(255, 176, 32, 0.95), 0 0 4px rgba(255,255,255,0.45)' }} />
             <span className="text-sm text-gray-light">Warning</span>
           </div>
           <div className="flex items-center gap-3">
-            <div className="h-2.5 w-2.5 rounded-full bg-coral-critical" style={{ boxShadow: '0 0 10px rgba(255, 71, 87, 0.6)' }} />
+            <div className="h-3 w-3 rounded-full border border-white/35 bg-[#ff5f6f]" style={{ boxShadow: '0 0 14px rgba(255, 95, 111, 0.95), 0 0 4px rgba(255,255,255,0.45)' }} />
             <span className="text-sm text-gray-light">Critical</span>
           </div>
           <div className="flex items-center gap-3">
-            <div className="h-2.5 w-2.5 rounded-full bg-gray-muted" style={{ boxShadow: '0 0 10px rgba(127, 149, 161, 0.45)' }} />
+            <div className="h-3 w-3 rounded-full border border-white/35 bg-[#b7c4cc]" style={{ boxShadow: '0 0 14px rgba(183, 196, 204, 0.8), 0 0 4px rgba(255,255,255,0.45)' }} />
             <span className="text-sm text-gray-light">Fallback</span>
           </div>
         </div>
@@ -158,7 +179,7 @@ function MapOverlays({ reefCount }: { reefCount: number }) {
         className="reef-panel-strong absolute bottom-8 left-1/2 z-10 flex -translate-x-1/2 items-center gap-3 rounded-full border border-cyan-glow/35 bg-ocean-dark/78 px-5 py-3 text-sm text-gray-light shadow-2xl backdrop-blur-2xl"
       >
         <Radio className="h-4 w-4 text-cyan-glow" />
-        <span><span className="text-white">{reefCount}</span> reef sites monitored</span>
+        <span><span className="text-white">{stationCount}</span> NOAA stations tracked · <span className="text-white">{activeCount}</span> under active AI monitoring</span>
       </motion.div>
     </>
   );
@@ -267,12 +288,60 @@ function ReefSelectionPanel({ reef, onClose }: { reef: LiveReef; onClose: () => 
   );
 }
 
+function StationSelectionPanel({ station, onClose }: { station: ReefStation; onClose: () => void }) {
+  return (
+    <motion.div
+      initial={{ opacity: 0, x: 32 }}
+      animate={{ opacity: 1, x: 0 }}
+      exit={{ opacity: 0, x: 32 }}
+      className="reef-panel-strong absolute right-6 top-6 z-10 w-[360px] rounded-2xl border border-gray-border/70 bg-ocean-dark/88 p-6 shadow-2xl backdrop-blur-2xl"
+    >
+      <div className="mb-5 flex items-start justify-between gap-4">
+        <div>
+          <h3 className="mb-2 text-2xl text-white">{station.name}</h3>
+          <div className="flex items-center gap-2 text-sm text-gray-light">
+            <MapPin className="h-4 w-4 text-cyan-glow" />
+            <span>{station.lat.toFixed(4)}, {station.lng.toFixed(4)}</span>
+          </div>
+        </div>
+        <button
+          onClick={onClose}
+          className="rounded-lg border border-gray-border/70 bg-ocean-medium/60 p-2 text-gray-light transition-colors hover:border-cyan-glow/50 hover:text-white"
+          aria-label="Close station details"
+        >
+          <X className="h-4 w-4" />
+        </button>
+      </div>
+
+      <div className="mb-5 flex flex-wrap gap-3">
+        <span className="rounded-lg border border-cyan-glow/30 bg-cyan-glow/10 px-3 py-1 text-xs text-cyan-glow">
+          NOAA Virtual Station
+        </span>
+        <span className="rounded-lg border border-gray-border/70 bg-ocean-medium/45 px-3 py-1 text-xs text-gray-light">
+          {station.source}
+        </span>
+      </div>
+
+      <button
+        type="button"
+        className="reef-panel-strong w-full rounded-xl border border-cyan-glow/40 bg-cyan-glow/12 px-5 py-3 text-sm text-cyan-glow transition-colors hover:border-cyan-glow/65 hover:bg-cyan-glow/18"
+      >
+        Request Full Analysis
+      </button>
+    </motion.div>
+  );
+}
+
 export function LiveReefGoogleMap({ onReefSelect }: LiveReefGoogleMapProps) {
   const apiKey = import.meta.env.VITE_GOOGLE_MAPS_API_KEY;
   const [reefs, setReefs] = useState<LiveReef[]>([]);
+  const [stations, setStations] = useState<ReefStation[]>([]);
   const [selectedReef, setSelectedReef] = useState<LiveReef | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
-  const [mapError, setMapError] = useState<string | null>(null);
+  const [selectedStation, setSelectedStation] = useState<ReefStation | null>(null);
+  const [isLoadingReefs, setIsLoadingReefs] = useState(true);
+  const [isLoadingStations, setIsLoadingStations] = useState(true);
+  const [reefError, setReefError] = useState<string | null>(null);
+  const [stationError, setStationError] = useState<string | null>(null);
 
   useEffect(() => {
     let isMounted = true;
@@ -283,20 +352,49 @@ export function LiveReefGoogleMap({ onReefSelect }: LiveReefGoogleMapProps) {
 
         if (isMounted) {
           setReefs(liveReefs);
-          setMapError(null);
+          setReefError(null);
         }
       } catch (error) {
         if (isMounted) {
-          setMapError('Live reef map data is unavailable. Start the local backend on port 4000 to reconnect.');
+          setReefError('Active reef data is unavailable. Start the local backend on port 4000 to reconnect.');
         }
       } finally {
         if (isMounted) {
-          setIsLoading(false);
+          setIsLoadingReefs(false);
         }
       }
     }
 
     loadReefs();
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    async function loadStations() {
+      try {
+        const stationList = await fetchReefStations();
+
+        if (isMounted) {
+          setStations(stationList);
+          setStationError(null);
+        }
+      } catch (error) {
+        if (isMounted) {
+          setStationError('NOAA station layer is unavailable. Active reefs can still be monitored.');
+        }
+      } finally {
+        if (isMounted) {
+          setIsLoadingStations(false);
+        }
+      }
+    }
+
+    loadStations();
 
     return () => {
       isMounted = false;
@@ -311,6 +409,15 @@ export function LiveReefGoogleMap({ onReefSelect }: LiveReefGoogleMapProps) {
       ]),
     );
   }, [reefs, selectedReef?.id]);
+
+  const stationIcons = useMemo(() => {
+    return new Map<string, string>(
+      stations.map((station) => [
+        station.id,
+        createStationIcon(selectedStation?.id === station.id),
+      ]),
+    );
+  }, [stations, selectedStation?.id]);
 
   if (!apiKey) {
     return <ApiKeyFallback />;
@@ -335,6 +442,20 @@ export function LiveReefGoogleMap({ onReefSelect }: LiveReefGoogleMapProps) {
             strictBounds: false,
           }}
         >
+          {stations.map((station) => (
+            <Marker
+              key={station.id}
+              position={{ lat: station.lat, lng: station.lng }}
+              title={station.name}
+              icon={stationIcons.get(station.id)}
+              zIndex={selectedStation?.id === station.id ? 6 : 1}
+              onClick={() => {
+                setSelectedStation(station);
+                setSelectedReef(null);
+              }}
+            />
+          ))}
+
           {reefs.map((reef) => (
             <Marker
               key={reef.id}
@@ -344,14 +465,21 @@ export function LiveReefGoogleMap({ onReefSelect }: LiveReefGoogleMapProps) {
               zIndex={selectedReef?.id === reef.id ? 20 : 10}
               onClick={() => {
                 setSelectedReef(reef);
+                setSelectedStation(null);
                 onReefSelect({
                   id: reef.id,
                   name: reef.name,
                   lat: reef.lat,
                   lng: reef.lng,
                   risk: reef.status,
-                  temperature: reef.seaSurfaceTemp ?? 0,
+                  temperature: reef.seaSurfaceTemp,
                   bleachingRisk: reef.riskScore,
+                  tempAnomaly: reef.tempAnomaly,
+                  degreeHeatingWeeks: reef.degreeHeatingWeeks,
+                  bleachingAlertLevel: reef.bleachingAlertLevel,
+                  source: reef.source,
+                  lastUpdated: reef.lastUpdated,
+                  error: reef.error,
                 });
               }}
             />
@@ -360,14 +488,14 @@ export function LiveReefGoogleMap({ onReefSelect }: LiveReefGoogleMapProps) {
       </APIProvider>
 
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_50%,transparent_45%,rgba(3,18,28,0.42)_100%)]" />
-      {isLoading && (
+      {(isLoadingReefs || isLoadingStations) && (
         <div className="reef-panel-strong absolute left-1/2 top-8 z-10 -translate-x-1/2 rounded-full border border-cyan-glow/35 bg-ocean-dark/78 px-5 py-3 text-sm text-gray-light shadow-2xl backdrop-blur-2xl">
-          Loading live NOAA reef markers...
+          Loading NOAA map layers...
         </div>
       )}
-      {mapError && (
+      {(reefError || stationError) && (
         <div className="reef-panel-strong absolute left-1/2 top-8 z-10 max-w-md -translate-x-1/2 rounded-2xl border border-coral-warning/45 bg-ocean-dark/82 px-5 py-4 text-center text-sm text-gray-light shadow-2xl backdrop-blur-2xl">
-          {mapError}
+          {reefError || stationError}
         </div>
       )}
       {selectedReef && (
@@ -376,7 +504,13 @@ export function LiveReefGoogleMap({ onReefSelect }: LiveReefGoogleMapProps) {
           onClose={() => setSelectedReef(null)}
         />
       )}
-      <MapOverlays reefCount={reefs.length} />
+      {selectedStation && (
+        <StationSelectionPanel
+          station={selectedStation}
+          onClose={() => setSelectedStation(null)}
+        />
+      )}
+      <MapOverlays activeCount={reefs.length} stationCount={stations.length} />
     </div>
   );
 }

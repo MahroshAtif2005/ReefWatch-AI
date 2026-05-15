@@ -7,8 +7,14 @@ interface ReefData {
   lat: number;
   lng: number;
   risk: 'safe' | 'warning' | 'critical';
-  temperature: number;
+  temperature: number | null;
   bleachingRisk: number;
+  tempAnomaly?: number | null;
+  degreeHeatingWeeks?: number | null;
+  bleachingAlertLevel?: string;
+  source?: string;
+  lastUpdated?: string;
+  error?: string;
 }
 
 interface ReefDetailPanelProps {
@@ -37,10 +43,20 @@ export function ReefDetailPanel({ reef, onClose }: ReefDetailPanelProps) {
     }
   };
 
+  const formatNumber = (value: number | null | undefined, suffix = '') => {
+    if (value === null || value === undefined) return 'Unavailable';
+    return `${value}${suffix}`;
+  };
+
+  const anomalyLabel = reef.tempAnomaly === null || reef.tempAnomaly === undefined
+    ? 'Anomaly unavailable'
+    : `${reef.tempAnomaly > 0 ? '+' : ''}${reef.tempAnomaly}°C anomaly`;
+  const thermalStressLabel = reef.tempAnomaly === null || reef.tempAnomaly === undefined
+    ? 'unavailable'
+    : reef.tempAnomaly > 0 ? 'elevated' : 'normal';
+
   const mockData = {
-    degreeHeatingWeeks: reef.risk === 'critical' ? 12.4 : reef.risk === 'warning' ? 6.8 : 2.1,
     confidence: reef.risk === 'critical' ? 94.2 : reef.risk === 'warning' ? 87.5 : 91.3,
-    tempAnomaly: reef.temperature - 26.5,
     trend: reef.risk === 'critical' ? 'rising' : reef.risk === 'warning' ? 'stable' : 'falling',
     historicalComparison: 'Similar patterns observed during 2016 El Niño event',
     recommendation: reef.risk === 'critical'
@@ -97,9 +113,9 @@ export function ReefDetailPanel({ reef, onClose }: ReefDetailPanelProps) {
               <Thermometer className="w-4 h-4 text-coral-warning" />
               <span className="text-xs uppercase tracking-wider text-gray-muted">Temperature</span>
             </div>
-            <p className="text-3xl text-white mb-2">{reef.temperature}°C</p>
+            <p className="text-3xl text-white mb-2">{formatNumber(reef.temperature, '°C')}</p>
             <p className="text-sm text-coral-warning">
-              +{mockData.tempAnomaly.toFixed(1)}°C anomaly
+              {anomalyLabel}
             </p>
           </div>
 
@@ -108,7 +124,7 @@ export function ReefDetailPanel({ reef, onClose }: ReefDetailPanelProps) {
               <Activity className="w-4 h-4 text-cyan-glow" />
               <span className="text-xs uppercase tracking-wider text-gray-muted">DHW Index</span>
             </div>
-            <p className="text-3xl text-white mb-2">{mockData.degreeHeatingWeeks}</p>
+            <p className="text-3xl text-white mb-2">{formatNumber(reef.degreeHeatingWeeks)}</p>
             <p className="text-sm text-gray-muted">Heating Weeks</p>
           </div>
         </div>
@@ -164,7 +180,7 @@ export function ReefDetailPanel({ reef, onClose }: ReefDetailPanelProps) {
           </h3>
           <p className="text-base text-gray-light leading-relaxed mb-4">
             Autonomous analysis indicates {reef.risk} bleaching conditions with {mockData.confidence}% confidence.
-            Current sea surface temperature of {reef.temperature}°C shows {mockData.tempAnomaly > 0 ? 'elevated' : 'normal'} thermal stress.
+            Current sea surface temperature of {formatNumber(reef.temperature, '°C')} shows {thermalStressLabel} thermal stress.
           </p>
           <p className="text-sm text-gray-muted italic">
             {mockData.historicalComparison}

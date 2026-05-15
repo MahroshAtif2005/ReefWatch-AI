@@ -35,6 +35,12 @@ const toNavigationReef = (reef: LiveReef) => ({
   lng: reef.lng,
   risk: reef.riskScore,
   temp: reef.seaSurfaceTemp,
+  tempAnomaly: reef.tempAnomaly,
+  degreeHeatingWeeks: reef.degreeHeatingWeeks,
+  bleachingAlertLevel: reef.bleachingAlertLevel,
+  source: reef.source,
+  lastUpdated: reef.lastUpdated,
+  error: reef.error,
 });
 
 export function DashboardOverview({ onNavigate }: DashboardOverviewProps) {

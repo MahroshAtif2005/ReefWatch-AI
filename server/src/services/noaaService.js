@@ -18,9 +18,11 @@ const NOAA_SOURCE_LABEL = 'NOAA Coral Reef Watch 5km ERDDAP NOAA_DHW';
 
 const noaaClient = axios.create({
   baseURL: NOAA_ERDDAP_BASE_URL,
-  timeout: 20000,
+  timeout: 35000,
   maxRedirects: 5,
 });
+
+const NOAA_MAX_RETRIES = 2;
 
 const reefLocations = [
   {
@@ -76,8 +78,8 @@ const reefLocations = [
     name: 'Coral Triangle',
     region: 'Southeast Asia',
     country: 'Indonesia',
-    lat: -8.3405,
-    lng: 115.092,
+    lat: -5.1477,
+    lng: 119.4327,
   },
   {
     id: 'new-caledonia-barrier-reef',
@@ -181,7 +183,7 @@ const fallbackReef = (reef, error) => ({
 
 async function fetchReefFromNoaa(reef) {
   const query = buildLatestPointQuery(reef);
-  const response = await noaaClient.get(query);
+  const response = await getNoaaWithRetry(query, reef.id);
   const row = parseSingleRowCsv(response.data);
 
   const seaSurfaceTemp = round(toNumber(row.CRW_SST));
@@ -211,6 +213,24 @@ async function fetchReefFromNoaa(reef) {
     lastUpdated: row.time || new Date().toISOString(),
     source: NOAA_SOURCE_LABEL,
   };
+}
+
+async function getNoaaWithRetry(query, reefId) {
+  let lastError;
+
+  for (let attempt = 0; attempt <= NOAA_MAX_RETRIES; attempt += 1) {
+    try {
+      return await noaaClient.get(query);
+    } catch (error) {
+      lastError = error;
+
+      if (attempt < NOAA_MAX_RETRIES) {
+        console.warn(`[noaa] retry ${reefId} attempt ${attempt + 1}/${NOAA_MAX_RETRIES}`, error.message);
+      }
+    }
+  }
+
+  throw lastError;
 }
 
 export async function fetchReefConditions() {

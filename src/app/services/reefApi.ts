@@ -18,6 +18,16 @@ export interface LiveReef {
   error?: string;
 }
 
+export interface ReefStation {
+  id: string;
+  name: string;
+  lat: number;
+  lng: number;
+  type: 'station';
+  status: 'station';
+  source: string;
+}
+
 const REEF_API_BASE_URL = 'http://localhost:4000';
 
 export async function fetchLiveReefs(): Promise<LiveReef[]> {
@@ -25,6 +35,16 @@ export async function fetchLiveReefs(): Promise<LiveReef[]> {
 
   if (!response.ok) {
     throw new Error(`Reef API request failed with ${response.status}`);
+  }
+
+  return response.json();
+}
+
+export async function fetchReefStations(): Promise<ReefStation[]> {
+  const response = await fetch(`${REEF_API_BASE_URL}/api/reefs/stations`);
+
+  if (!response.ok) {
+    throw new Error(`Reef station request failed with ${response.status}`);
   }
 
   return response.json();

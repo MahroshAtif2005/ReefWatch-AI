@@ -87,7 +87,7 @@ export function AnalyticsDashboard() {
         <div className="reef-panel-strong p-8 rounded-2xl bg-ocean-medium/65 border border-gray-border/70">
           <div className="flex items-center justify-between mb-8">
             <h3 className="text-base text-white">Ocean Temperature Trend</h3>
-            <span className="text-sm text-coral-warning">+3.7°C above baseline</span>
+            <span className="text-sm text-coral-warning">NOAA anomaly data in reef details</span>
           </div>
           <ResponsiveContainer width="100%" height={240}>
             <LineChart data={temperatureData}>

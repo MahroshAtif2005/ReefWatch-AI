@@ -17,8 +17,14 @@ interface ReefData {
   lat: number;
   lng: number;
   risk: 'safe' | 'warning' | 'critical';
-  temperature: number;
+  temperature: number | null;
   bleachingRisk: number;
+  tempAnomaly?: number | null;
+  degreeHeatingWeeks?: number | null;
+  bleachingAlertLevel?: string;
+  source?: string;
+  lastUpdated?: string;
+  error?: string;
 }
 
 export default function App() {
@@ -32,9 +38,15 @@ export default function App() {
         ...reef,
         lat: reef.lat || 0,
         lng: reef.lng || 0,
-        temperature: reef.temp || 0,
+        temperature: reef.temp ?? null,
         bleachingRisk: reef.risk || 0,
         risk: reef.risk > 70 ? 'critical' : reef.risk > 30 ? 'warning' : 'safe',
+        tempAnomaly: reef.tempAnomaly,
+        degreeHeatingWeeks: reef.degreeHeatingWeeks,
+        bleachingAlertLevel: reef.bleachingAlertLevel,
+        source: reef.source,
+        lastUpdated: reef.lastUpdated,
+        error: reef.error,
       });
     }
   };
