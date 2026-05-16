@@ -7,9 +7,12 @@ import { LiveAgentFeed } from './components/LiveAgentFeed';
 import { ReefDetailPanel } from './components/ReefDetailPanel';
 import { AnalyticsDashboard } from './components/AnalyticsDashboard';
 import { ArizeMonitoring } from './components/ArizeMonitoring';
+import { ConservationReports } from './components/ConservationReports';
 import { LiveActivityTicker } from './components/LiveActivityTicker';
 import { DashboardOverview } from './components/DashboardOverview';
 import { CoralBackground } from './components/CoralBackground';
+import { ResearcherWorkspace } from './components/ResearcherWorkspace';
+import { Settings } from './components/Settings';
 
 interface ReefData {
   id: string;
@@ -122,11 +125,26 @@ export default function App() {
             </div>
           )}
 
-          {(activeView === 'reports' || activeView === 'workspace' || activeView === 'settings') && (
-            <div className="h-full flex items-center justify-center">
-              <div className="text-center">
-                <h2 className="text-2xl text-white mb-2 capitalize">{activeView}</h2>
-                <p className="text-gray-muted">Coming soon...</p>
+          {activeView === 'reports' && (
+            <div className="h-full overflow-auto p-8">
+              <div className="max-w-7xl mx-auto">
+                <ConservationReports />
+              </div>
+            </div>
+          )}
+
+          {activeView === 'workspace' && (
+            <div className="h-full overflow-auto p-8">
+              <div className="max-w-7xl mx-auto">
+                <ResearcherWorkspace />
+              </div>
+            </div>
+          )}
+
+          {activeView === 'settings' && (
+            <div className="h-full overflow-auto p-8">
+              <div className="max-w-7xl mx-auto">
+                <Settings />
               </div>
             </div>
           )}

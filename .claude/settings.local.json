@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c ' *)",
+      "Bash(/opt/homebrew/share/google-cloud-sdk/bin/gcloud resource-manager *)",
+      "Bash(/opt/homebrew/share/google-cloud-sdk/bin/gcloud projects *)",
+      "Bash(/opt/homebrew/share/google-cloud-sdk/bin/gcloud auth *)",
+      "Bash(curl -s -X POST https://apikeys.googleapis.com/v2/projects/gen-lang-client-0582837750/locations/global/keys -H 'Authorization: Bearer __TRACKED_VAR__' -H 'Content-Type: application/json' -d '{ *)"
+    ]
+  }
+}

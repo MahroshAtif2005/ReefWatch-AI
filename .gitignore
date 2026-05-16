@@ -6,3 +6,24 @@ server/node_modules
 
 dist
 dist
+
+.env
+
+.env.*
+
+ai-service/.env
+
+ai-service/.env.*
+
+server/.env
+
+server/.env.*
+
+dist
+
+node_modules
+
+server/node_modules
+
+ai-service/.venv
+

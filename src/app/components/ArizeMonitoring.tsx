@@ -1,21 +1,68 @@
+import { useEffect, useMemo, useState } from 'react';
 import { Brain, CheckCircle, AlertTriangle, Activity, TrendingUp } from 'lucide-react';
 import { motion } from 'motion/react';
+import { fetchArizeStatus, fetchArizeTraces, type ArizeStatus, type ArizeTrace } from '../services/reefApi';
 
 export function ArizeMonitoring() {
+  const [status, setStatus] = useState<ArizeStatus | null>(null);
+  const [traces, setTraces] = useState<ArizeTrace[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    async function loadArizeData() {
+      try {
+        const [statusResult, traceResult] = await Promise.all([
+          fetchArizeStatus(),
+          fetchArizeTraces(),
+        ]);
+
+        if (isMounted) {
+          setStatus(statusResult);
+          setTraces(traceResult);
+          setError(null);
+        }
+      } catch (requestError) {
+        if (isMounted) {
+          setError('Arize monitoring data is unavailable. Start the local backend to reconnect.');
+        }
+      }
+    }
+
+    loadArizeData();
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  const averageConfidence = useMemo(() => {
+    const confidenceValues = traces
+      .map((trace) => trace.aiConfidence)
+      .filter((value): value is number => typeof value === 'number');
+
+    if (confidenceValues.length === 0) return null;
+
+    return confidenceValues.reduce((sum, value) => sum + value, 0) / confidenceValues.length;
+  }, [traces]);
+
+  const lastTraceTime = status?.lastTraceTime
+    ? new Date(status.lastTraceTime).toLocaleTimeString()
+    : 'None yet';
+
   const metrics = [
-    { label: 'Model Accuracy', value: '94.2%', status: 'excellent', trend: '+2.1%' },
-    { label: 'Prediction Confidence', value: '91.8%', status: 'good', trend: '+0.8%' },
-    { label: 'Hallucination Risk', value: '2.3%', status: 'excellent', trend: '-0.4%' },
-    { label: 'Response Latency', value: '287ms', status: 'good', trend: '-12ms' },
+    { label: 'Arize Status', value: status?.configured ? 'Configured' : 'Local Only', status: status?.configured ? 'excellent' : 'good', trend: status?.projectName || 'ReefWatch AI' },
+    { label: 'Trace Count', value: `${status?.localTraceCount ?? 0}`, status: 'good', trend: 'Local traces' },
+    { label: 'Avg Confidence', value: averageConfidence === null ? 'N/A' : `${averageConfidence.toFixed(1)}%`, status: 'good', trend: 'NOAA rules' },
+    { label: 'Last Trace', value: lastTraceTime, status: 'good', trend: status?.configured ? 'Arize ready' : 'Stored locally' },
   ];
 
-  const traces = [
-    { id: 1, reef: 'Great Barrier Reef', confidence: 94.2, result: 'warning', time: '14:32:18' },
-    { id: 2, reef: 'Raja Ampat', confidence: 89.1, result: 'critical', time: '14:31:45' },
-    { id: 3, reef: 'Maldives Cluster', confidence: 96.5, result: 'safe', time: '14:30:22' },
-    { id: 4, reef: 'Caribbean Coral', confidence: 91.3, result: 'critical', time: '14:29:58' },
-    { id: 5, reef: 'Red Sea Reefs', confidence: 93.7, result: 'safe', time: '14:28:41' },
-  ];
+  const formatTraceTime = (timestamp: string) => {
+    const parsed = new Date(timestamp);
+    if (Number.isNaN(parsed.getTime())) return timestamp;
+    return parsed.toLocaleTimeString();
+  };
 
   return (
     <div className="space-y-8">
@@ -23,13 +70,25 @@ export function ArizeMonitoring() {
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-4xl text-white mb-2">AI Observability</h2>
-          <p className="text-base text-gray-muted">Powered by Arize Phoenix</p>
+          <p className="text-base text-gray-muted">{status?.message || 'Loading observability status...'}</p>
         </div>
-        <div className="flex items-center gap-3 px-5 py-3 rounded-xl bg-coral-safe/10 border border-coral-safe/30">
-          <CheckCircle className="w-5 h-5 text-coral-safe" />
-          <span className="text-sm text-coral-safe">System Healthy</span>
+        <div className={`flex items-center gap-3 px-5 py-3 rounded-xl ${status?.configured ? 'bg-coral-safe/10 border border-coral-safe/30' : 'bg-coral-warning/10 border border-coral-warning/30'}`}>
+          {status?.configured ? (
+            <CheckCircle className="w-5 h-5 text-coral-safe" />
+          ) : (
+            <AlertTriangle className="w-5 h-5 text-coral-warning" />
+          )}
+          <span className={`text-sm ${status?.configured ? 'text-coral-safe' : 'text-coral-warning'}`}>
+            {status?.configured ? 'Arize Configured' : 'Arize Not Configured'}
+          </span>
         </div>
       </div>
+
+      {error && (
+        <div className="reef-panel-soft p-4 rounded-xl bg-ocean-medium/45 border border-coral-warning/40 text-sm text-coral-warning">
+          {error}
+        </div>
+      )}
 
       {/* Key Metrics - More Spacious */}
       <div className="grid grid-cols-4 gap-6">
@@ -51,7 +110,7 @@ export function ArizeMonitoring() {
             </div>
             <p className="text-3xl text-white mb-2">{metric.value}</p>
             <div className="flex items-center gap-1.5 text-sm">
-              <TrendingUp className={`w-4 h-4 ${metric.trend.startsWith('+') || metric.trend.startsWith('-') ? 'text-coral-safe' : 'text-gray-muted'}`} />
+              <TrendingUp className="w-4 h-4 text-coral-safe" />
               <span className="text-gray-light">{metric.trend}</span>
             </div>
           </motion.div>
@@ -66,33 +125,41 @@ export function ArizeMonitoring() {
         </div>
 
         <div className="space-y-3">
+          {traces.length === 0 && (
+            <div className="reef-panel-soft p-5 rounded-xl bg-ocean-dark/45 border border-gray-border/70 text-sm text-gray-light">
+              No reef assessment traces have been logged yet. Refresh live NOAA reef data to populate local observability.
+            </div>
+          )}
+
           {traces.map((trace) => (
             <div
-              key={trace.id}
+              key={trace.traceId}
               className="reef-panel-soft p-5 rounded-xl bg-ocean-dark/45 border border-gray-border/70 hover:border-cyan-glow/40 transition-all"
             >
               <div className="flex items-center justify-between">
                 <div className="flex-1">
                   <div className="flex items-center gap-3 mb-2">
-                    <span className="text-base text-white">{trace.reef}</span>
+                    <span className="text-base text-white">{trace.reefName}</span>
                     <span className={`px-3 py-1 rounded-lg text-xs ${
-                      trace.result === 'critical' ? 'bg-coral-critical/10 text-coral-critical border border-coral-critical/30' :
-                      trace.result === 'warning' ? 'bg-coral-warning/10 text-coral-warning border border-coral-warning/30' :
+                      trace.status === 'critical' ? 'bg-coral-critical/10 text-coral-critical border border-coral-critical/30' :
+                      trace.status === 'warning' ? 'bg-coral-warning/10 text-coral-warning border border-coral-warning/30' :
                       'bg-coral-safe/10 text-coral-safe border border-coral-safe/30'
                     }`}>
-                      {trace.result}
+                      {trace.status}
                     </span>
                   </div>
                   <div className="flex items-center gap-4">
-                    <span className="text-sm text-gray-muted">Confidence: {trace.confidence}%</span>
-                    <span className="text-sm text-gray-muted">{trace.time}</span>
+                    <span className="text-sm text-gray-muted">Confidence: {trace.aiConfidence ?? 'N/A'}%</span>
+                    <span className="text-sm text-gray-muted">Risk: {trace.aiRiskScore ?? 'N/A'}%</span>
+                    <span className="text-sm text-gray-muted">{trace.modelName}</span>
+                    <span className="text-sm text-gray-muted">{formatTraceTime(trace.timestamp)}</span>
                   </div>
                 </div>
                 <div className="w-32">
                   <div className="h-2 bg-ocean-deep rounded-full overflow-hidden">
                     <div
                       className="h-full bg-gradient-to-r from-cyan-bright to-cyan-glow rounded-full"
-                      style={{ width: `${trace.confidence}%` }}
+                      style={{ width: `${trace.aiConfidence ?? 0}%` }}
                     />
                   </div>
                 </div>
@@ -110,28 +177,28 @@ export function ArizeMonitoring() {
             <div>
               <div className="flex justify-between text-sm mb-2">
                 <span className="text-gray-muted">Precision</span>
-                <span className="text-white">93.7%</span>
+                <span className="text-white">{averageConfidence === null ? 'N/A' : `${averageConfidence.toFixed(1)}%`}</span>
               </div>
               <div className="h-2 bg-ocean-deep rounded-full overflow-hidden">
-                <div className="h-full bg-cyan-glow rounded-full" style={{ width: '93.7%' }} />
+                <div className="h-full bg-cyan-glow rounded-full" style={{ width: `${averageConfidence ?? 0}%` }} />
               </div>
             </div>
             <div>
               <div className="flex justify-between text-sm mb-2">
                 <span className="text-gray-muted">Recall</span>
-                <span className="text-white">91.2%</span>
+                <span className="text-white">{status?.localTraceCount ?? 0}</span>
               </div>
               <div className="h-2 bg-ocean-deep rounded-full overflow-hidden">
-                <div className="h-full bg-blue-ocean rounded-full" style={{ width: '91.2%' }} />
+                <div className="h-full bg-blue-ocean rounded-full" style={{ width: `${Math.min(100, status?.localTraceCount ?? 0)}%` }} />
               </div>
             </div>
             <div>
               <div className="flex justify-between text-sm mb-2">
                 <span className="text-gray-muted">F1 Score</span>
-                <span className="text-white">92.4%</span>
+                <span className="text-white">{status?.configured ? 'Ready' : 'Local'}</span>
               </div>
               <div className="h-2 bg-ocean-deep rounded-full overflow-hidden">
-                <div className="h-full bg-coral-safe rounded-full" style={{ width: '92.4%' }} />
+                <div className="h-full bg-coral-safe rounded-full" style={{ width: status?.configured ? '100%' : '55%' }} />
               </div>
             </div>
           </div>

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { APIProvider, Map as GoogleMap, Marker } from '@vis.gl/react-google-maps';
 import { motion } from 'motion/react';
 import { AlertTriangle, Clock, Database, Droplet, MapPin, Radio, ThermometerSun, X } from 'lucide-react';
-import { fetchLiveReefs, fetchReefStations, type LiveReef, type ReefStation } from '../services/reefApi';
+import { fetchLiveReefs, fetchReefStationReadings, fetchReefStations, type LiveReef, type ReefStation, type ReefStationReading } from '../services/reefApi';
 
 interface LiveReefGoogleMapProps {
   onReefSelect: (reef: {
@@ -83,14 +83,38 @@ const createMarkerIcon = (status: LiveReef['status'] | 'fallback', selected: boo
   return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
 };
 
-const createStationIcon = (selected: boolean) => {
+const getStationVisualStatus = (station: ReefStation | ReefStationReading) => {
+  if ('seaSurfaceTemp' in station) {
+    return station.error || station.status === 'unavailable' ? 'unavailable' : station.status;
+  }
+
+  return 'metadata';
+};
+
+const getStationColor = (status: ReefStationReading['status'] | 'metadata') => {
+  switch (status) {
+    case 'safe':
+      return '#72e6c7';
+    case 'warning':
+      return '#ffae45';
+    case 'critical':
+      return '#ff7582';
+    case 'unavailable':
+      return '#9aaab2';
+    default:
+      return '#8fcfd6';
+  }
+};
+
+const createStationIcon = (status: ReefStationReading['status'] | 'metadata', selected: boolean) => {
   const size = selected ? 22 : 14;
   const radius = selected ? 4 : 2.8;
   const opacity = selected ? 0.9 : 0.48;
+  const color = getStationColor(status);
   const svg = `
     <svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" xmlns="http://www.w3.org/2000/svg">
-      <circle cx="${size / 2}" cy="${size / 2}" r="${radius + 3}" fill="#6fb7bf" opacity="0.12"/>
-      <circle cx="${size / 2}" cy="${size / 2}" r="${radius}" fill="#8fcfd6" opacity="${opacity}"/>
+      <circle cx="${size / 2}" cy="${size / 2}" r="${radius + 3}" fill="${color}" opacity="0.12"/>
+      <circle cx="${size / 2}" cy="${size / 2}" r="${radius}" fill="${color}" opacity="${opacity}"/>
       <circle cx="${size / 2}" cy="${size / 2}" r="${radius}" fill="none" stroke="#d7fbff" stroke-width="0.7" opacity="0.35"/>
     </svg>
   `;
@@ -111,12 +135,12 @@ function ApiKeyFallback() {
           </p>
         </div>
       </div>
-      <MapOverlays activeCount={0} stationCount={0} />
+      <MapOverlays activeCount={0} readingCount={0} stationCount={0} />
     </div>
   );
 }
 
-function MapOverlays({ activeCount, stationCount }: { activeCount: number; stationCount: number }) {
+function MapOverlays({ activeCount, readingCount, stationCount }: { activeCount: number; readingCount: number; stationCount: number }) {
   const [timeRange, setTimeRange] = useState(100);
 
   return (
@@ -179,7 +203,7 @@ function MapOverlays({ activeCount, stationCount }: { activeCount: number; stati
         className="reef-panel-strong absolute bottom-8 left-1/2 z-10 flex -translate-x-1/2 items-center gap-3 rounded-full border border-cyan-glow/35 bg-ocean-dark/78 px-5 py-3 text-sm text-gray-light shadow-2xl backdrop-blur-2xl"
       >
         <Radio className="h-4 w-4 text-cyan-glow" />
-        <span><span className="text-white">{stationCount}</span> NOAA stations tracked · <span className="text-white">{activeCount}</span> under active AI monitoring</span>
+        <span><span className="text-white">{stationCount}</span> NOAA stations tracked · <span className="text-white">{readingCount}</span> stations with cached readings · <span className="text-white">{activeCount}</span> under active AI monitoring</span>
       </motion.div>
     </>
   );
@@ -288,7 +312,11 @@ function ReefSelectionPanel({ reef, onClose }: { reef: LiveReef; onClose: () => 
   );
 }
 
-function StationSelectionPanel({ station, onClose }: { station: ReefStation; onClose: () => void }) {
+function StationSelectionPanel({ station, onClose }: { station: ReefStation | ReefStationReading; onClose: () => void }) {
+  const hasReading = 'seaSurfaceTemp' in station;
+  const visualStatus = getStationVisualStatus(station);
+  const color = getStationColor(visualStatus);
+
   return (
     <motion.div
       initial={{ opacity: 0, x: 32 }}
@@ -320,14 +348,48 @@ function StationSelectionPanel({ station, onClose }: { station: ReefStation; onC
         <span className="rounded-lg border border-gray-border/70 bg-ocean-medium/45 px-3 py-1 text-xs text-gray-light">
           {station.source}
         </span>
+        {hasReading && (
+          <span className="rounded-lg border px-3 py-1 text-xs capitalize" style={{ borderColor: `${color}66`, color, backgroundColor: `${color}1a` }}>
+            {station.status}
+          </span>
+        )}
       </div>
 
-      <button
-        type="button"
-        className="reef-panel-strong w-full rounded-xl border border-cyan-glow/40 bg-cyan-glow/12 px-5 py-3 text-sm text-cyan-glow transition-colors hover:border-cyan-glow/65 hover:bg-cyan-glow/18"
-      >
-        Request Full Analysis
-      </button>
+      {hasReading ? (
+        <div className="space-y-3">
+          <div className="grid grid-cols-2 gap-3">
+            <DetailMetric label="Sea Temp" value={formatNumber(station.seaSurfaceTemp, '°C')} />
+            <DetailMetric label="SST Anomaly" value={formatNumber(station.tempAnomaly, '°C')} />
+            <DetailMetric label="DHW" value={formatNumber(station.degreeHeatingWeeks)} />
+            <DetailMetric label="Risk Score" value={`${station.riskScore}%`} />
+          </div>
+          <div className="reef-panel-soft rounded-xl border border-gray-border/70 bg-ocean-medium/45 p-4">
+            <p className="mb-1 text-xs uppercase tracking-wider text-gray-muted">Bleaching Alert</p>
+            <p className="text-lg text-white">{station.bleachingAlertLevel}</p>
+          </div>
+          <div className="reef-panel-soft rounded-xl border border-gray-border/70 bg-ocean-medium/45 p-4">
+            <p className="mb-1 text-xs uppercase tracking-wider text-gray-muted">Last Updated</p>
+            <p className="text-sm text-white">{formatDate(station.lastUpdated)}</p>
+          </div>
+          {station.error && (
+            <div className="rounded-xl border border-gray-muted/40 bg-gray-muted/10 p-4 text-sm leading-relaxed text-gray-light">
+              {station.error}
+            </div>
+          )}
+        </div>
+      ) : (
+        <>
+          <p className="mb-5 text-sm leading-relaxed text-gray-light">
+            Station metadata available. Full analysis not refreshed yet.
+          </p>
+          <button
+            type="button"
+            className="reef-panel-strong w-full rounded-xl border border-cyan-glow/40 bg-cyan-glow/12 px-5 py-3 text-sm text-cyan-glow transition-colors hover:border-cyan-glow/65 hover:bg-cyan-glow/18"
+          >
+            Request Full Analysis
+          </button>
+        </>
+      )}
     </motion.div>
   );
 }
@@ -335,9 +397,9 @@ function StationSelectionPanel({ station, onClose }: { station: ReefStation; onC
 export function LiveReefGoogleMap({ onReefSelect: _onReefSelect }: LiveReefGoogleMapProps) {
   const apiKey = import.meta.env.VITE_GOOGLE_MAPS_API_KEY;
   const [reefs, setReefs] = useState<LiveReef[]>([]);
-  const [stations, setStations] = useState<ReefStation[]>([]);
+  const [stations, setStations] = useState<Array<ReefStation | ReefStationReading>>([]);
   const [selectedReef, setSelectedReef] = useState<LiveReef | null>(null);
-  const [selectedStation, setSelectedStation] = useState<ReefStation | null>(null);
+  const [selectedStation, setSelectedStation] = useState<ReefStation | ReefStationReading | null>(null);
   const [isLoadingReefs, setIsLoadingReefs] = useState(true);
   const [isLoadingStations, setIsLoadingStations] = useState(true);
   const [reefError, setReefError] = useState<string | null>(null);
@@ -377,15 +439,29 @@ export function LiveReefGoogleMap({ onReefSelect: _onReefSelect }: LiveReefGoogl
 
     async function loadStations() {
       try {
-        const stationList = await fetchReefStations();
+        const stationReadings = await fetchReefStationReadings();
 
         if (isMounted) {
-          setStations(stationList);
+          if (stationReadings.length > 0) {
+            setStations(stationReadings);
+          } else {
+            const stationList = await fetchReefStations();
+            setStations(stationList);
+          }
           setStationError(null);
         }
       } catch (error) {
-        if (isMounted) {
-          setStationError('NOAA station layer is unavailable. Active reefs can still be monitored.');
+        try {
+          const stationList = await fetchReefStations();
+
+          if (isMounted) {
+            setStations(stationList);
+            setStationError('Cached station readings are unavailable. Showing station metadata only.');
+          }
+        } catch {
+          if (isMounted) {
+            setStationError('NOAA station layer is unavailable. Active reefs can still be monitored.');
+          }
         }
       } finally {
         if (isMounted) {
@@ -414,10 +490,12 @@ export function LiveReefGoogleMap({ onReefSelect: _onReefSelect }: LiveReefGoogl
     return new Map<string, string>(
       stations.map((station) => [
         station.id,
-        createStationIcon(selectedStation?.id === station.id),
+        createStationIcon(getStationVisualStatus(station), selectedStation?.id === station.id),
       ]),
     );
   }, [stations, selectedStation?.id]);
+
+  const readingCount = stations.filter((station) => 'seaSurfaceTemp' in station).length;
 
   if (!apiKey) {
     return <ApiKeyFallback />;
@@ -495,7 +573,7 @@ export function LiveReefGoogleMap({ onReefSelect: _onReefSelect }: LiveReefGoogl
           onClose={() => setSelectedStation(null)}
         />
       )}
-      <MapOverlays activeCount={reefs.length} stationCount={stations.length} />
+      <MapOverlays activeCount={reefs.length} readingCount={readingCount} stationCount={stations.length} />
     </div>
   );
 }

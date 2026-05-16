@@ -1,7 +1,10 @@
 import 'dotenv/config';
 import cors from 'cors';
 import express from 'express';
+import aiRoutes from './routes/aiRoutes.js';
+import arizeRoutes from './routes/arizeRoutes.js';
 import reefRoutes from './routes/reefRoutes.js';
+import { refreshStationsOnStartupIfEmpty, scheduleStationRefresh } from './services/stationRefreshService.js';
 
 const app = express();
 const port = process.env.PORT || 4000;
@@ -17,6 +20,8 @@ app.get('/api/health', (_req, res) => {
 });
 
 app.use('/api/reefs', reefRoutes);
+app.use('/api/arize', arizeRoutes);
+app.use('/api/ai', aiRoutes);
 
 app.use((error, _req, res, _next) => {
   console.error('[reefwatch-api] request failed', error);
@@ -28,4 +33,9 @@ app.use((error, _req, res, _next) => {
 
 app.listen(port, host, () => {
   console.log(`ReefWatch AI backend running on http://localhost:${port}`);
+  scheduleStationRefresh();
+
+  if (process.env.STATION_REFRESH_ON_STARTUP !== 'false') {
+    refreshStationsOnStartupIfEmpty();
+  }
 });

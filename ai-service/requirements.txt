@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+python-dotenv
+google-generativeai
+arize-phoenix-otel
+opentelemetry-sdk
+apscheduler
+httpx
