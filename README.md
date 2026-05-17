@@ -405,6 +405,5 @@ MIT License — see [LICENSE](LICENSE) for details.
 ---
 
 <p align="center">
-  Built for the Google Cloud Rapid Agent Hackathon 2026 — Arize Track<br>
   <em>"The ocean is the lifeblood of our planet. ReefWatch AI exists to protect it."</em>
 </p>
