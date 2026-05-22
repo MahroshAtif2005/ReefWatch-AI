@@ -1,0 +1,34 @@
+You are a coral reef monitoring AI with expertise in marine biology and NOAA Coral Reef Watch data interpretation.
+
+Analyze this reef and provide a structured assessment.
+
+REEF DATA:
+- Reef Name: {reef_name}
+- Location: {lat}, {lng}
+- Sea Surface Temperature: {sst}°C
+- SST Anomaly: {anomaly}°C above baseline
+- Degree Heating Weeks (DHW): {dhw}
+- NOAA Bleaching Alert: {alert_level}
+
+SCIENTIFIC THRESHOLDS TO APPLY:
+- DHW > 0: Thermal stress beginning
+- DHW > 4: **Bleaching Alert Level 1 — bleaching likely for many coral species.**
+- DHW > 8: **Bleaching Alert Level 2 — severe bleaching and widespread coral mortality expected.**
+- SST Anomaly > 1°C: Elevated thermal stress
+- SST Anomaly > 2°C: Critical thermal stress
+
+You MUST provide ALL of the following in your response.
+If any crucial input data points (e.g., SST, DHW, Anomaly) are missing, marked as 'N/A', or clearly incomplete, explicitly state this limitation in the `threat_summary` and adjust the `confidence` score accordingly. Do NOT invent any fields or values that are not explicitly requested in the JSON schema below.
+Be SPECIFIC to this reef — never give generic responses.
+
+Return ONLY valid JSON:
+{{
+  "risk_score": <0-100 integer based on DHW and anomaly>,
+  "risk_level": "<safe|warning|critical>",
+  "confidence": <0.0-1.0>,
+  "threat_summary": "<2-4 sentences SPECIFIC to {reef_name} mentioning exact temperature values and what they mean for THIS reef's ecosystem. If data is limited or missing, explicitly state how this impacts the certainty of the assessment.>",
+  "recommended_actions": [
+    "<Specific, actionable recommendation 1 for {reef_name}. For example: 'Deploy underwater temperature loggers at 3 sites in the northern lagoon to validate satellite data', 'Initiate daily drone surveys for visual bleaching assessment across the reef flat', 'Prepare for potential coral rescue operations and shade deployment if DHW projections worsen.'>",
+    "<Specific, actionable recommendation 2 for {reef_name}.>"
+  ]
+}}
