@@ -1,8 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { motion } from 'motion/react';
-import { CheckCircle2, Github, Mail, RefreshCw, Save, Settings as SettingsIcon } from 'lucide-react';
-import { fetchAiHealth, fetchLiveReefs, type LiveReef } from '../services/reefApi';
-import { Slider } from './ui/slider';
+import { Github, Mail, RefreshCw, Save, Settings as SettingsIcon } from 'lucide-react';
+import { fetchArizeStatus, fetchLiveReefs, fetchSettings, saveSettings, type LiveReef } from '../services/reefApi';
 import { Switch } from './ui/switch';
 
 interface AlertSettings {
@@ -20,7 +19,9 @@ interface RefreshSettings {
 }
 
 const ALERT_SETTINGS_KEY = 'reefwatch:alert-settings';
-const MONITORED_REEFS_KEY = 'reefwatch:monitored-reefs';
+const ANOMALY_THRESHOLD_KEY = 'anomaly_threshold';
+const GITHUB_URL = 'https://github.com/MahroshAtif2005/ReefWatch-AI';
+const MONITORED_REEFS_KEY = 'monitored_reefs';
 const REFRESH_SETTINGS_KEY = 'reefwatch:refresh-settings';
 
 const defaultAlertSettings: AlertSettings = {
@@ -51,8 +52,21 @@ function readStorage<T>(key: string, fallback: T): T {
   }
 }
 
+function readNumberStorage(key: string, fallback: number) {
+  const storedValue = localStorage.getItem(key);
+  if (storedValue === null) return fallback;
+  const value = Number(storedValue);
+  return Number.isFinite(value) ? value : fallback;
+}
+
 function writeStorage<T>(key: string, value: T) {
   localStorage.setItem(key, JSON.stringify(value));
+}
+
+function parseStoredNumber(value: string | undefined, fallback: number) {
+  if (value === undefined) return fallback;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
 }
 
 function minutesSince(timestamp: string | null) {
@@ -62,37 +76,69 @@ function minutesSince(timestamp: string | null) {
   return `${minutes} minute${minutes === 1 ? '' : 's'} ago`;
 }
 
-function HealthDot({ active }: { active: boolean }) {
+function getLatestReefTimestamp(reefs: LiveReef[]) {
+  const timestamps = reefs
+    .map((reef) => reef.lastUpdated || (reef as LiveReef & { last_updated?: string }).last_updated)
+    .filter(Boolean)
+    .map((timestamp) => new Date(timestamp).getTime())
+    .filter(Number.isFinite);
+
+  if (timestamps.length === 0) return null;
+  return new Date(Math.max(...timestamps)).toISOString();
+}
+
+function formatTemperature(temp: number | null) {
+  return typeof temp === 'number' ? `${temp.toFixed(1)}°C` : 'Unavailable';
+}
+
+type ServiceStatus = 'operational' | 'degraded' | 'offline';
+
+function HealthDot({ status }: { status: ServiceStatus }) {
+  const styles = {
+    operational: {
+      className: 'bg-coral-safe',
+      shadow: '0 0 12px rgba(0, 217, 163, 0.7)',
+    },
+    degraded: {
+      className: 'bg-coral-warning',
+      shadow: '0 0 12px rgba(255, 136, 0, 0.6)',
+    },
+    offline: {
+      className: 'bg-coral-critical',
+      shadow: '0 0 12px rgba(255, 79, 112, 0.65)',
+    },
+  }[status];
+
   return (
     <span
-      className={`h-2.5 w-2.5 rounded-full ${active ? 'bg-coral-safe' : 'bg-coral-warning'}`}
-      style={{ boxShadow: active ? '0 0 12px rgba(0, 217, 163, 0.7)' : '0 0 12px rgba(255, 136, 0, 0.6)' }}
+      className={`h-2.5 w-2.5 rounded-full ${styles.className}`}
+      style={{ boxShadow: styles.shadow }}
     />
   );
 }
 
 export function Settings() {
   const [reefs, setReefs] = useState<LiveReef[]>([]);
-  const [alertSettings, setAlertSettings] = useState<AlertSettings>(() => readStorage(ALERT_SETTINGS_KEY, defaultAlertSettings));
+  const [alertSettings, setAlertSettings] = useState<AlertSettings>(() => {
+    const storedSettings = readStorage(ALERT_SETTINGS_KEY, defaultAlertSettings);
+    return {
+      ...storedSettings,
+      anomalyThreshold: readNumberStorage(ANOMALY_THRESHOLD_KEY, storedSettings.anomalyThreshold ?? 1.5),
+    };
+  });
   const [refreshSettings, setRefreshSettings] = useState<RefreshSettings>(() => readStorage(REFRESH_SETTINGS_KEY, defaultRefreshSettings));
   const [monitoredReefIds, setMonitoredReefIds] = useState<string[]>(() => readStorage(MONITORED_REEFS_KEY, []));
-  const [alertSaved, setAlertSaved] = useState(false);
+  const [alertSaveStatus, setAlertSaveStatus] = useState<'idle' | 'success' | 'error'>('idle');
+  const [isSavingAlerts, setIsSavingAlerts] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
-  const [noaaOnline, setNoaaOnline] = useState(false);
-  const [aiOnline, setAiOnline] = useState(false);
-  const [phoenixOnline, setPhoenixOnline] = useState(false);
+  const [noaaStatus, setNoaaStatus] = useState<ServiceStatus>('offline');
+  const [aiStatus, setAiStatus] = useState<ServiceStatus>('offline');
+  const [phoenixStatus, setPhoenixStatus] = useState<ServiceStatus>('offline');
 
   useEffect(() => {
     loadReefs();
-    fetchAiHealth()
-      .then((health) => {
-        setAiOnline(health.status === 'ok');
-        setPhoenixOnline(health.phoenix === 'connected');
-      })
-      .catch(() => {
-        setAiOnline(false);
-        setPhoenixOnline(false);
-      });
+    checkSystemStatus();
+    loadServerSettings();
   }, []);
 
   useEffect(() => {
@@ -113,12 +159,17 @@ export function Settings() {
     try {
       const liveReefs = await fetchLiveReefs();
       setReefs(liveReefs);
-      setNoaaOnline(true);
-      const nextRefreshSettings = { ...refreshSettings, lastSynced: new Date().toISOString() };
-      setRefreshSettings(nextRefreshSettings);
-      writeStorage(REFRESH_SETTINGS_KEY, nextRefreshSettings);
+      setNoaaStatus('operational');
+      const lastSynced = getLatestReefTimestamp(liveReefs);
+      if (lastSynced) {
+        setRefreshSettings((current) => {
+          const nextRefreshSettings = { ...current, lastSynced };
+          writeStorage(REFRESH_SETTINGS_KEY, nextRefreshSettings);
+          return nextRefreshSettings;
+        });
+      }
     } catch {
-      setNoaaOnline(false);
+      setNoaaStatus('offline');
     } finally {
       setIsRefreshing(false);
     }
@@ -126,12 +177,39 @@ export function Settings() {
 
   function updateAlertSettings(next: Partial<AlertSettings>) {
     setAlertSettings((current) => ({ ...current, ...next }));
-    setAlertSaved(false);
+    setAlertSaveStatus('idle');
   }
 
-  function saveAlertSettings() {
-    writeStorage(ALERT_SETTINGS_KEY, alertSettings);
-    setAlertSaved(true);
+  function updateAnomalyThreshold(threshold: number) {
+    setAlertSettings((current) => {
+      const updated = { ...current, anomalyThreshold: threshold };
+      localStorage.setItem(ANOMALY_THRESHOLD_KEY, String(threshold));
+      writeStorage(ALERT_SETTINGS_KEY, updated);
+      return updated;
+    });
+    setAlertSaveStatus('idle');
+  }
+
+  async function saveAlertSettings() {
+    setIsSavingAlerts(true);
+    setAlertSaveStatus('idle');
+
+    try {
+      await saveSettings({
+        notification_email: alertSettings.email,
+        anomaly_threshold: alertSettings.anomalyThreshold,
+        critical_alerts_enabled: alertSettings.criticalAlerts,
+        temp_anomaly_alerts_enabled: alertSettings.anomalyWarnings,
+        weekly_summary_enabled: alertSettings.weeklySummary,
+      });
+      writeStorage(ALERT_SETTINGS_KEY, alertSettings);
+      localStorage.setItem(ANOMALY_THRESHOLD_KEY, String(alertSettings.anomalyThreshold));
+      setAlertSaveStatus('success');
+    } catch {
+      setAlertSaveStatus('error');
+    } finally {
+      setIsSavingAlerts(false);
+    }
   }
 
   function updateRefreshSettings(next: Partial<RefreshSettings>) {
@@ -150,6 +228,61 @@ export function Settings() {
       ? monitoredReefIds.filter((reefId) => reefId !== id)
       : [...monitoredReefIds, id];
     setMonitored(nextIds);
+  }
+
+  async function checkSystemStatus() {
+    fetchLiveReefs()
+      .then(() => setNoaaStatus('operational'))
+      .catch(() => setNoaaStatus('offline'));
+
+    fetch('http://localhost:8000/health')
+      .then(async (response) => {
+        if (!response.ok) throw new Error('AI service offline');
+        const health = await response.json();
+        setAiStatus(health.gemini === 'connected' ? 'operational' : 'offline');
+      })
+      .catch(() => setAiStatus('offline'));
+
+    fetchArizeStatus()
+      .then((status) => setPhoenixStatus(status.configured ? 'operational' : 'degraded'))
+      .catch(() => setPhoenixStatus('offline'));
+  }
+
+  async function loadServerSettings() {
+    try {
+      const settings = await fetchSettings();
+      const hasServerAlertSettings = Object.keys(settings).some((key) => [
+        'notification_email',
+        'anomaly_threshold',
+        'critical_alerts_enabled',
+        'temp_anomaly_alerts_enabled',
+        'weekly_summary_enabled',
+      ].includes(key));
+
+      if (!hasServerAlertSettings) return;
+
+      setAlertSettings((current) => {
+        const nextSettings = {
+          ...current,
+          email: settings.notification_email ?? current.email,
+          anomalyThreshold: parseStoredNumber(settings.anomaly_threshold, current.anomalyThreshold),
+          criticalAlerts: settings.critical_alerts_enabled === undefined
+            ? current.criticalAlerts
+            : settings.critical_alerts_enabled === 'true',
+          anomalyWarnings: settings.temp_anomaly_alerts_enabled === undefined
+            ? current.anomalyWarnings
+            : settings.temp_anomaly_alerts_enabled === 'true',
+          weeklySummary: settings.weekly_summary_enabled === undefined
+            ? current.weeklySummary
+            : settings.weekly_summary_enabled === 'true',
+        };
+        writeStorage(ALERT_SETTINGS_KEY, nextSettings);
+        localStorage.setItem(ANOMALY_THRESHOLD_KEY, String(nextSettings.anomalyThreshold));
+        return nextSettings;
+      });
+    } catch {
+      console.warn('[settings] server settings unavailable; using localStorage fallback');
+    }
   }
 
   return (
@@ -208,24 +341,40 @@ export function Settings() {
               {alertSettings.anomalyThreshold.toFixed(1)}°C
             </span>
           </div>
-          <Slider
-            value={[alertSettings.anomalyThreshold]}
-            min={0.5}
-            max={4}
-            step={0.5}
-            onValueChange={(value) => updateAlertSettings({ anomalyThreshold: value[0] })}
-          />
+          <div style={{ maxWidth: '500px', width: '100%' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
+              <span style={{ color: '#94a3b8', fontSize: '13px' }}>0.5°C</span>
+              <span style={{ color: '#22d3ee', fontWeight: 'bold' }}>
+                {alertSettings.anomalyThreshold.toFixed(1)}°C
+              </span>
+              <span style={{ color: '#94a3b8', fontSize: '13px' }}>4.0°C</span>
+            </div>
+            <input
+              type="range"
+              min="0.5"
+              max="4.0"
+              step="0.5"
+              value={alertSettings.anomalyThreshold}
+              onChange={(event) => updateAnomalyThreshold(parseFloat(event.target.value))}
+              style={{ width: '100%', accentColor: '#22d3ee' }}
+            />
+            <p style={{ color: '#64748b', fontSize: '12px', marginTop: '8px' }}>
+              Reefs with SST anomaly above this value will trigger alerts
+            </p>
+          </div>
         </div>
 
         <div className="mt-6 flex items-center gap-3">
           <button
             onClick={saveAlertSettings}
-            className="inline-flex items-center gap-2 rounded-xl border border-cyan-glow/25 bg-cyan-glow/12 px-5 py-3 text-cyan-glow transition hover:bg-cyan-glow/18"
+            disabled={isSavingAlerts}
+            className="inline-flex items-center gap-2 rounded-xl border border-cyan-glow/25 bg-cyan-glow/12 px-5 py-3 text-cyan-glow transition hover:bg-cyan-glow/18 disabled:cursor-not-allowed disabled:opacity-70"
           >
             <Save className="h-4 w-4" />
-            Save Alert Settings
+            {isSavingAlerts ? 'Saving...' : 'Save Alert Settings'}
           </button>
-          {alertSaved && <span className="text-sm text-coral-safe">Saved locally</span>}
+          {alertSaveStatus === 'success' && <span className="text-sm text-coral-safe">Saved to server ✓</span>}
+          {alertSaveStatus === 'error' && <span className="text-sm text-coral-critical">Save failed</span>}
         </div>
       </motion.section>
 
@@ -255,10 +404,13 @@ export function Settings() {
                   onChange={() => toggleReef(reef.id)}
                   className="h-4 w-4 accent-cyan-glow"
                 />
-                <span className="text-sm text-white">{reef.name}</span>
+                <div>
+                  <span className="block text-sm text-white">{reef.name}</span>
+                  <span className="text-xs text-gray-muted">Current temperature: {formatTemperature(reef.seaSurfaceTemp)}</span>
+                </div>
               </div>
-              <span className={`rounded-lg border px-2 py-1 text-[11px] capitalize ${statusStyles[reef.status]}`}>
-                {reef.status}
+              <span className={`shrink-0 rounded-lg border px-2 py-1 text-[11px] capitalize ${statusStyles[reef.status]}`}>
+                {reef.status} risk
               </span>
             </label>
           ))}
@@ -328,9 +480,9 @@ export function Settings() {
           </div>
           <div className="rounded-xl border border-cyan-glow/10 bg-ocean-medium/25 p-5">
             <p className="mb-2 text-sm text-gray-muted">Repository</p>
-            <a href="#" className="inline-flex items-center gap-2 text-sm text-cyan-glow transition hover:text-cyan-bright">
+            <a href={GITHUB_URL} target="_blank" rel="noreferrer" className="inline-flex items-center gap-2 text-sm text-cyan-glow transition hover:text-cyan-bright">
               <Github className="h-4 w-4" />
-              GitHub link placeholder
+              GitHub repository
             </a>
           </div>
         </div>
@@ -339,15 +491,15 @@ export function Settings() {
           <h4 className="mb-4 text-lg text-white">System Status</h4>
           <div className="grid gap-3 md:grid-cols-3">
             <div className="flex items-center gap-3 rounded-xl border border-cyan-glow/10 bg-ocean-deep/42 p-4">
-              <HealthDot active={noaaOnline} />
+              <HealthDot status={noaaStatus} />
               <span className="text-sm text-gray-light">NOAA Data Feed</span>
             </div>
             <div className="flex items-center gap-3 rounded-xl border border-cyan-glow/10 bg-ocean-deep/42 p-4">
-              <HealthDot active={aiOnline} />
+              <HealthDot status={aiStatus} />
               <span className="text-sm text-gray-light">AI Service</span>
             </div>
             <div className="flex items-center gap-3 rounded-xl border border-cyan-glow/10 bg-ocean-deep/42 p-4">
-              <HealthDot active={phoenixOnline} />
+              <HealthDot status={phoenixStatus} />
               <span className="text-sm text-gray-light">Phoenix Monitoring</span>
             </div>
           </div>

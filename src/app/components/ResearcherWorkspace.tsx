@@ -145,8 +145,9 @@ export function ResearcherWorkspace() {
         },
       ]);
     } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'The AI chat request failed.';
       console.error('[ResearcherWorkspace] AI chat request failed', {
-        error,
+        error: errorMessage,
         endpoint: 'http://localhost:4000/api/ai/chat',
         message: trimmed,
       });
@@ -155,7 +156,7 @@ export function ResearcherWorkspace() {
         {
           id: `assistant-error-${Date.now()}`,
           role: 'assistant',
-          content: 'The AI chat request failed. I logged the backend response in the console so we can see whether it came from the Node proxy, Python service, or model call.',
+          content: `The AI chat request failed. ${errorMessage}`,
           dataUsed: ['Local app state'],
           confidence: 0,
         },
@@ -303,7 +304,7 @@ export function ResearcherWorkspace() {
               <div key={message.id} className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                 <div className={`max-w-[82%] border px-5 py-4 shadow-[0_16px_36px_rgba(2,11,20,0.2)] ${
                   message.role === 'user'
-                    ? 'rounded-2xl rounded-br-md border-cyan-glow/45 bg-gradient-to-br from-ocean-light/58 via-ocean-medium/62 to-blue-deep/44 text-white shadow-[0_18px_42px_rgba(0,84,112,0.28),inset_0_1px_0_rgba(191,253,255,0.08)]'
+                    ? 'rounded-2xl rounded-br-md border-cyan-glow/62 bg-gradient-to-br from-[#052638]/96 via-[#07344a]/94 to-[#06475e]/90 text-white shadow-[0_22px_54px_rgba(1,20,32,0.58),0_0_0_1px_rgba(0,229,255,0.08),0_0_24px_rgba(0,229,255,0.12),inset_0_1px_0_rgba(191,253,255,0.08)]'
                     : 'rounded-2xl rounded-bl-md border-cyan-glow/18 bg-gradient-to-br from-ocean-medium/52 via-ocean-dark/46 to-ocean-deep/58 text-gray-light shadow-[0_14px_34px_rgba(2,11,20,0.2),inset_0_1px_0_rgba(191,253,255,0.045)]'
                 }`}>
                   {renderMessageContent(message.content)}

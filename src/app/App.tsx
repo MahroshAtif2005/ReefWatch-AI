@@ -1,7 +1,8 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { AnimatePresence } from 'motion/react';
+import { checkBackendHealth } from './services/reefApi';
 import { Sidebar } from './components/Sidebar';
-import { Header } from './components/Header';
+import { Header, type SearchNavigationTarget } from './components/Header';
 import { LiveReefGoogleMap } from './components/LiveReefGoogleMap';
 import { LiveAgentFeed } from './components/LiveAgentFeed';
 import { ReefDetailPanel } from './components/ReefDetailPanel';
@@ -11,6 +12,7 @@ import { ConservationReports } from './components/ConservationReports';
 import { LiveActivityTicker } from './components/LiveActivityTicker';
 import { DashboardOverview } from './components/DashboardOverview';
 import { CoralBackground } from './components/CoralBackground';
+import { UnderwaterAmbientBackground } from './components/UnderwaterAmbientBackground';
 import { ResearcherWorkspace } from './components/ResearcherWorkspace';
 import { Settings } from './components/Settings';
 
@@ -33,23 +35,35 @@ interface ReefData {
 export default function App() {
   const [activeView, setActiveView] = useState('dashboard');
   const [selectedReef, setSelectedReef] = useState<ReefData | null>(null);
+  const [mapFocusTarget, setMapFocusTarget] = useState<SearchNavigationTarget | null>(null);
 
-  const handleNavigate = (view: string, reef?: any) => {
+  useEffect(() => {
+    checkBackendHealth();
+  }, []);
+
+  const handleNavigate = (view: string, target?: SearchNavigationTarget) => {
     setActiveView(view);
-    if (reef) {
+    if (target?.lat !== undefined && target.lng !== undefined) {
+      setMapFocusTarget(target);
+    }
+
+    if (target && target.searchTargetType !== 'station') {
+      const riskScore = typeof target.riskScore === 'number' ? target.riskScore : target.risk || 0;
       setSelectedReef({
-        ...reef,
-        lat: reef.lat || 0,
-        lng: reef.lng || 0,
-        temperature: reef.temp ?? null,
-        bleachingRisk: reef.risk || 0,
-        risk: reef.risk > 70 ? 'critical' : reef.risk > 30 ? 'warning' : 'safe',
-        tempAnomaly: reef.tempAnomaly,
-        degreeHeatingWeeks: reef.degreeHeatingWeeks,
-        bleachingAlertLevel: reef.bleachingAlertLevel,
-        source: reef.source,
-        lastUpdated: reef.lastUpdated,
-        error: reef.error,
+        ...target,
+        lat: target.lat || 0,
+        lng: target.lng || 0,
+        temperature: target.seaSurfaceTemp ?? target.temp ?? null,
+        bleachingRisk: riskScore,
+        risk: target.status === 'critical' || target.status === 'warning' || target.status === 'safe'
+          ? target.status
+          : riskScore > 70 ? 'critical' : riskScore > 30 ? 'warning' : 'safe',
+        tempAnomaly: target.tempAnomaly,
+        degreeHeatingWeeks: target.degreeHeatingWeeks,
+        bleachingAlertLevel: target.bleachingAlertLevel,
+        source: target.source,
+        lastUpdated: target.lastUpdated,
+        error: target.error || undefined,
       });
     }
   };
@@ -57,6 +71,7 @@ export default function App() {
   return (
     <div className="size-full flex text-foreground overflow-hidden relative" style={{ background: 'linear-gradient(135deg, #082e42 0%, #0d5068 35%, #0f6674 60%, #093d58 100%)' }}>
       <CoralBackground />
+      <UnderwaterAmbientBackground />
 
       {/* App shell — sits above the fixed coral background */}
       <div className="relative z-10 flex flex-1 overflow-hidden">
@@ -64,7 +79,7 @@ export default function App() {
 
       {/* Main Content */}
       <div className="flex-1 flex flex-col overflow-hidden">
-        <Header />
+        <Header onNavigate={handleNavigate} />
 
         <div className="flex-1 overflow-hidden">
           {activeView === 'dashboard' && (
@@ -74,7 +89,7 @@ export default function App() {
           {activeView === 'map' && (
             <div className="h-full p-8">
               <div className="reef-panel-strong h-full rounded-3xl overflow-hidden border border-gray-border/70">
-                <LiveReefGoogleMap onReefSelect={setSelectedReef} />
+                <LiveReefGoogleMap onReefSelect={setSelectedReef} focusTarget={mapFocusTarget} />
               </div>
             </div>
           )}
@@ -114,7 +129,7 @@ export default function App() {
           )}
 
           {activeView === 'trends' && (
-            <div className="h-full overflow-auto p-8">
+            <div className="h-full overflow-auto px-8 pb-8 pt-10">
               <div className="max-w-7xl mx-auto space-y-8">
                 <div>
                   <h2 className="text-4xl text-white mb-2">Historical Trends</h2>

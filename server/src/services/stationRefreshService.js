@@ -1,7 +1,8 @@
 import cron from 'node-cron';
+import { checkAndSendAlerts } from './alertService.js';
 import { fetchNoaaPointCondition } from './noaaService.js';
 import { fetchVirtualStations } from './stationService.js';
-import { getStationReadingCount, getStationReadings, upsertStationReading } from '../db/database.js';
+import { getStationReadingCount, getStationReadings, insertAgentEvent, upsertStationReading } from '../db/database.js';
 
 const REQUEST_DELAY_MS = 200;
 
@@ -20,6 +21,8 @@ const unavailableReading = (station, error) => ({
   bleachingAlertLevel: 'Unavailable',
   riskScore: 0,
   status: 'unavailable',
+  noaa_data_available: false,
+  noaaDataAvailable: false,
   source: station.source,
   lastUpdated: new Date().toISOString(),
   error: error.message,
@@ -36,6 +39,8 @@ const successfulReading = (station, condition) => ({
   bleachingAlertLevel: condition.bleachingAlertLevel,
   riskScore: condition.riskScore,
   status: condition.status,
+  noaa_data_available: true,
+  noaaDataAvailable: true,
   source: condition.source,
   lastUpdated: condition.lastUpdated,
   error: null,
@@ -55,6 +60,7 @@ export async function refreshStationReadings({ reason = 'manual' } = {}) {
   const startedAt = Date.now();
   let successCount = 0;
   let failureCount = 0;
+  const updatedReadings = [];
 
   try {
     console.log(`[station-refresh] started (${reason})`);
@@ -67,11 +73,15 @@ export async function refreshStationReadings({ reason = 'manual' } = {}) {
 
       try {
         const condition = await fetchNoaaPointCondition(station);
-        upsertStationReading(successfulReading(station, condition));
+        const reading = successfulReading(station, condition);
+        upsertStationReading(reading);
+        updatedReadings.push(reading);
         successCount += 1;
         console.log(`[refresh] Success: ${station.name}`);
       } catch (error) {
-        upsertStationReading(unavailableReading(station, error));
+        const reading = unavailableReading(station, error);
+        upsertStationReading(reading);
+        updatedReadings.push(reading);
         failureCount += 1;
         console.error(`[refresh] Failed: ${station.name} (${error.message})`);
       }
@@ -83,6 +93,13 @@ export async function refreshStationReadings({ reason = 'manual' } = {}) {
 
     const seconds = Math.round((Date.now() - startedAt) / 1000);
     console.log(`[station-refresh] complete in ${seconds}s: ${successCount} success, ${failureCount} failed`);
+    insertAgentEvent(
+      'batch_refresh',
+      `Nightly station refresh completed: ${successCount} stations updated`,
+      null,
+      null,
+    );
+    checkAndSendAlerts(updatedReadings).catch(console.error);
     return { started: true, successCount, failureCount };
   } finally {
     refreshInProgress = false;

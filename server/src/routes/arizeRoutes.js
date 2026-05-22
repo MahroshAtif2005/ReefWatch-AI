@@ -12,9 +12,9 @@ router.post('/trace', async (req, res, next) => {
   }
 });
 
-router.get('/status', (_req, res, next) => {
+router.get('/status', async (_req, res, next) => {
   try {
-    res.json(getArizeStatus());
+    res.json(await getArizeStatus());
   } catch (error) {
     next(error);
   }

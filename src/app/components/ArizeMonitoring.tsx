@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Brain, CheckCircle, AlertTriangle, Activity, TrendingUp } from 'lucide-react';
+import { Brain, CheckCircle, AlertTriangle, Activity, TrendingUp, ExternalLink } from 'lucide-react';
 import { motion } from 'motion/react';
 import { fetchArizeStatus, fetchArizeTraces, type ArizeStatus, type ArizeTrace } from '../services/reefApi';
 
@@ -7,6 +7,7 @@ export function ArizeMonitoring() {
   const [status, setStatus] = useState<ArizeStatus | null>(null);
   const [traces, setTraces] = useState<ArizeTrace[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [reefFilter, setReefFilter] = useState('all');
 
   useEffect(() => {
     let isMounted = true;
@@ -15,7 +16,7 @@ export function ArizeMonitoring() {
       try {
         const [statusResult, traceResult] = await Promise.all([
           fetchArizeStatus(),
-          fetchArizeTraces(),
+          fetchArizeTraces(100),
         ]);
 
         if (isMounted) {
@@ -51,11 +52,29 @@ export function ArizeMonitoring() {
     ? new Date(status.lastTraceTime).toLocaleTimeString()
     : 'None yet';
 
+  const metricsSource = status?.metrics;
+  const tokenUsage = metricsSource?.total_tokens ?? traces.length * 0;
+  const effectiveTraceCount = Math.max(status?.localTraceCount ?? 0, metricsSource?.total_traces ?? 0);
+  const observabilityConnected = Boolean(status?.localPhoenixConnected || status?.hostedArizeConnected);
+  const primaryStatusLabel = status?.localPhoenixConnected
+    ? 'Local Phoenix Connected'
+    : status?.hostedArizeConnected
+      ? 'Hosted Arize Connected'
+      : 'Local Phoenix Offline';
+  const secondaryStatusLabel = status?.hostedArizeConnected
+    ? 'Hosted Arize Connected'
+    : 'Hosted Arize Not Configured';
+  const phoenixProjectsUrl = `${(status?.phoenixUrl || 'http://127.0.0.1:6006').replace(/\/$/, '')}/projects`;
+
   const metrics = [
-    { label: 'Arize Status', value: status?.configured ? 'Configured' : 'Local Only', status: status?.configured ? 'excellent' : 'good', trend: status?.projectName || 'ReefWatch AI' },
-    { label: 'Trace Count', value: `${status?.localTraceCount ?? 0}`, status: 'good', trend: 'Local traces' },
-    { label: 'Avg Confidence', value: averageConfidence === null ? 'N/A' : `${averageConfidence.toFixed(1)}%`, status: 'good', trend: 'NOAA rules' },
-    { label: 'Last Trace', value: lastTraceTime, status: 'good', trend: status?.configured ? 'Arize ready' : 'Stored locally' },
+    { label: 'Total Traces', value: `${effectiveTraceCount}`, status: 'good', trend: status?.projectName || 'reefwatch-ai' },
+    { label: 'Average Latency', value: metricsSource ? `${metricsSource.average_latency_ms}ms` : 'N/A', status: 'good', trend: 'reef.analyze' },
+    { label: 'Error Rate', value: metricsSource ? `${metricsSource.error_rate}%` : '0%', status: metricsSource?.error_rate ? 'warning' : 'excellent', trend: `${metricsSource?.failure_count ?? 0} failures` },
+    { label: 'NOAA API Latency', value: metricsSource ? `${metricsSource.average_noaa_latency_ms}ms` : 'N/A', status: 'good', trend: `${metricsSource?.cache_hit_rate ?? 0}% cache hit` },
+    { label: 'LLM Latency', value: metricsSource ? `${metricsSource.average_llm_latency_ms}ms` : 'N/A', status: 'good', trend: 'Gemini generate' },
+    { label: 'Token Usage', value: `${tokenUsage}`, status: 'good', trend: `${metricsSource?.prompt_tokens ?? 0} in / ${metricsSource?.completion_tokens ?? 0} out` },
+    { label: 'Cache Hit Rate', value: `${metricsSource?.cache_hit_rate ?? 0}%`, status: 'good', trend: `${metricsSource?.fallback_count ?? 0} fallbacks` },
+    { label: 'Last Trace Time', value: metricsSource?.last_trace_time ? new Date(metricsSource.last_trace_time).toLocaleTimeString() : lastTraceTime, status: 'good', trend: 'Recent activity' },
   ];
 
   const formatTraceTime = (timestamp: string) => {
@@ -64,6 +83,31 @@ export function ArizeMonitoring() {
     return parsed.toLocaleTimeString();
   };
 
+  const reefOptions = useMemo(() => (
+    Array.from(new Set(traces.map((trace) => trace.reefName).filter(Boolean))).sort()
+  ), [traces]);
+
+  const visibleTraces = useMemo(() => {
+    const filteredTraces = reefFilter === 'all'
+      ? traces
+      : traces.filter((trace) => trace.reefName === reefFilter);
+    const uniqueTraces: ArizeTrace[] = [];
+    const seenTraceIds = new Set<string>();
+    const seenReefNames = new Set<string>();
+
+    for (const trace of filteredTraces) {
+      if (trace.traceId && seenTraceIds.has(trace.traceId)) continue;
+      if (reefFilter === 'all' && seenReefNames.has(trace.reefName)) continue;
+
+      uniqueTraces.push(trace);
+      if (trace.traceId) seenTraceIds.add(trace.traceId);
+      if (reefFilter === 'all') seenReefNames.add(trace.reefName);
+      if (uniqueTraces.length >= 20) break;
+    }
+
+    return uniqueTraces;
+  }, [reefFilter, traces]);
+
   return (
     <div className="space-y-8">
       {/* Header - More Spacious */}
@@ -71,16 +115,35 @@ export function ArizeMonitoring() {
         <div>
           <h2 className="text-4xl text-white mb-2">AI Observability</h2>
           <p className="text-base text-gray-muted">{status?.message || 'Loading observability status...'}</p>
+          <div className="mt-3 flex flex-wrap gap-2 text-xs">
+            <span className={`rounded-lg border px-3 py-1 ${status?.localPhoenixConnected ? 'border-coral-safe/35 bg-coral-safe/10 text-coral-safe' : 'border-coral-warning/35 bg-coral-warning/10 text-coral-warning'}`}>
+              {status?.phoenixStatus || primaryStatusLabel}
+            </span>
+            <span className={`rounded-lg border px-3 py-1 ${status?.hostedArizeConnected ? 'border-coral-safe/35 bg-coral-safe/10 text-coral-safe' : 'border-gray-border/70 bg-ocean-medium/55 text-gray-light'}`}>
+              {status?.hostedArizeStatus || secondaryStatusLabel}
+            </span>
+          </div>
         </div>
-        <div className={`flex items-center gap-3 px-5 py-3 rounded-xl ${status?.configured ? 'bg-coral-safe/10 border border-coral-safe/30' : 'bg-coral-warning/10 border border-coral-warning/30'}`}>
-          {status?.configured ? (
+        <div className="flex items-center gap-3">
+          <a
+            href={phoenixProjectsUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="reef-panel-strong flex items-center gap-2 rounded-xl border border-cyan-glow/35 bg-ocean-medium/75 px-4 py-3 text-sm text-cyan-glow transition-all hover:border-cyan-glow/70 hover:bg-ocean-medium hover:shadow-[0_0_18px_rgba(0,229,255,0.18)]"
+          >
+            Open Phoenix
+            <ExternalLink className="h-4 w-4" />
+          </a>
+          <div className={`flex items-center gap-3 px-5 py-3 rounded-xl ${observabilityConnected ? 'bg-coral-safe/10 border border-coral-safe/30' : 'bg-coral-warning/10 border border-coral-warning/30'}`}>
+          {observabilityConnected ? (
             <CheckCircle className="w-5 h-5 text-coral-safe" />
           ) : (
             <AlertTriangle className="w-5 h-5 text-coral-warning" />
           )}
-          <span className={`text-sm ${status?.configured ? 'text-coral-safe' : 'text-coral-warning'}`}>
-            {status?.configured ? 'Arize Configured' : 'Arize Not Configured'}
+          <span className={`text-sm ${observabilityConnected ? 'text-coral-safe' : 'text-coral-warning'}`}>
+            {primaryStatusLabel}
           </span>
+          </div>
         </div>
       </div>
 
@@ -91,7 +154,7 @@ export function ArizeMonitoring() {
       )}
 
       {/* Key Metrics - More Spacious */}
-      <div className="grid grid-cols-4 gap-6">
+      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-6">
         {metrics.map((metric, i) => (
           <motion.div
             key={i}
@@ -104,6 +167,8 @@ export function ArizeMonitoring() {
               <span className="text-xs uppercase tracking-wider text-gray-muted">{metric.label}</span>
               {metric.status === 'excellent' ? (
                 <CheckCircle className="w-4 h-4 text-coral-safe" />
+              ) : metric.status === 'warning' ? (
+                <AlertTriangle className="w-4 h-4 text-coral-warning" />
               ) : (
                 <Activity className="w-4 h-4 text-cyan-glow" />
               )}
@@ -119,21 +184,39 @@ export function ArizeMonitoring() {
 
       {/* AI Trace Log - More Spacious */}
       <div className="reef-panel-strong p-8 rounded-2xl bg-ocean-medium/65 border border-gray-border/70">
-        <div className="flex items-center gap-3 mb-6">
-          <Brain className="w-5 h-5 text-cyan-glow" />
-          <h3 className="text-base text-white">Recent AI Inference Traces</h3>
+        <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-center gap-3">
+            <Brain className="w-5 h-5 text-cyan-glow" />
+            <h3 className="text-base text-white">Recent AI Inference Traces</h3>
+          </div>
+          <select
+            value={reefFilter}
+            onChange={(event) => setReefFilter(event.target.value)}
+            className="reef-panel-soft rounded-xl border border-gray-border/70 bg-ocean-dark/70 px-4 py-2 text-sm text-gray-light outline-none transition-all hover:border-cyan-glow/40 focus:border-cyan-glow/70"
+          >
+            <option value="all">All Reefs</option>
+            {reefOptions.map((reefName) => (
+              <option key={reefName} value={reefName}>{reefName}</option>
+            ))}
+          </select>
         </div>
 
         <div className="space-y-3">
           {traces.length === 0 && (
             <div className="reef-panel-soft p-5 rounded-xl bg-ocean-dark/45 border border-gray-border/70 text-sm text-gray-light">
-              No reef assessment traces have been logged yet. Refresh live NOAA reef data to populate local observability.
+              No reef assessment traces have been logged yet. Hit `/test-trace` or run a reef analysis to populate Phoenix and local observability.
             </div>
           )}
 
-          {traces.map((trace) => (
+          {traces.length > 0 && visibleTraces.length === 0 && (
+            <div className="reef-panel-soft p-5 rounded-xl bg-ocean-dark/45 border border-gray-border/70 text-sm text-gray-light">
+              No local traces match this reef filter yet.
+            </div>
+          )}
+
+          {visibleTraces.map((trace) => (
             <div
-              key={trace.traceId}
+              key={trace.traceId || `${trace.reefName}-${trace.timestamp}`}
               className="reef-panel-soft p-5 rounded-xl bg-ocean-dark/45 border border-gray-border/70 hover:border-cyan-glow/40 transition-all"
             >
               <div className="flex items-center justify-between">

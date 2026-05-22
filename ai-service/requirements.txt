@@ -2,6 +2,7 @@ fastapi
 uvicorn
 python-dotenv
 google-generativeai
+arize-phoenix
 arize-phoenix-otel
 opentelemetry-sdk
 apscheduler

@@ -1,6 +1,16 @@
-import { getArizeTraceCount, getLastArizeTraceTime, getRecentArizeTraces, insertArizeTrace } from '../db/database.js';
+import axios from 'axios';
+import {
+  getArizeTraceCount,
+  getLastArizeTraceTime,
+  getLastArizeTraceTimeForReef,
+  getRecentArizeTraces,
+  insertArizeTrace,
+} from '../db/database.js';
 
-const projectName = process.env.ARIZE_PROJECT_NAME || 'ReefWatch AI';
+const projectName = process.env.ARIZE_PROJECT_NAME || process.env.PHOENIX_PROJECT_NAME || 'reefwatch-ai';
+const aiServiceUrl = process.env.AI_SERVICE_URL || 'http://localhost:8000';
+const phoenixUiUrl = process.env.PHOENIX_UI_URL || 'http://127.0.0.1:6006';
+const TRACE_COOLDOWN_MS = 5 * 60 * 1000;
 
 const normalizeTracePayload = (payload) => ({
   traceId: payload.traceId || `trace-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
@@ -21,9 +31,43 @@ export function isArizeConfigured() {
   return Boolean(process.env.ARIZE_API_KEY && process.env.ARIZE_SPACE_ID);
 }
 
+async function getAiObservabilityStatus() {
+  try {
+    const response = await axios.get(`${aiServiceUrl}/observability/metrics`, {
+      timeout: 3500,
+    });
+    return response.data;
+  } catch (error) {
+    console.warn('[arize] AI observability status unavailable', error.message);
+    return {
+      project_name: projectName,
+      phoenix: 'offline',
+      phoenix_url: phoenixUiUrl,
+      hosted_arize: isArizeConfigured() ? 'unknown' : 'not_configured',
+      arize_project_name: projectName,
+      metrics: null,
+    };
+  }
+}
+
 export async function logReefAssessmentTrace(payload) {
   const trace = normalizeTracePayload(payload);
   const configured = isArizeConfigured();
+  const lastTraceTime = getLastArizeTraceTimeForReef(trace.reefId, trace.reefName);
+
+  if (lastTraceTime) {
+    const elapsed = Date.now() - new Date(lastTraceTime).getTime();
+    if (Number.isFinite(elapsed) && elapsed >= 0 && elapsed < TRACE_COOLDOWN_MS) {
+      console.log(`[arize] skipped local trace for ${trace.reefName}; analyzed ${Math.round(elapsed / 1000)}s ago`);
+      return {
+        configured,
+        logged: false,
+        skipped: true,
+        message: 'Trace skipped due to 5 minute reef analysis cooldown.',
+        trace,
+      };
+    }
+  }
 
   // Arize API submission is intentionally guarded until keys are provided.
   // Local persistence always happens so the monitoring page remains useful.
@@ -54,19 +98,30 @@ export async function logReefAssessmentTrace(payload) {
   };
 }
 
-export function getArizeStatus() {
+export async function getArizeStatus() {
   const configured = isArizeConfigured();
   const localTraceCount = getArizeTraceCount();
   const lastTraceTime = getLastArizeTraceTime();
+  const aiObservability = await getAiObservabilityStatus();
+  const localPhoenixConnected = aiObservability.phoenix === 'connected';
+  const hostedArizeConnected = configured && aiObservability.hosted_arize === 'connected';
 
   return {
     configured,
+    localPhoenixConnected,
+    hostedArizeConnected,
+    phoenixStatus: localPhoenixConnected ? 'Local Phoenix Connected' : 'Local Phoenix Offline',
+    hostedArizeStatus: hostedArizeConnected ? 'Hosted Arize Connected' : 'Hosted Arize Not Configured',
+    phoenixUrl: aiObservability.phoenix_url || phoenixUiUrl,
     projectName,
     lastTraceTime,
     localTraceCount,
-    message: configured
-      ? 'Arize configured. Local trace capture is active.'
-      : 'Arize not configured. Traces are stored locally.',
+    metrics: aiObservability.metrics,
+    message: localPhoenixConnected
+      ? 'Local Phoenix connected. ReefWatch AI traces are streaming to Phoenix.'
+      : configured
+        ? 'Hosted Arize configured. Local Phoenix is offline.'
+        : 'Local Phoenix offline. Hosted Arize is not configured; traces are stored locally.',
   };
 }
 

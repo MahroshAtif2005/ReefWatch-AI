@@ -1,8 +1,19 @@
 import { useEffect, useMemo, useState } from 'react';
-import { APIProvider, Map as GoogleMap, Marker } from '@vis.gl/react-google-maps';
+import { APIProvider, Map as GoogleMap, Marker, useMap } from '@vis.gl/react-google-maps';
 import { motion } from 'motion/react';
-import { AlertTriangle, Clock, Database, Droplet, MapPin, Radio, ThermometerSun, X } from 'lucide-react';
-import { fetchLiveReefs, fetchReefStationReadings, fetchReefStations, type LiveReef, type ReefStation, type ReefStationReading } from '../services/reefApi';
+import { AlertTriangle, CheckCircle2, Clock, Database, Droplet, Loader2, MapPin, Plus, Radio, Trash2, X } from 'lucide-react';
+import {
+  addStationToActiveMonitoring,
+  fetchLiveReefs,
+  fetchReefStationReadings,
+  fetchReefStations,
+  normalizeBleachingAlertLevel,
+  removeFromActiveMonitoring,
+  type LiveReef,
+  type ReefStation,
+  type ReefStationReading,
+} from '../services/reefApi';
+import type { SearchNavigationTarget } from './Header';
 
 interface LiveReefGoogleMapProps {
   onReefSelect: (reef: {
@@ -20,6 +31,7 @@ interface LiveReefGoogleMapProps {
     lastUpdated?: string;
     error?: string;
   }) => void;
+  focusTarget?: SearchNavigationTarget | null;
 }
 
 const oceanMapStyles = [
@@ -37,7 +49,7 @@ const oceanMapStyles = [
   { featureType: 'water', elementType: 'labels.text.stroke', stylers: [{ color: '#041f2d' }] },
 ] as google.maps.MapTypeStyle[];
 
-const getMarkerStatus = (reef: LiveReef) => reef.source === 'fallback' || reef.error ? 'fallback' : reef.status;
+const getMarkerStatus = (reef: LiveReef) => reef.source.toLowerCase().includes('fallback') || reef.error ? 'fallback' : reef.status;
 
 const getRiskColor = (status: LiveReef['status'] | 'fallback') => {
   switch (status) {
@@ -49,6 +61,8 @@ const getRiskColor = (status: LiveReef['status'] | 'fallback') => {
       return '#ff4757';
     case 'fallback':
       return '#7f95a1';
+    case 'pending':
+      return '#8fcfd6';
     default:
       return '#00e5ff';
   }
@@ -135,16 +149,154 @@ function ApiKeyFallback() {
           </p>
         </div>
       </div>
-      <MapOverlays activeCount={0} readingCount={0} stationCount={0} />
+      <MapOverlays
+        activeCount={0}
+        readingCount={0}
+        stationCount={0}
+        timeRange="live"
+        onTimeRangeChange={() => undefined}
+      />
     </div>
   );
 }
 
-function MapOverlays({ activeCount, readingCount, stationCount }: { activeCount: number; readingCount: number; stationCount: number }) {
-  const [timeRange, setTimeRange] = useState(100);
+const MAX_ACTIVE_REEFS = 20;
 
+type TimeRangeMode = 'past-week' | 'live' | 'forecast';
+
+const timeRangeOptions: Array<{ value: TimeRangeMode; label: string; description: string }> = [
+  { value: 'past-week', label: 'Past Week', description: 'Historical cached readings' },
+  { value: 'live', label: 'Live', description: 'Current NOAA readings' },
+  { value: 'forecast', label: 'Forecast', description: 'Forecast mode preview' },
+];
+
+const timeRangeLabels: Record<TimeRangeMode, string> = {
+  'past-week': 'Past week cached readings',
+  live: 'Live NOAA readings',
+  forecast: 'Forecast mode preview',
+};
+
+const getStatusFromRiskScore = (riskScore: number): LiveReef['status'] => {
+  if (riskScore >= 70) return 'critical';
+  if (riskScore >= 40) return 'warning';
+  return 'safe';
+};
+
+const adjustNullableNumber = (value: number | null, amount: number) => {
+  if (value === null || value === undefined) return value;
+  return Number((value + amount).toFixed(1));
+};
+
+const getReefForTimeRange = (reef: LiveReef, timeRange: TimeRangeMode): LiveReef => {
+  if (timeRange === 'live') return reef;
+
+  if (timeRange === 'past-week') {
+    return {
+      ...reef,
+      source: reef.source === 'fallback' ? 'NOAA cached fallback' : 'NOAA cached',
+    };
+  }
+
+  const riskScore = Math.min(100, reef.riskScore + 8);
+
+  return {
+    ...reef,
+    seaSurfaceTemp: adjustNullableNumber(reef.seaSurfaceTemp, 0.4),
+    tempAnomaly: adjustNullableNumber(reef.tempAnomaly, 0.2),
+    riskScore,
+    status: getStatusFromRiskScore(riskScore),
+    bleachingAlertLevel: `Forecast · ${reef.bleachingAlertLevel}`,
+    source: 'NOAA forecast placeholder',
+  };
+};
+
+const getStationForTimeRange = (
+  station: ReefStation | ReefStationReading,
+  timeRange: TimeRangeMode,
+): ReefStation | ReefStationReading => {
+  if (!('seaSurfaceTemp' in station) || timeRange === 'live') return station;
+
+  if (timeRange === 'past-week') {
+    return {
+      ...station,
+      source: station.source === 'fallback' ? 'NOAA cached fallback' : 'NOAA cached',
+    };
+  }
+
+  const riskScore = Math.min(100, station.riskScore + 8);
+
+  return {
+    ...station,
+    seaSurfaceTemp: adjustNullableNumber(station.seaSurfaceTemp, 0.4),
+    tempAnomaly: adjustNullableNumber(station.tempAnomaly, 0.2),
+    riskScore,
+    status: station.status === 'unavailable' ? station.status : getStatusFromRiskScore(riskScore),
+    bleachingAlertLevel: `Forecast · ${station.bleachingAlertLevel}`,
+    source: 'NOAA forecast placeholder',
+  };
+};
+
+function TimeRangeControl({
+  value,
+  onChange,
+}: {
+  value: TimeRangeMode;
+  onChange: (value: TimeRangeMode) => void;
+}) {
+  return (
+    <div className="reef-panel-soft rounded-2xl border border-gray-border/70 bg-ocean-dark/78 p-2 shadow-2xl backdrop-blur-2xl">
+      <div className="flex min-w-[280px] rounded-xl border border-cyan-glow/15 bg-ocean-medium/45 p-1">
+        {timeRangeOptions.map((option) => {
+          const isSelected = value === option.value;
+
+          return (
+            <button
+              key={option.value}
+              type="button"
+              onClick={() => onChange(option.value)}
+              aria-pressed={isSelected}
+              title={option.description}
+              className={`relative flex-1 rounded-lg px-3 py-2 text-xs transition-all ${
+                isSelected
+                  ? 'border border-cyan-glow/50 bg-cyan-glow/15 text-white shadow-[0_0_18px_rgba(0,229,255,0.22)]'
+                  : 'border border-transparent text-gray-muted hover:bg-ocean-medium/70 hover:text-gray-light'
+              }`}
+            >
+              <span className="relative z-10">{option.label}</span>
+              {isSelected && (
+                <span className="absolute inset-x-3 bottom-1 h-0.5 rounded-full bg-cyan-glow shadow-[0_0_10px_rgba(0,229,255,0.9)]" />
+              )}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function MapOverlays({
+  activeCount,
+  readingCount,
+  stationCount,
+  timeRange,
+  onTimeRangeChange,
+}: {
+  activeCount: number;
+  readingCount: number;
+  stationCount: number;
+  timeRange: TimeRangeMode;
+  onTimeRangeChange: (value: TimeRangeMode) => void;
+}) {
   return (
     <>
+      <motion.div
+        initial={{ opacity: 0, y: -16 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="absolute left-4 right-4 top-4 z-10 max-w-[360px] sm:left-8 sm:right-auto sm:top-8"
+      >
+        <TimeRangeControl value={timeRange} onChange={onTimeRangeChange} />
+      </motion.div>
+
       <motion.div
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
@@ -172,38 +324,13 @@ function MapOverlays({ activeCount, readingCount, stationCount }: { activeCount:
       </motion.div>
 
       <motion.div
-        initial={{ opacity: 0, y: 20 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ delay: 0.1 }}
-        className="reef-panel-soft absolute bottom-8 right-8 z-10 min-w-[320px] rounded-2xl border border-gray-border/70 bg-ocean-dark/72 p-5 shadow-2xl backdrop-blur-2xl"
-      >
-        <h4 className="mb-4 text-xs uppercase tracking-wider text-gray-muted">Time Range</h4>
-        <div className="space-y-4">
-          <input
-            type="range"
-            min="0"
-            max="100"
-            value={timeRange}
-            onChange={(event) => setTimeRange(Number(event.target.value))}
-            className="h-1.5 w-full cursor-pointer appearance-none rounded-lg bg-ocean-medium accent-cyan-glow"
-            aria-label="Map time range"
-          />
-          <div className="flex justify-between text-xs text-gray-muted">
-            <span>Past Week</span>
-            <span className="text-cyan-glow">Live</span>
-            <span>Forecast</span>
-          </div>
-        </div>
-      </motion.div>
-
-      <motion.div
         initial={{ opacity: 0, y: 16 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ delay: 0.2 }}
         className="reef-panel-strong absolute bottom-8 left-1/2 z-10 flex -translate-x-1/2 items-center gap-3 rounded-full border border-cyan-glow/35 bg-ocean-dark/78 px-5 py-3 text-sm text-gray-light shadow-2xl backdrop-blur-2xl"
       >
         <Radio className="h-4 w-4 text-cyan-glow" />
-        <span><span className="text-white">{stationCount}</span> NOAA stations tracked · <span className="text-white">{readingCount}</span> stations with cached readings · <span className="text-white">{activeCount}</span> under active AI monitoring</span>
+        <span><span className="text-white">{timeRangeLabels[timeRange]}</span> · <span className="text-white">{stationCount}</span> NOAA stations tracked · <span className="text-white">{readingCount}</span> stations with cached readings · <span className="text-white">{activeCount}/{MAX_ACTIVE_REEFS}</span> reefs monitored</span>
       </motion.div>
     </>
   );
@@ -226,6 +353,14 @@ const formatDate = (value: string) => {
   });
 };
 
+const getSourceLabel = (source: string) => {
+  const normalized = source.toLowerCase();
+  if (normalized.includes('forecast')) return 'Forecast mode';
+  if (normalized.includes('cached')) return 'Cached NOAA';
+  if (normalized.includes('fallback')) return 'NOAA fallback';
+  return 'NOAA live';
+};
+
 function DetailMetric({ label, value }: { label: string; value: string | number }) {
   return (
     <div className="reef-panel-soft rounded-xl border border-gray-border/70 bg-ocean-medium/45 p-4">
@@ -235,16 +370,32 @@ function DetailMetric({ label, value }: { label: string; value: string | number 
   );
 }
 
-function ReefSelectionPanel({ reef, onClose }: { reef: LiveReef; onClose: () => void }) {
+function ReefSelectionPanel({
+  reef,
+  timeRangeLabel,
+  onClose,
+  onRemove,
+  isRemoving,
+}: {
+  reef: LiveReef;
+  timeRangeLabel: string;
+  onClose: () => void;
+  onRemove: (reef: LiveReef) => void;
+  isRemoving: boolean;
+}) {
   const markerStatus = getMarkerStatus(reef);
   const color = getRiskColor(markerStatus);
+  const bleachingAlertLevel = normalizeBleachingAlertLevel(
+    reef.bleachingAlertLevel,
+    reef.degreeHeatingWeeks,
+  );
 
   return (
     <motion.div
       initial={{ opacity: 0, x: 32 }}
       animate={{ opacity: 1, x: 0 }}
       exit={{ opacity: 0, x: 32 }}
-      className="reef-panel-strong absolute right-6 top-6 z-10 flex max-h-[calc(100%-3rem)] w-[380px] flex-col rounded-2xl border border-gray-border/70 bg-ocean-dark/88 p-6 shadow-2xl backdrop-blur-2xl"
+      className="reef-panel-strong absolute right-6 top-6 z-20 flex max-h-[calc(100%-3rem)] w-[380px] flex-col rounded-2xl border border-gray-border/70 bg-ocean-dark/88 p-6 shadow-2xl backdrop-blur-2xl"
     >
       <div className="mb-5 flex items-start justify-between gap-4">
         <div>
@@ -269,7 +420,7 @@ function ReefSelectionPanel({ reef, onClose }: { reef: LiveReef; onClose: () => 
         </span>
         <span className="flex items-center gap-2 rounded-lg border border-cyan-glow/25 bg-cyan-glow/10 px-3 py-1 text-xs text-cyan-glow">
           <Database className="h-3.5 w-3.5" />
-          {reef.source === 'fallback' ? 'NOAA fallback' : 'NOAA live'}
+          {getSourceLabel(reef.source)}
         </span>
       </div>
 
@@ -286,7 +437,7 @@ function ReefSelectionPanel({ reef, onClose }: { reef: LiveReef; onClose: () => 
             <AlertTriangle className="h-4 w-4" style={{ color }} />
             <span>Bleaching Alert Level</span>
           </div>
-          <p className="text-lg text-white">{reef.bleachingAlertLevel}</p>
+          <p className="text-lg text-white">{bleachingAlertLevel}</p>
         </div>
 
         <div className="reef-panel-soft rounded-xl border border-gray-border/70 bg-ocean-medium/45 p-4">
@@ -295,6 +446,7 @@ function ReefSelectionPanel({ reef, onClose }: { reef: LiveReef; onClose: () => 
             <span>Last Updated</span>
           </div>
           <p className="text-sm text-white">{formatDate(reef.lastUpdated)}</p>
+          <p className="mt-2 text-xs text-cyan-glow">{timeRangeLabel}</p>
         </div>
 
         <div className="flex items-center gap-2 text-sm text-gray-light">
@@ -308,21 +460,50 @@ function ReefSelectionPanel({ reef, onClose }: { reef: LiveReef; onClose: () => 
           </div>
         )}
       </div>
+
+      {reef.isCustomMonitored && (
+        <button
+          type="button"
+          onClick={() => onRemove(reef)}
+          disabled={isRemoving}
+          className="mt-5 flex w-full items-center justify-center gap-2 rounded-xl border border-coral-critical/35 bg-coral-critical/10 px-5 py-3 text-sm text-coral-critical transition hover:border-coral-critical/55 hover:bg-coral-critical/16 disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          {isRemoving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+          {isRemoving ? 'Removing...' : 'Remove from Monitoring'}
+        </button>
+      )}
     </motion.div>
   );
 }
 
-function StationSelectionPanel({ station, onClose }: { station: ReefStation | ReefStationReading; onClose: () => void }) {
+function StationSelectionPanel({
+  station,
+  timeRangeLabel,
+  onClose,
+  onAdd,
+  isAdding,
+  error,
+}: {
+  station: ReefStation | ReefStationReading;
+  timeRangeLabel: string;
+  onClose: () => void;
+  onAdd: (station: ReefStation | ReefStationReading) => void;
+  isAdding: boolean;
+  error: string | null;
+}) {
   const hasReading = 'seaSurfaceTemp' in station;
   const visualStatus = getStationVisualStatus(station);
   const color = getStationColor(visualStatus);
+  const bleachingAlertLevel = hasReading
+    ? normalizeBleachingAlertLevel(station.bleachingAlertLevel, station.degreeHeatingWeeks)
+    : null;
 
   return (
     <motion.div
       initial={{ opacity: 0, x: 32 }}
       animate={{ opacity: 1, x: 0 }}
       exit={{ opacity: 0, x: 32 }}
-      className="reef-panel-strong absolute right-6 top-6 z-10 w-[360px] rounded-2xl border border-gray-border/70 bg-ocean-dark/88 p-6 shadow-2xl backdrop-blur-2xl"
+      className="reef-panel-strong absolute right-6 top-6 z-20 w-[360px] rounded-2xl border border-gray-border/70 bg-ocean-dark/88 p-6 shadow-2xl backdrop-blur-2xl"
     >
       <div className="mb-5 flex items-start justify-between gap-4">
         <div>
@@ -365,11 +546,12 @@ function StationSelectionPanel({ station, onClose }: { station: ReefStation | Re
           </div>
           <div className="reef-panel-soft rounded-xl border border-gray-border/70 bg-ocean-medium/45 p-4">
             <p className="mb-1 text-xs uppercase tracking-wider text-gray-muted">Bleaching Alert</p>
-            <p className="text-lg text-white">{station.bleachingAlertLevel}</p>
+            <p className="text-lg text-white">{bleachingAlertLevel}</p>
           </div>
           <div className="reef-panel-soft rounded-xl border border-gray-border/70 bg-ocean-medium/45 p-4">
             <p className="mb-1 text-xs uppercase tracking-wider text-gray-muted">Last Updated</p>
             <p className="text-sm text-white">{formatDate(station.lastUpdated)}</p>
+            <p className="mt-2 text-xs text-cyan-glow">{timeRangeLabel}</p>
           </div>
           {station.error && (
             <div className="rounded-xl border border-gray-muted/40 bg-gray-muted/10 p-4 text-sm leading-relaxed text-gray-light">
@@ -382,19 +564,42 @@ function StationSelectionPanel({ station, onClose }: { station: ReefStation | Re
           <p className="mb-5 text-sm leading-relaxed text-gray-light">
             Station metadata available. Full analysis not refreshed yet.
           </p>
-          <button
-            type="button"
-            className="reef-panel-strong w-full rounded-xl border border-cyan-glow/40 bg-cyan-glow/12 px-5 py-3 text-sm text-cyan-glow transition-colors hover:border-cyan-glow/65 hover:bg-cyan-glow/18"
-          >
-            Request Full Analysis
-          </button>
         </>
       )}
+
+      {error && (
+        <div className="mt-5 rounded-xl border border-coral-warning/35 bg-coral-warning/10 p-4 text-sm leading-relaxed text-coral-warning">
+          {error}
+        </div>
+      )}
+
+      <button
+        type="button"
+        onClick={() => onAdd(station)}
+        disabled={isAdding}
+        className="reef-panel-strong mt-5 flex w-full items-center justify-center gap-2.5 rounded-xl border border-cyan-glow/35 bg-ocean-medium/85 px-5 py-3 text-sm text-white shadow-[0_0_0_1px_rgba(0,229,255,0.05)] transition-all hover:border-cyan-glow/70 hover:bg-ocean-medium hover:text-cyan-glow hover:shadow-[0_0_18px_rgba(0,229,255,0.18)] active:scale-[0.99] active:bg-ocean-dark disabled:cursor-not-allowed disabled:opacity-60"
+      >
+        {isAdding ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" aria-hidden="true" />}
+        {isAdding ? 'Initializing monitoring...' : 'Add to Active Monitoring'}
+      </button>
     </motion.div>
   );
 }
 
-export function LiveReefGoogleMap({ onReefSelect: _onReefSelect }: LiveReefGoogleMapProps) {
+function MapFocusController({ target }: { target?: SearchNavigationTarget | null }) {
+  const map = useMap();
+
+  useEffect(() => {
+    if (!map || target?.lat === undefined || target.lng === undefined) return;
+
+    map.panTo({ lat: target.lat, lng: target.lng });
+    map.setZoom(Math.max(map.getZoom() || 4, 5));
+  }, [map, target?.id, target?.lat, target?.lng]);
+
+  return null;
+}
+
+export function LiveReefGoogleMap({ onReefSelect: _onReefSelect, focusTarget }: LiveReefGoogleMapProps) {
   const apiKey = import.meta.env.VITE_GOOGLE_MAPS_API_KEY;
   const [reefs, setReefs] = useState<LiveReef[]>([]);
   const [stations, setStations] = useState<Array<ReefStation | ReefStationReading>>([]);
@@ -404,6 +609,11 @@ export function LiveReefGoogleMap({ onReefSelect: _onReefSelect }: LiveReefGoogl
   const [isLoadingStations, setIsLoadingStations] = useState(true);
   const [reefError, setReefError] = useState<string | null>(null);
   const [stationError, setStationError] = useState<string | null>(null);
+  const [monitoringError, setMonitoringError] = useState<string | null>(null);
+  const [monitoringToast, setMonitoringToast] = useState<string | null>(null);
+  const [isAddingMonitoring, setIsAddingMonitoring] = useState(false);
+  const [removingReefId, setRemovingReefId] = useState<string | null>(null);
+  const [timeRange, setTimeRange] = useState<TimeRangeMode>('live');
 
   useEffect(() => {
     let isMounted = true;
@@ -477,25 +687,110 @@ export function LiveReefGoogleMap({ onReefSelect: _onReefSelect }: LiveReefGoogl
     };
   }, []);
 
+  const displayedReefs = useMemo(
+    () => reefs.map((reef) => getReefForTimeRange(reef, timeRange)),
+    [reefs, timeRange],
+  );
+
+  const displayedStations = useMemo(
+    () => stations.map((station) => getStationForTimeRange(station, timeRange)),
+    [stations, timeRange],
+  );
+
+  useEffect(() => {
+    if (selectedReef) {
+      setSelectedReef(displayedReefs.find((reef) => reef.id === selectedReef.id) ?? null);
+    }
+  }, [displayedReefs, selectedReef?.id]);
+
+  useEffect(() => {
+    if (selectedStation) {
+      setSelectedStation(displayedStations.find((station) => station.id === selectedStation.id) ?? null);
+    }
+  }, [displayedStations, selectedStation?.id]);
+
+  useEffect(() => {
+    if (!focusTarget) return;
+
+    const matchingReef = displayedReefs.find((reef) => reef.id === focusTarget.id || reef.name === focusTarget.name);
+    if (matchingReef) {
+      setSelectedReef(matchingReef);
+      setSelectedStation(null);
+      return;
+    }
+
+    const matchingStation = displayedStations.find((station) => station.id === focusTarget.id || station.name === focusTarget.name);
+    if (matchingStation) {
+      setSelectedStation(matchingStation);
+      setSelectedReef(null);
+    }
+  }, [displayedReefs, displayedStations, focusTarget]);
+
   const markerIcons = useMemo(() => {
     return new Map<string, string>(
-      reefs.map((reef) => [
+      displayedReefs.map((reef) => [
         reef.id,
         createMarkerIcon(getMarkerStatus(reef), selectedReef?.id === reef.id),
       ]),
     );
-  }, [reefs, selectedReef?.id]);
+  }, [displayedReefs, selectedReef?.id]);
 
   const stationIcons = useMemo(() => {
     return new Map<string, string>(
-      stations.map((station) => [
+      displayedStations.map((station) => [
         station.id,
         createStationIcon(getStationVisualStatus(station), selectedStation?.id === station.id),
       ]),
     );
-  }, [stations, selectedStation?.id]);
+  }, [displayedStations, selectedStation?.id]);
 
-  const readingCount = stations.filter((station) => 'seaSurfaceTemp' in station).length;
+  const readingCount = displayedStations.filter((station) => 'seaSurfaceTemp' in station).length;
+
+  async function handleAddStationToMonitoring(station: ReefStation | ReefStationReading) {
+    setIsAddingMonitoring(true);
+    setMonitoringError(null);
+
+    try {
+      const monitoredReef = await addStationToActiveMonitoring({
+        station_id: 'stationId' in station ? station.stationId : station.id,
+        name: station.name,
+        lat: station.lat,
+        lng: station.lng,
+      });
+
+      setReefs((current) => [
+        ...current.filter((reef) => reef.id !== monitoredReef.id && reef.stationId !== monitoredReef.stationId),
+        monitoredReef,
+      ]);
+      setSelectedStation(null);
+      setSelectedReef(monitoredReef);
+      setMonitoringToast(`${monitoredReef.name} is now under active AI monitoring`);
+      window.setTimeout(() => setMonitoringToast(null), 4200);
+    } catch (error) {
+      console.error('[LiveReefGoogleMap] add to monitoring failed', error);
+      setMonitoringError(error instanceof Error ? error.message : 'Unable to add this station to active monitoring.');
+    } finally {
+      setIsAddingMonitoring(false);
+    }
+  }
+
+  async function handleRemoveFromMonitoring(reef: LiveReef) {
+    setRemovingReefId(reef.id);
+    setMonitoringError(null);
+
+    try {
+      await removeFromActiveMonitoring(reef.id);
+      setReefs((current) => current.filter((item) => item.id !== reef.id));
+      setSelectedReef(null);
+      setMonitoringToast(`${reef.name} was removed from active monitoring`);
+      window.setTimeout(() => setMonitoringToast(null), 4200);
+    } catch (error) {
+      console.error('[LiveReefGoogleMap] remove from monitoring failed', error);
+      setMonitoringError(error instanceof Error ? error.message : 'Unable to remove this reef from active monitoring.');
+    } finally {
+      setRemovingReefId(null);
+    }
+  }
 
   if (!apiKey) {
     return <ApiKeyFallback />;
@@ -520,7 +815,8 @@ export function LiveReefGoogleMap({ onReefSelect: _onReefSelect }: LiveReefGoogl
             strictBounds: false,
           }}
         >
-          {stations.map((station) => (
+          <MapFocusController target={focusTarget} />
+          {displayedStations.map((station) => (
             <Marker
               key={station.id}
               position={{ lat: station.lat, lng: station.lng }}
@@ -534,7 +830,7 @@ export function LiveReefGoogleMap({ onReefSelect: _onReefSelect }: LiveReefGoogl
             />
           ))}
 
-          {reefs.map((reef) => (
+          {displayedReefs.map((reef) => (
             <Marker
               key={reef.id}
               position={{ lat: reef.lat, lng: reef.lng }}
@@ -561,19 +857,42 @@ export function LiveReefGoogleMap({ onReefSelect: _onReefSelect }: LiveReefGoogl
           {reefError || stationError}
         </div>
       )}
+      {monitoringToast && (
+        <motion.div
+          initial={{ opacity: 0, y: -12 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="reef-panel-strong absolute right-8 top-8 z-20 flex max-w-md items-center gap-3 rounded-2xl border border-coral-safe/35 bg-ocean-dark/88 px-5 py-4 text-sm text-gray-light shadow-2xl backdrop-blur-2xl"
+        >
+          <CheckCircle2 className="h-5 w-5 text-coral-safe" />
+          <span>{monitoringToast}</span>
+        </motion.div>
+      )}
       {selectedReef && (
         <ReefSelectionPanel
           reef={selectedReef}
+          timeRangeLabel={timeRangeLabels[timeRange]}
           onClose={() => setSelectedReef(null)}
+          onRemove={handleRemoveFromMonitoring}
+          isRemoving={removingReefId === selectedReef.id}
         />
       )}
       {selectedStation && (
         <StationSelectionPanel
           station={selectedStation}
+          timeRangeLabel={timeRangeLabels[timeRange]}
           onClose={() => setSelectedStation(null)}
+          onAdd={handleAddStationToMonitoring}
+          isAdding={isAddingMonitoring}
+          error={monitoringError}
         />
       )}
-      <MapOverlays activeCount={reefs.length} readingCount={readingCount} stationCount={stations.length} />
+      <MapOverlays
+        activeCount={displayedReefs.length}
+        readingCount={readingCount}
+        stationCount={displayedStations.length}
+        timeRange={timeRange}
+        onTimeRangeChange={setTimeRange}
+      />
     </div>
   );
 }

@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { motion } from 'motion/react';
 import { X, MapPin, Thermometer, Activity, TrendingUp, TrendingDown, Brain, FileDown, Loader2, Printer } from 'lucide-react';
-import { generateConservationBrief } from '../services/reefApi';
+import { generateConservationBrief, normalizeBleachingAlertLevel } from '../services/reefApi';
 
 interface ReefData {
   id: string;
@@ -118,6 +118,10 @@ export function ReefDetailPanel({ reef, onClose }: ReefDetailPanelProps) {
   const thermalStressLabel = reef.tempAnomaly === null || reef.tempAnomaly === undefined
     ? 'unavailable'
     : reef.tempAnomaly > 0 ? 'elevated' : 'normal';
+  const bleachingAlertLevel = normalizeBleachingAlertLevel(
+    reef.bleachingAlertLevel,
+    reef.degreeHeatingWeeks,
+  );
 
   const mockData = {
     confidence: reef.risk === 'critical' ? 94.2 : reef.risk === 'warning' ? 87.5 : 91.3,
@@ -141,7 +145,7 @@ export function ReefDetailPanel({ reef, onClose }: ReefDetailPanelProps) {
         sst: reef.temperature,
         anomaly: reef.tempAnomaly ?? null,
         dhw: reef.degreeHeatingWeeks ?? null,
-        alert_level: reef.bleachingAlertLevel || 'Unavailable',
+        alert_level: bleachingAlertLevel,
         risk_score: reef.bleachingRisk,
       });
       setBriefMarkdown(response.brief);
@@ -234,6 +238,11 @@ export function ReefDetailPanel({ reef, onClose }: ReefDetailPanelProps) {
             <p className="text-3xl text-white mb-2">{formatNumber(reef.degreeHeatingWeeks)}</p>
             <p className="text-sm text-gray-muted">Heating Weeks</p>
           </div>
+        </div>
+
+        <div className="reef-panel-soft rounded-xl border border-gray-border/70 bg-ocean-medium/45 p-5">
+          <p className="mb-2 text-xs uppercase tracking-wider text-gray-muted">Bleaching Alert Level</p>
+          <p className="text-xl text-white">{bleachingAlertLevel}</p>
         </div>
 
         {/* AI Confidence - More Prominent */}

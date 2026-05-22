@@ -1,52 +1,47 @@
 import { motion, AnimatePresence } from 'motion/react';
 import { useEffect, useState } from 'react';
-import { Database, Brain, FileText, AlertTriangle, CheckCircle } from 'lucide-react';
-
-interface AgentEvent {
-  id: string;
-  type: 'data' | 'analysis' | 'report' | 'alert' | 'success';
-  message: string;
-}
+import { Activity, AlertTriangle, Brain, Database, FileText, RefreshCw } from 'lucide-react';
+import { fetchAgentActivity, type AgentActivityEvent } from '../services/reefApi';
 
 const eventTypes = {
-  data: { icon: Database, color: 'text-blue-ocean' },
-  analysis: { icon: Brain, color: 'text-cyan-glow' },
-  report: { icon: FileText, color: 'text-gray-light' },
-  alert: { icon: AlertTriangle, color: 'text-coral-warning' },
-  success: { icon: CheckCircle, color: 'text-coral-safe' },
+  noaa_fetch: { icon: Database, color: 'text-blue-ocean' },
+  ai_analysis: { icon: Brain, color: 'text-cyan-glow' },
+  brief_generated: { icon: FileText, color: 'text-gray-light' },
+  noaa_error: { icon: AlertTriangle, color: 'text-coral-warning' },
+  batch_refresh: { icon: RefreshCw, color: 'text-coral-safe' },
 };
 
-const sampleEvents: Omit<AgentEvent, 'id'>[] = [
-  { type: 'data', message: 'NOAA thermal data retrieved' },
-  { type: 'analysis', message: 'Running bleaching risk analysis' },
-  { type: 'alert', message: 'Elevated temperature detected' },
-  { type: 'success', message: 'Report generated' },
-  { type: 'data', message: 'Syncing historical events' },
-  { type: 'analysis', message: 'AI confidence: 94.2%' },
-  { type: 'report', message: 'Trace logged to Arize' },
-  { type: 'alert', message: 'High-risk anomaly flagged' },
-];
+const getEventConfig = (type: AgentActivityEvent['event_type']) => (
+  eventTypes[type as keyof typeof eventTypes] || { icon: Activity, color: 'text-cyan-glow' }
+);
 
 export function LiveActivityTicker() {
-  const [currentEvent, setCurrentEvent] = useState<AgentEvent | null>(null);
+  const [currentEvent, setCurrentEvent] = useState<AgentActivityEvent | null>(null);
 
   useEffect(() => {
-    const updateEvent = () => {
-      const randomEvent = sampleEvents[Math.floor(Math.random() * sampleEvents.length)];
-      setCurrentEvent({
-        ...randomEvent,
-        id: `event-${Date.now()}`,
-      });
-    };
+    let isMounted = true;
+
+    async function updateEvent() {
+      try {
+        const [latestEvent] = await fetchAgentActivity();
+        if (isMounted) setCurrentEvent(latestEvent || null);
+      } catch {
+        if (isMounted) setCurrentEvent(null);
+      }
+    }
 
     updateEvent();
-    const interval = setInterval(updateEvent, 4000);
-    return () => clearInterval(interval);
+    const interval = window.setInterval(updateEvent, 30000);
+
+    return () => {
+      isMounted = false;
+      window.clearInterval(interval);
+    };
   }, []);
 
   if (!currentEvent) return null;
 
-  const eventConfig = eventTypes[currentEvent.type];
+  const eventConfig = getEventConfig(currentEvent.event_type);
   const Icon = eventConfig.icon;
 
   return (
@@ -74,7 +69,7 @@ export function LiveActivityTicker() {
             <div className={eventConfig.color}>
               <Icon className="w-4 h-4" />
             </div>
-            <span className="text-sm text-gray-light">{currentEvent.message}</span>
+            <span className="text-sm text-gray-light">{currentEvent.description}</span>
           </motion.div>
         </AnimatePresence>
       </div>

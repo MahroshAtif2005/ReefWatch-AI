@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { insertAgentEvent } from '../db/database.js';
 import { logReefAssessmentTrace } from './arizeService.js';
 
 // NOAA Coral Reef Watch 5km near-real-time ERDDAP griddap dataset.
@@ -23,10 +24,12 @@ const noaaClient = axios.create({
   maxRedirects: 5,
 });
 
-const NOAA_MAX_RETRIES = 2;
+const NOAA_MAX_RETRIES = 3;
 const NOAA_RETRY_DELAY_MS = 500;
+const NOAA_RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503]);
+const NOAA_RETRYABLE_ERROR_CODES = new Set(['ECONNABORTED', 'ETIMEDOUT']);
 
-const reefLocations = [
+export const reefLocations = [
   {
     id: 'raja-ampat',
     name: 'Raja Ampat',
@@ -74,6 +77,14 @@ const reefLocations = [
     country: 'United States',
     lat: 24.5551,
     lng: -81.78,
+  },
+  {
+    id: 'galapagos-reef-system',
+    name: 'Galapagos Reef System',
+    region: 'Galapagos Islands',
+    country: 'Ecuador',
+    lat: -0.8293,
+    lng: -90.9821,
   },
   {
     id: 'coral-triangle',
@@ -131,14 +142,26 @@ const parseSingleRowCsv = (csv) => {
   }), {});
 };
 
-const getBleachingAlertLevel = (alertArea) => {
-  if (alertArea === null || alertArea === undefined) return 'Unavailable';
-  return alertAreaLabels[Math.round(alertArea)] || `Alert Area ${alertArea}`;
+export const getDhwAlertArea = (degreeHeatingWeeks) => {
+  const dhw = degreeHeatingWeeks ?? 0;
+  if (dhw >= 8) return 4;
+  if (dhw > 4) return 3;
+  if (dhw > 0) return 1;
+  return 0;
+};
+
+export const getBleachingAlertLevel = (alertArea, degreeHeatingWeeks = null) => {
+  const dhwAlertArea = getDhwAlertArea(degreeHeatingWeeks);
+  const noaaAlertArea = alertArea === null || alertArea === undefined ? null : Math.round(alertArea);
+  const normalizedAlertArea = Math.max(noaaAlertArea ?? 0, dhwAlertArea);
+
+  if (noaaAlertArea === null && dhwAlertArea === 0) return 'Unavailable';
+  return alertAreaLabels[normalizedAlertArea] || `Alert Area ${normalizedAlertArea}`;
 };
 
 const calculateRisk = (degreeHeatingWeeks, alertArea) => {
   const dhw = degreeHeatingWeeks ?? 0;
-  const alert = alertArea ?? 0;
+  const alert = Math.max(alertArea ?? 0, getDhwAlertArea(degreeHeatingWeeks));
 
   if (dhw >= 8 || alert >= 4) {
     return {
@@ -147,7 +170,7 @@ const calculateRisk = (degreeHeatingWeeks, alertArea) => {
     };
   }
 
-  if (dhw >= 4 || alert >= 2) {
+  if (dhw > 4 || alert >= 2) {
     return {
       riskScore: Math.max(45, Math.min(79, Math.round(dhw * 10))),
       status: 'warning',
@@ -172,18 +195,34 @@ const buildLatestPointQuery = ({ lat, lng }) => {
   return `/${NOAA_DHW_DATASET_ID}.csv?${variables.join(',')}`;
 };
 
-const fallbackReef = (reef, error) => ({
+const unavailableReef = (reef, error) => ({
   ...reef,
   seaSurfaceTemp: null,
   tempAnomaly: null,
   degreeHeatingWeeks: null,
   bleachingAlertLevel: 'Unavailable',
   riskScore: 0,
-  status: 'safe',
+  status: 'unavailable',
+  noaa_data_available: false,
+  noaaDataAvailable: false,
   lastUpdated: new Date().toISOString(),
-  source: 'fallback',
+  source: 'NOAA Coral Reef Watch unavailable',
   error: error.message,
 });
+
+const isNoaaUnavailableError = (error) => error?.response?.status === 404;
+
+const logNoaaUnavailable = (reefId, error) => {
+  if (error.noaaUnavailableLogged) return;
+  console.warn(`[noaa] unavailable: ${reefId} (404)`);
+  error.noaaUnavailableLogged = true;
+};
+
+const isRetryableNoaaError = (error) => {
+  const status = error?.response?.status;
+  if (NOAA_RETRYABLE_STATUS_CODES.has(status)) return true;
+  return NOAA_RETRYABLE_ERROR_CODES.has(error?.code);
+};
 
 const confidenceFromCompleteness = (reef) => {
   const fields = [
@@ -209,6 +248,7 @@ const traceReefAssessment = async (reef) => {
       tempAnomaly: reef.tempAnomaly,
       degreeHeatingWeeks: reef.degreeHeatingWeeks,
       bleachingAlertLevel: reef.bleachingAlertLevel,
+      noaa_data_available: reef.noaa_data_available ?? reef.noaaDataAvailable ?? true,
     },
     aiRiskScore: reef.riskScore,
     aiConfidence: confidenceFromCompleteness(reef),
@@ -220,9 +260,9 @@ const traceReefAssessment = async (reef) => {
   });
 };
 
-export async function fetchNoaaPointCondition(point) {
+export async function fetchNoaaPointCondition(point, options = {}) {
   const query = buildLatestPointQuery(point);
-  const response = await getNoaaWithRetry(query, point.id);
+  const response = await getNoaaWithRetry(query, point.id, options);
   const row = parseSingleRowCsv(response.data);
 
   const seaSurfaceTemp = round(toNumber(row.CRW_SST));
@@ -245,9 +285,11 @@ export async function fetchNoaaPointCondition(point) {
     seaSurfaceTemp,
     tempAnomaly,
     degreeHeatingWeeks,
-    bleachingAlertLevel: getBleachingAlertLevel(alertArea),
+    bleachingAlertLevel: getBleachingAlertLevel(alertArea, degreeHeatingWeeks),
     riskScore: risk.riskScore,
     status: risk.status,
+    noaa_data_available: true,
+    noaaDataAvailable: true,
     lastUpdated: row.time || new Date().toISOString(),
     source: NOAA_SOURCE_LABEL,
   };
@@ -262,17 +304,27 @@ async function fetchReefFromNoaa(reef) {
   };
 }
 
-async function getNoaaWithRetry(query, reefId) {
+async function getNoaaWithRetry(query, reefId, options = {}) {
+  const maxRetries = options.retries ?? NOAA_MAX_RETRIES;
+  const timeout = options.timeout ?? 35000;
   let lastError;
 
-  for (let attempt = 0; attempt <= NOAA_MAX_RETRIES; attempt += 1) {
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
     try {
-      return await noaaClient.get(query);
+      return await noaaClient.get(query, { timeout });
     } catch (error) {
       lastError = error;
 
-      if (attempt < NOAA_MAX_RETRIES) {
-        console.warn(`[noaa] retry ${reefId} attempt ${attempt + 1}/${NOAA_MAX_RETRIES}`, error.message);
+      if (isNoaaUnavailableError(error)) {
+        logNoaaUnavailable(reefId, error);
+      }
+
+      if (!isRetryableNoaaError(error)) {
+        throw error;
+      }
+
+      if (attempt < maxRetries) {
+        console.warn(`[noaa] retry ${reefId} attempt ${attempt + 1}/${maxRetries}`, error.message);
         await sleep(NOAA_RETRY_DELAY_MS);
       }
     }
@@ -292,15 +344,40 @@ export async function fetchReefConditions() {
         dhw: liveReef.degreeHeatingWeeks,
         alert: liveReef.bleachingAlertLevel,
       });
+      insertAgentEvent(
+        'noaa_fetch',
+        `NOAA data retrieved for ${liveReef.name}`,
+        liveReef.name,
+        JSON.stringify({
+          sst: liveReef.seaSurfaceTemp,
+          anomaly: liveReef.tempAnomaly,
+        }),
+        new Date().toISOString(),
+      );
       await traceReefAssessment(liveReef);
       return liveReef;
     } catch (error) {
-      console.error(`[noaa] failure ${reef.id}`, error.message);
-      const fallback = fallbackReef(reef, error);
-      await traceReefAssessment(fallback);
-      return fallback;
+      if (isNoaaUnavailableError(error)) {
+        logNoaaUnavailable(reef.id, error);
+      } else {
+        console.error(`[noaa] failure ${reef.id}`, error.message);
+      }
+      insertAgentEvent(
+        'noaa_error',
+        isNoaaUnavailableError(error)
+          ? `NOAA data unavailable for ${reef.name}`
+          : `NOAA fetch failed for ${reef.name}`,
+        reef.name,
+        null,
+        new Date().toISOString(),
+      );
+      return unavailableReef(reef, error);
     }
   }));
 
   return reefs;
+}
+
+export function getBaseReefCount() {
+  return reefLocations.length;
 }

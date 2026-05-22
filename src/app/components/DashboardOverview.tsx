@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { motion } from 'motion/react';
-import { AlertTriangle, TrendingUp, Droplet, Activity, ArrowRight, MapPin } from 'lucide-react';
-import { fetchLiveReefs, type LiveReef } from '../services/reefApi';
+import { AlertTriangle, TrendingUp, Droplet, Activity, ArrowRight, MapPin, RefreshCw } from 'lucide-react';
+import { type LiveReef } from '../services/reefApi';
+import { SelfImprovementCard } from './SelfImprovementCard';
 
 interface DashboardOverviewProps {
   onNavigate: (view: string, reef?: any) => void;
@@ -47,35 +48,37 @@ export function DashboardOverview({ onNavigate }: DashboardOverviewProps) {
   const [reefs, setReefs] = useState<LiveReef[]>([]);
   const [isLoadingReefs, setIsLoadingReefs] = useState(true);
   const [reefError, setReefError] = useState<string | null>(null);
+  const [retryCount, setRetryCount] = useState(0);
 
   useEffect(() => {
     let isMounted = true;
+    setIsLoadingReefs(true);
+    setReefError(null);
 
-    async function loadLiveReefs() {
-      try {
-        const liveReefs = await fetchLiveReefs();
-
+    fetch('http://localhost:4000/api/reefs/live')
+      .then((response) => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.json() as Promise<LiveReef[]>;
+      })
+      .then((liveReefs) => {
         if (isMounted) {
           setReefs(liveReefs);
           setReefError(null);
+          console.log(`[reefwatch] loaded ${liveReefs.length} reefs from http://localhost:4000/api/reefs/live`);
         }
-      } catch (error) {
+      })
+      .catch((error) => {
         if (isMounted) {
-          setReefError('Live reef data is unavailable. Start the local backend on port 4000 to reconnect.');
+          console.warn('[reefwatch] /api/reefs/live fetch failed:', error.message);
+          setReefError('Live reef data could not be loaded.');
         }
-      } finally {
-        if (isMounted) {
-          setIsLoadingReefs(false);
-        }
-      }
-    }
+      })
+      .finally(() => {
+        if (isMounted) setIsLoadingReefs(false);
+      });
 
-    loadLiveReefs();
-
-    return () => {
-      isMounted = false;
-    };
-  }, []);
+    return () => { isMounted = false; };
+  }, [retryCount]);
 
   const reefStats = useMemo(() => ({
     total: reefs.length,
@@ -158,10 +161,25 @@ export function DashboardOverview({ onNavigate }: DashboardOverviewProps) {
           </div>
 
           {reefError && (
-            <div className="mt-6 text-sm text-coral-warning">
-              {reefError}
+            <div className="mt-6 flex items-center gap-4 text-sm text-coral-warning">
+              <span>{reefError}</span>
+              <button
+                onClick={() => setRetryCount((n) => n + 1)}
+                className="inline-flex items-center gap-2 rounded-lg border border-coral-warning/30 bg-coral-warning/10 px-3 py-1.5 text-coral-warning transition hover:bg-coral-warning/20"
+              >
+                <RefreshCw className="h-3.5 w-3.5" />
+                Retry
+              </button>
             </div>
           )}
+        </motion.div>
+
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.08 }}
+        >
+          <SelfImprovementCard />
         </motion.div>
 
         {/* Critical Alerts Section */}

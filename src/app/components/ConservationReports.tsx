@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { motion } from 'motion/react';
-import { AlertTriangle, Download, FileText, Loader2, Printer, RefreshCw } from 'lucide-react';
+import { Download, FileText, Loader2, Printer, RefreshCw } from 'lucide-react';
 import { fetchLiveReefs, generateConservationBrief, type LiveReef, type ReefBriefResponse } from '../services/reefApi';
 
 interface StoredReport {
@@ -10,6 +10,15 @@ interface StoredReport {
   riskLevel: LiveReef['status'];
   markdown: string;
   generatedAt: string;
+}
+
+interface PersistedReport {
+  id: string;
+  reef_name: string;
+  reef_id?: string;
+  risk_level: LiveReef['status'];
+  generated_at: string;
+  brief_text: string;
 }
 
 const REPORT_STORAGE_KEY = 'reefwatch:conservation-reports';
@@ -28,18 +37,56 @@ const rowStyles = {
 
 function loadStoredReports(): StoredReport[] {
   try {
-    return JSON.parse(localStorage.getItem(REPORT_STORAGE_KEY) || '[]');
+    const parsed = JSON.parse(localStorage.getItem(REPORT_STORAGE_KEY) || '[]') as Array<StoredReport | PersistedReport>;
+    return parsed.map((report) => {
+      if ('reef_name' in report) {
+        return {
+          id: report.id,
+          reefId: report.reef_id || report.id,
+          reefName: report.reef_name,
+          riskLevel: report.risk_level,
+          markdown: report.brief_text,
+          generatedAt: report.generated_at,
+        };
+      }
+
+      return report;
+    });
   } catch {
     return [];
   }
 }
 
 function saveStoredReports(reports: StoredReport[]) {
-  localStorage.setItem(REPORT_STORAGE_KEY, JSON.stringify(reports.slice(0, 5)));
+  const persisted: PersistedReport[] = reports.slice(0, 5).map((report) => ({
+    id: report.id,
+    reef_id: report.reefId,
+    reef_name: report.reefName,
+    risk_level: report.riskLevel,
+    generated_at: report.generatedAt,
+    brief_text: report.markdown,
+  }));
+  localStorage.setItem(REPORT_STORAGE_KEY, JSON.stringify(persisted));
 }
 
 function formatNumber(value: number | null, suffix = '') {
   return value === null || Number.isNaN(value) ? 'Unavailable' : `${value.toFixed(2)}${suffix}`;
+}
+
+function renderInlineMarkdown(text: string) {
+  const parts = text.split(/(\*\*[^*]+\*\*)/g);
+
+  return parts.map((part, index) => {
+    if (part.startsWith('**') && part.endsWith('**')) {
+      return (
+        <strong key={`${part}-${index}`} className="font-semibold text-cyan-glow">
+          {part.slice(2, -2)}
+        </strong>
+      );
+    }
+
+    return part;
+  });
 }
 
 function renderMarkdown(markdown: string) {
@@ -50,9 +97,12 @@ function renderMarkdown(markdown: string) {
   const flushList = () => {
     if (listItems.length > 0) {
       nodes.push(
-        <ul key={`list-${nodes.length}`} className="my-4 space-y-2 list-disc pl-6 text-gray-light">
+        <ul key={`list-${nodes.length}`} className="my-5 space-y-2 pl-1 text-gray-light">
           {listItems.map((item, index) => (
-            <li key={`${item}-${index}`}>{item.replace(/^[-*]\s*/, '')}</li>
+            <li key={`${item}-${index}`} className="flex gap-3 leading-7">
+              <span className="mt-3 h-1.5 w-1.5 shrink-0 rounded-full bg-cyan-glow shadow-[0_0_10px_rgba(0,229,255,0.65)]" />
+              <span>{renderInlineMarkdown(item.replace(/^[-*]\s*/, ''))}</span>
+            </li>
           ))}
         </ul>
       );
@@ -77,9 +127,11 @@ function renderMarkdown(markdown: string) {
 
     if (trimmed.startsWith('## ')) {
       nodes.push(
-        <h2 key={index} className="mt-7 mb-3 text-2xl text-white">
+        <div key={`divider-${index}`} className="mt-8 border-t border-cyan-glow/10 pt-6">
+          <h2 className="mb-3 text-2xl text-cyan-glow">
           {trimmed.replace(/^##\s*/, '')}
-        </h2>
+          </h2>
+        </div>
       );
     } else if (trimmed.startsWith('# ')) {
       nodes.push(
@@ -90,7 +142,7 @@ function renderMarkdown(markdown: string) {
     } else {
       nodes.push(
         <p key={index} className="mb-3 leading-7 text-gray-light">
-          {trimmed}
+          {renderInlineMarkdown(trimmed)}
         </p>
       );
     }
@@ -98,6 +150,14 @@ function renderMarkdown(markdown: string) {
 
   flushList();
   return nodes;
+}
+
+function stripMarkdownCodeFence(brief: string) {
+  return brief
+    .replace(/^```markdown\n?/, '')
+    .replace(/^```\n?/, '')
+    .replace(/```$/, '')
+    .trim();
 }
 
 function downloadCsv(reefs: LiveReef[]) {
@@ -165,34 +225,54 @@ export function ConservationReports() {
 
     setIsGenerating(true);
     setError(null);
+    let timeoutId: number | undefined;
 
     try {
-      const response: ReefBriefResponse = await generateConservationBrief({
-        reef_id: selectedReef.id,
-        reef_name: selectedReef.name,
-        sst: selectedReef.seaSurfaceTemp,
-        anomaly: selectedReef.tempAnomaly,
-        dhw: selectedReef.degreeHeatingWeeks,
-        alert_level: selectedReef.bleachingAlertLevel,
-        risk_score: selectedReef.riskScore,
+      const timeout = new Promise<never>((_, reject) => {
+        timeoutId = window.setTimeout(() => reject(new Error('timeout')), 30000);
       });
+      const response: ReefBriefResponse = await Promise.race([
+        generateConservationBrief({
+          reef_id: selectedReef.id,
+          reef_name: selectedReef.name,
+          sst: selectedReef.seaSurfaceTemp,
+          anomaly: selectedReef.tempAnomaly,
+          dhw: selectedReef.degreeHeatingWeeks,
+          alert_level: selectedReef.bleachingAlertLevel,
+          risk_score: selectedReef.riskScore,
+        }),
+        timeout,
+      ]);
+      const cleanBrief = stripMarkdownCodeFence(response.brief);
       const report: StoredReport = {
         id: `${selectedReef.id}-${Date.now()}`,
         reefId: selectedReef.id,
         reefName: response.reef_name || selectedReef.name,
         riskLevel: selectedReef.status,
-        markdown: response.brief,
+        markdown: cleanBrief,
         generatedAt: response.generated_at || new Date().toISOString(),
       };
       const nextReports = [report, ...reports].slice(0, 5);
       setReports(nextReports);
       setActiveReport(report);
       saveStoredReports(nextReports);
-    } catch {
-      setError('The AI service could not generate a report. Confirm FastAPI is running on port 8000 and Gemini is configured.');
+    } catch (requestError) {
+      if (requestError instanceof Error && requestError.message === 'timeout') {
+        setError('Report generation timed out after 30 seconds. Please try again.');
+      } else {
+        setError(requestError instanceof Error ? requestError.message : 'Failed to generate report. Please try again.');
+      }
     } finally {
+      if (timeoutId) {
+        window.clearTimeout(timeoutId);
+      }
       setIsGenerating(false);
     }
+  }
+
+  function handleGenerateNewReport() {
+    setActiveReport(null);
+    setError(null);
   }
 
   return (
@@ -227,79 +307,103 @@ export function ConservationReports() {
         animate={{ opacity: 1, y: 0 }}
         className="reef-panel-strong rounded-2xl border border-gray-border/70 bg-ocean-dark/70 p-6"
       >
-        <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
-          <div className="flex-1">
-            <label className="mb-2 block text-sm text-gray-light">Monitored Reef</label>
-            <select
-              value={selectedReefId}
-              onChange={(event) => setSelectedReefId(event.target.value)}
-              className="w-full rounded-xl border border-cyan-glow/15 bg-ocean-deep/70 px-4 py-3 text-white outline-none transition focus:border-cyan-glow/50"
-              disabled={isLoadingReefs || reefs.length === 0}
-            >
-              {reefs.map((reef) => (
-                <option key={reef.id} value={reef.id}>
-                  {reef.name} - {reef.country}
-                </option>
-              ))}
-            </select>
-          </div>
+        {!activeReport && (
+          <>
+            <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+              <div className="flex-1">
+                <label className="mb-2 block text-sm text-gray-light">Monitored Reef</label>
+                <select
+                  value={selectedReefId}
+                  onChange={(event) => setSelectedReefId(event.target.value)}
+                  className="w-full rounded-xl border border-cyan-glow/15 bg-ocean-deep/70 px-4 py-3 text-white outline-none transition focus:border-cyan-glow/50"
+                  disabled={isLoadingReefs || reefs.length === 0}
+                >
+                  {reefs.map((reef) => (
+                    <option key={reef.id} value={reef.id}>
+                      {reef.name} - {reef.country}
+                    </option>
+                  ))}
+                </select>
+              </div>
 
-          <button
-            onClick={handleGenerateReport}
-            disabled={!selectedReef || isGenerating}
-            className="inline-flex items-center justify-center gap-2 rounded-xl border border-cyan-glow/25 bg-cyan-glow/12 px-5 py-3 text-cyan-glow transition hover:bg-cyan-glow/18 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {isGenerating ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}
-            {isGenerating ? 'Generating Report' : 'Generate Report'}
-          </button>
-        </div>
+              <button
+                onClick={handleGenerateReport}
+                disabled={!selectedReef || isGenerating}
+                className="inline-flex items-center justify-center gap-2 rounded-xl border border-cyan-glow/30 bg-ocean-medium/85 px-5 py-3 text-white shadow-[0_0_18px_rgba(0,229,255,0.08)] transition-all hover:border-cyan-glow/70 hover:bg-ocean-medium hover:text-cyan-glow hover:shadow-[0_0_22px_rgba(0,229,255,0.18)] disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {isGenerating ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}
+                {isGenerating ? 'Gemini is analyzing reef conditions...' : 'Generate Report'}
+              </button>
+            </div>
 
-        {selectedReef && (
-          <div className="mt-5 grid gap-3 text-sm text-gray-light md:grid-cols-4">
-            <span>SST: {formatNumber(selectedReef.seaSurfaceTemp, '°C')}</span>
-            <span>Anomaly: {formatNumber(selectedReef.tempAnomaly, '°C')}</span>
-            <span>DHW: {formatNumber(selectedReef.degreeHeatingWeeks)}</span>
-            <span className={`w-fit rounded-lg border px-2 py-1 capitalize ${statusStyles[selectedReef.status]}`}>
-              {selectedReef.status}
-            </span>
-          </div>
-        )}
-
-        {isGenerating && (
-          <div className="mt-6 rounded-xl border border-cyan-glow/15 bg-ocean-medium/32 p-5 text-sm text-gray-light">
-            Gemini is drafting the conservation brief from the latest NOAA snapshot...
-          </div>
-        )}
-
-        {error && (
-          <div className="mt-6 rounded-xl border border-coral-warning/35 bg-coral-warning/10 p-4 text-sm text-coral-warning">
-            {error}
-          </div>
+            {selectedReef && (
+              <div className="mt-5 grid gap-3 text-sm text-gray-light md:grid-cols-4">
+                <span>SST: {formatNumber(selectedReef.seaSurfaceTemp, '°C')}</span>
+                <span>Anomaly: {formatNumber(selectedReef.tempAnomaly, '°C')}</span>
+                <span>DHW: {formatNumber(selectedReef.degreeHeatingWeeks)}</span>
+                <span className={`w-fit rounded-lg border px-2 py-1 capitalize ${statusStyles[selectedReef.status]}`}>
+                  {selectedReef.status}
+                </span>
+              </div>
+            )}
+          </>
         )}
 
         {activeReport && (
-          <div className="mt-8">
-            <div className="mb-4 flex items-center justify-between gap-4">
+          <div>
+            <div className="mb-5 flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
               <div>
-                <h3 className="text-xl text-white">{activeReport.reefName}</h3>
+                <div className="mb-3 flex flex-wrap items-center gap-3">
+                  <h3 className="text-2xl text-white">{activeReport.reefName}</h3>
+                  <span className={`rounded-lg border px-3 py-1 text-xs capitalize ${statusStyles[activeReport.riskLevel]}`}>
+                    {activeReport.riskLevel}
+                  </span>
+                </div>
                 <p className="text-sm text-gray-muted">
                   Generated {new Date(activeReport.generatedAt).toLocaleString()}
                 </p>
               </div>
-              <button
-                onClick={() => window.print()}
-                className="print-hidden inline-flex items-center gap-2 rounded-xl border border-cyan-glow/20 bg-ocean-medium/35 px-4 py-2 text-sm text-cyan-glow transition hover:bg-cyan-glow/10"
-              >
-                <Printer className="h-4 w-4" />
-                Download as PDF
-              </button>
+              <div className="print-hidden flex flex-wrap gap-3">
+                <button
+                  onClick={() => window.print()}
+                  className="inline-flex items-center gap-2 rounded-xl border border-cyan-glow/25 bg-ocean-medium/50 px-4 py-2 text-sm text-cyan-glow transition hover:bg-cyan-glow/10"
+                >
+                  <Printer className="h-4 w-4" />
+                  Download PDF
+                </button>
+                <button
+                  onClick={handleGenerateNewReport}
+                  className="inline-flex items-center gap-2 rounded-xl border border-gray-border/70 bg-ocean-medium/45 px-4 py-2 text-sm text-gray-light transition hover:border-cyan-glow/40 hover:text-white"
+                >
+                  <RefreshCw className="h-4 w-4" />
+                  Generate New Report
+                </button>
+              </div>
             </div>
             <article
               id="reefwatch-print-report"
-              className="rounded-2xl border border-cyan-glow/12 bg-ocean-deep/58 p-7"
+              className="rounded-2xl border border-cyan-glow/20 bg-ocean-deep/58 p-8 shadow-[0_0_40px_rgba(0,229,255,0.08)]"
             >
+              <div className="mb-7 border-b border-cyan-glow/12 pb-5">
+                <p className="text-xs uppercase tracking-wider text-gray-muted">Conservation Brief</p>
+                <h1 className="mt-2 text-3xl text-white">{activeReport.reefName}</h1>
+                <p className="mt-2 text-sm text-gray-muted">Generated {new Date(activeReport.generatedAt).toLocaleString()}</p>
+              </div>
               {renderMarkdown(activeReport.markdown)}
             </article>
+          </div>
+        )}
+
+        {isGenerating && (
+          <div className="mt-6 flex items-center gap-3 rounded-xl border border-cyan-glow/15 bg-ocean-medium/32 p-5 text-sm text-gray-light">
+            <Loader2 className="h-4 w-4 animate-spin text-cyan-glow" />
+            Gemini is analyzing reef conditions...
+          </div>
+        )}
+
+        {error && (
+          <div className="mt-6 rounded-xl border border-coral-critical/35 bg-coral-critical/10 p-4 text-sm text-coral-critical">
+            {error}
           </div>
         )}
       </motion.section>
@@ -328,7 +432,7 @@ export function ConservationReports() {
                 onClick={() => setActiveReport(report)}
                 className="w-full rounded-lg border border-cyan-glow/15 px-3 py-2 text-xs text-cyan-glow transition hover:bg-cyan-glow/10"
               >
-                View
+                View Report
               </button>
             </div>
           ))}

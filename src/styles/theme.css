@@ -251,4 +251,103 @@
     box-shadow: 0 14px 34px rgba(2, 11, 20, 0.24), 0 0 0 1px rgba(34, 211, 238, 0.045), inset 0 1px 0 rgba(191, 253, 255, 0.045);
     transform: translateY(-0.5px);
   }
+
+  .underwater-ambient-background {
+    position: fixed;
+    inset: 0;
+    z-index: 1;
+    overflow: hidden;
+    pointer-events: none;
+    contain: layout paint;
+  }
+
+  .underwater-ambient-fish {
+    position: absolute;
+    top: var(--fish-top);
+    left: 0;
+    opacity: var(--fish-opacity);
+    filter: blur(1.4px) drop-shadow(0 0 18px color-mix(in srgb, currentColor 42%, transparent));
+    transform: translate3d(-24vw, 0, 0) rotate(0deg) scale(var(--fish-scale));
+    animation: underwater-fish-drift var(--fish-duration) linear infinite;
+    animation-delay: var(--fish-delay);
+    transform-origin: 50% 50%;
+    will-change: transform;
+  }
+
+  .underwater-ambient-fish:nth-child(even) {
+    filter: blur(2px) drop-shadow(0 0 22px color-mix(in srgb, currentColor 34%, transparent));
+  }
+
+  .underwater-ambient-fish__glow {
+    transform-origin: center;
+    animation: underwater-fish-pulse 12s ease-in-out infinite;
+  }
+
+  @keyframes underwater-fish-drift {
+    0% {
+      transform: translate3d(-24vw, 0, 0) rotate(0deg) scale(var(--fish-scale));
+    }
+
+    18% {
+      transform: translate3d(2vw, calc(var(--fish-wave) * -0.55), 0) rotate(var(--fish-rotation)) scale(var(--fish-scale));
+    }
+
+    38% {
+      transform: translate3d(34vw, calc(var(--fish-wave) * 0.72), 0) rotate(calc(var(--fish-rotation) * -0.7)) scale(var(--fish-scale));
+    }
+
+    61% {
+      transform: translate3d(70vw, calc(var(--fish-wave) * -1), 0) rotate(calc(var(--fish-rotation) * 0.65)) scale(var(--fish-scale));
+    }
+
+    82% {
+      transform: translate3d(102vw, calc(var(--fish-wave) * 0.45), 0) rotate(calc(var(--fish-rotation) * -0.45)) scale(var(--fish-scale));
+    }
+
+    100% {
+      transform: translate3d(124vw, 0, 0) rotate(0deg) scale(var(--fish-scale));
+    }
+  }
+
+  @keyframes underwater-fish-pulse {
+    0%,
+    100% {
+      opacity: 0.86;
+    }
+
+    50% {
+      opacity: 1;
+    }
+  }
+
+  @keyframes fade-in-down {
+    from {
+      opacity: 0;
+      transform: translateY(-8px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  @keyframes slide-progress {
+    from {
+      transform: translateX(-130%);
+    }
+    to {
+      transform: translateX(280%);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .underwater-ambient-fish,
+    .underwater-ambient-fish__glow {
+      animation: none;
+    }
+
+    .underwater-ambient-fish {
+      transform: translate3d(var(--fish-static-x), 0, 0) rotate(0deg) scale(var(--fish-scale));
+    }
+  }
 }
