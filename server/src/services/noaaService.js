@@ -83,8 +83,8 @@ export const reefLocations = [
     name: 'Galapagos Reef System',
     region: 'Galapagos Islands',
     country: 'Ecuador',
-    lat: -0.8293,
-    lng: -90.9821,
+    lat: -0.75,
+    lng: -90.25,
   },
   {
     id: 'coral-triangle',
