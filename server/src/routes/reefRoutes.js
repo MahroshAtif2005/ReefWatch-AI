@@ -14,12 +14,18 @@ const router = Router();
 
 router.get('/live', async (_req, res, next) => {
   try {
-    const reefs = [
-      ...await fetchReefConditions(),
-      ...getStoredActiveReefs(),
-    ];
-    checkAndSendAlerts(reefs).catch(console.error);
-    res.json(reefs);
+    const cached = getCachedStationReadings();
+    const active = getStoredActiveReefs();
+    const reefs = [...cached, ...active];
+    if (reefs.length > 0) {
+      checkAndSendAlerts(reefs).catch(console.error);
+      return res.json(reefs);
+    }
+
+    const live = await fetchReefConditions();
+    const all = [...live, ...active];
+    checkAndSendAlerts(all).catch(console.error);
+    res.json(all);
   } catch (error) {
     next(error);
   }

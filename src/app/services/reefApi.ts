@@ -70,6 +70,7 @@ export interface ReefChatResponse {
   data_used: string[];
   confidence: number;
   follow_up_suggestions: string[];
+  reasoning_steps?: string[];
 }
 
 export interface AiHealth {
@@ -260,7 +261,7 @@ export interface SelfImprovementHistory {
   count: number;
 }
 
-const REEF_API_BASE_URL = 'http://localhost:4000';
+const REEF_API_BASE_URL = 'https://reefwatch-backend-876566369096.us-central1.run.app';
 const SELF_EVALUATION_TIMEOUT_MS = 120000;
 export const SELF_EVALUATION_SLOW_MESSAGE =
   'AI evaluation is taking longer than expected. Try again with a smaller limit or check Gemini quota.';
@@ -485,6 +486,7 @@ export async function sendResearchChat(payload: {
     data_used: Array.isArray(data.data_used) ? data.data_used : [],
     confidence: typeof data.confidence === 'number' ? data.confidence : 0,
     follow_up_suggestions: Array.isArray(data.follow_up_suggestions) ? data.follow_up_suggestions : [],
+    reasoning_steps: Array.isArray(data.reasoning_steps) ? data.reasoning_steps : [],
   };
 }
 

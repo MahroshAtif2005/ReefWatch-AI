@@ -10,6 +10,7 @@ interface ChatEntry {
   dataUsed?: string[];
   confidence?: number;
   suggestions?: string[];
+  reasoningSteps?: string[];
   report?: string;
 }
 
@@ -142,13 +143,14 @@ export function ResearcherWorkspace() {
           dataUsed: response.data_used || [],
           confidence: response.confidence,
           suggestions: response.follow_up_suggestions || [],
+          reasoningSteps: response.reasoning_steps || [],
         },
       ]);
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'The AI chat request failed.';
       console.error('[ResearcherWorkspace] AI chat request failed', {
         error: errorMessage,
-        endpoint: 'http://localhost:4000/api/ai/chat',
+        endpoint: 'https://reefwatch-backend-876566369096.us-central1.run.app/api/ai/chat',
         message: trimmed,
       });
       setMessages((current) => [
@@ -300,13 +302,34 @@ export function ResearcherWorkspace() {
           </div>
 
           <div className="flex-1 space-y-8 overflow-auto p-6">
-            {messages.map((message) => (
+            {messages.map((message) => {
+              console.log('reasoning steps:', message.reasoningSteps);
+              return (
               <div key={message.id} className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                 <div className={`max-w-[82%] border px-5 py-4 shadow-[0_16px_36px_rgba(2,11,20,0.2)] ${
                   message.role === 'user'
                     ? 'rounded-2xl rounded-br-md border-cyan-glow/62 bg-gradient-to-br from-[#052638]/96 via-[#07344a]/94 to-[#06475e]/90 text-white shadow-[0_22px_54px_rgba(1,20,32,0.58),0_0_0_1px_rgba(0,229,255,0.08),0_0_24px_rgba(0,229,255,0.12),inset_0_1px_0_rgba(191,253,255,0.08)]'
                     : 'rounded-2xl rounded-bl-md border-cyan-glow/18 bg-gradient-to-br from-ocean-medium/52 via-ocean-dark/46 to-ocean-deep/58 text-gray-light shadow-[0_14px_34px_rgba(2,11,20,0.2),inset_0_1px_0_rgba(191,253,255,0.045)]'
                 }`}>
+                  {message.reasoningSteps && message.reasoningSteps.length > 0 && (
+                    <div className="mb-4 rounded-xl border border-cyan-glow/15 bg-ocean-deep/40 p-3">
+                      <div className="mb-2 flex items-center gap-2">
+                        <Sparkles className="h-3 w-3 text-cyan-glow" />
+                        <span className="text-[11px] font-medium uppercase tracking-wider text-cyan-glow">Agent Reasoning</span>
+                      </div>
+                      <div className="space-y-1.5">
+                        {message.reasoningSteps.map((step, i) => (
+                          <div key={i} className="flex items-start gap-2 text-xs text-gray-muted">
+                            <span className="mt-0.5 shrink-0 text-cyan-glow/60">{i + 1}.</span>
+                            <span className="leading-relaxed">{step}</span>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="mt-3 border-t border-cyan-glow/10 pt-2">
+                        <span className="text-[10px] uppercase tracking-wider text-gray-muted/50">Answer</span>
+                      </div>
+                    </div>
+                  )}
                   {renderMessageContent(message.content)}
 
                   {message.report && (
@@ -344,7 +367,8 @@ export function ResearcherWorkspace() {
                   )}
                 </div>
               </div>
-            ))}
+              );
+            })}
 
             {agentStatus !== 'ready' && (
               <div className="flex justify-start">

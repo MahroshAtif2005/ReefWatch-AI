@@ -5,7 +5,7 @@ import { scheduleStationRefresh } from './stationRefreshService.js';
 let selfImprovementInProgress = false;
 
 export function scheduleSelfImprovementLoop() {
-  cron.schedule('0 3 * * *', async () => {
+  cron.schedule('0 3 * * 0', async () => {
     if (selfImprovementInProgress) {
       console.log('[self-improvement] nightly run skipped; previous run still in progress');
       return;

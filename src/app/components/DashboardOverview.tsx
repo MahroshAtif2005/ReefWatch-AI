@@ -55,7 +55,7 @@ export function DashboardOverview({ onNavigate }: DashboardOverviewProps) {
     setIsLoadingReefs(true);
     setReefError(null);
 
-    fetch('http://localhost:4000/api/reefs/live')
+    fetch('https://reefwatch-backend-876566369096.us-central1.run.app/api/reefs/live')
       .then((response) => {
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         return response.json() as Promise<LiveReef[]>;
@@ -64,7 +64,7 @@ export function DashboardOverview({ onNavigate }: DashboardOverviewProps) {
         if (isMounted) {
           setReefs(liveReefs);
           setReefError(null);
-          console.log(`[reefwatch] loaded ${liveReefs.length} reefs from http://localhost:4000/api/reefs/live`);
+          console.log(`[reefwatch] loaded ${liveReefs.length} reefs from https://reefwatch-backend-876566369096.us-central1.run.app/api/reefs/live`);
         }
       })
       .catch((error) => {

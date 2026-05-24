@@ -1,0 +1,4 @@
+node_modules
+.env
+reefwatch.db-shm
+reefwatch.db-wal

@@ -1614,6 +1614,15 @@ Respond in JSON only with:
             span.set_status(Status(StatusCode.OK))
             span.add_event("ai_analysis_completed")
             track_analysis_metrics({"confidence": result.get("confidence")}, latency_ms, success=True)
+            raw_fields = data_need.get('data_needed', [])
+            readable_fields = [f.replace("monitored_reefs[?status=='critical'].", '').replace('_', ' ') for f in raw_fields] if raw_fields else []
+            human_fields = ', '.join(readable_fields) or 'general reef context'
+            result["reasoning_steps"] = [
+                f"Identified required data: {human_fields}",
+                f"Reasoning: {data_need.get('reasoning', 'determined live NOAA data needed')}",
+                f"Fetched live reef data and identified {len(result.get('data_used', [])) if isinstance(result.get('data_used'), list) else 0} relevant sources",
+                f"Generated answer with confidence {round((result.get('confidence') or 0) * 100)}%",
+            ]
             return result
         except Exception as error:
             latency_ms = elapsed_ms(route_start)
@@ -2196,6 +2205,61 @@ async def test_trace() -> Dict[str, str]:
             "message": "Test trace emitted. Open Phoenix locally to confirm it appears.",
             "phoenix_url": PHOENIX_UI_URL,
         }
+
+
+@app.get("/mcp/traces/recent")
+async def mcp_get_recent_traces(limit: int = 10) -> Dict[str, Any]:
+    """Phoenix MCP tool: get recent traces for agent self-introspection"""
+    try:
+        from src.db.database import getRecentArizeTraces
+        traces = getRecentArizeTraces(limit)
+        return {
+            "tool": "get_recent_traces",
+            "traces": traces,
+            "count": len(traces),
+            "description": "Recent AI inference traces from ReefWatch agent",
+        }
+    except Exception as e:
+        try:
+            async with httpx.AsyncClient() as client:
+                traces_url = PHOENIX_ENDPOINT.rstrip("/").replace("/v1/traces", "") + f"/v1/traces?limit={limit}"
+                resp = await client.get(traces_url, timeout=5.0)
+                return {"tool": "get_recent_traces", "traces": resp.json(), "source": "phoenix_api"}
+        except Exception:
+            return {"tool": "get_recent_traces", "traces": [], "error": str(e)}
+
+
+@app.get("/mcp/traces/summary")
+async def mcp_get_traces_summary() -> Dict[str, Any]:
+    """Phoenix MCP tool: get quality summary for self-improvement"""
+    try:
+        latest = latest_self_improvement_from_disk()
+        return {
+            "tool": "get_quality_summary",
+            "quality_score": latest.get("average_score"),
+            "actionability": latest.get("actionability"),
+            "accuracy": latest.get("accuracy"),
+            "prompt_updated": latest.get("prompt_updated"),
+            "summary": latest.get("summary"),
+            "description": "Agent quality metrics from self-improvement loop",
+        }
+    except Exception as e:
+        return {"tool": "get_quality_summary", "error": str(e)}
+
+
+@app.get("/mcp/tools")
+async def mcp_list_tools() -> Dict[str, Any]:
+    """Phoenix MCP: list available introspection tools"""
+    return {
+        "tools": [
+            {"name": "get_recent_traces", "endpoint": "/mcp/traces/recent", "description": "Get recent AI inference traces"},
+            {"name": "get_quality_summary", "endpoint": "/mcp/traces/summary", "description": "Get agent quality metrics"},
+            {"name": "analyze_reef", "endpoint": "/analyze-reef", "description": "Analyze reef bleaching risk"},
+            {"name": "chat", "endpoint": "/chat", "description": "Research chat with live NOAA context"},
+        ],
+        "phoenix_project": PHOENIX_PROJECT_NAME,
+        "phoenix_endpoint": PHOENIX_ENDPOINT,
+    }
 
 
 if __name__ == "__main__":

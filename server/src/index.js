@@ -14,7 +14,7 @@ import { refreshStationsOnStartupIfEmpty } from './services/stationRefreshServic
 
 const app = express();
 const port = process.env.PORT || 4000;
-const host = '127.0.0.1';
+const host = process.env.HOST || '0.0.0.0';
 
 app.use(cors({
   origin: [
@@ -25,6 +25,7 @@ app.use(cors({
     'http://127.0.0.1:5173',
     'http://127.0.0.1:5174',
     'http://127.0.0.1:5175',
+    'https://project-9b3e2672-8819-4fa5-afe.web.app',
   ],
 }));
 app.use(express.json());
@@ -56,6 +57,6 @@ app.listen(port, host, () => {
   scheduleReefWatchJobs();
 
   if (process.env.STATION_REFRESH_ON_STARTUP !== 'false') {
-    refreshStationsOnStartupIfEmpty();
+    if (!process.env.SKIP_STARTUP_REFRESH) refreshStationsOnStartupIfEmpty();
   }
 });
