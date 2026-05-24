@@ -741,6 +741,8 @@ export async function setSetting(key, value) {
   return normalizedValue;
 }
 
+export const upsertSetting = setSetting;
+
 export async function getAllSettings() {
   return getAllSettingsStatement.all().reduce((settings, row) => ({
     ...settings,

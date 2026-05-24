@@ -1,11 +1,12 @@
 import nodemailer from 'nodemailer';
-import { getSetting, insertAgentEvent } from '../db/database.js';
+import { getSetting, upsertSetting, insertAgentEvent } from '../db/database.js';
 
 const ALERT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
 const sentAlerts = new Map();
 
 const getReefAlertKey = (reef) => reef?.id || reef?.stationId || reef?.station_id || reef?.name;
+const getAlertCooldownSettingKey = (reef) => `alert_cooldown_${getReefAlertKey(reef)}`;
 
 const escapeHtml = (value) => String(value ?? '')
   .replace(/&/g, '&amp;')
@@ -43,24 +44,46 @@ async function getAlertThreshold() {
 }
 
 const isCriticalReef = (reef, threshold = 1.5) => (
-  reef?.status === 'critical'
-  || Number(reef?.riskScore) >= 75
+  Number(reef?.riskScore) >= 50
   || (reef?.tempAnomaly !== null && reef?.tempAnomaly !== undefined && Number(reef.tempAnomaly) >= threshold)
+  || (reef?.degreeHeatingWeeks !== null && reef?.degreeHeatingWeeks !== undefined && Number(reef.degreeHeatingWeeks) >= 4)
 );
 
-function rememberAlert(reef, sentTo) {
-  sentAlerts.set(getReefAlertKey(reef), {
+async function getLastAlertSentAt(reef) {
+  const reefKey = getReefAlertKey(reef);
+  const storedAt = await getSetting(getAlertCooldownSettingKey(reef));
+  if (storedAt) {
+    const cached = sentAlerts.get(reefKey) || {};
+    sentAlerts.set(reefKey, {
+      reefName: reef.name,
+      riskScore: reef.riskScore,
+      sentTo: cached.sentTo,
+      sentAt: storedAt,
+    });
+  }
+  return storedAt;
+}
+
+function isWithinCooldown(sentAt) {
+  const elapsed = sentAt ? Date.now() - new Date(sentAt).getTime() : Number.POSITIVE_INFINITY;
+  return Number.isFinite(elapsed) && elapsed < ALERT_COOLDOWN_MS;
+}
+
+async function rememberAlert(reef, sentTo) {
+  const sentAt = new Date().toISOString();
+  const reefKey = getReefAlertKey(reef);
+  sentAlerts.set(reefKey, {
     reefName: reef.name,
     riskScore: reef.riskScore,
     sentTo,
-    sentAt: new Date().toISOString(),
+    sentAt,
   });
+  await upsertSetting(getAlertCooldownSettingKey(reef), sentAt);
 }
 
 function buildRuleBasedAlertMessage(reef) {
   const reasons = [];
-  if (reef?.status === 'critical') reasons.push('reef status is marked critical');
-  if (Number(reef?.riskScore) >= 75) reasons.push(`bleaching risk is ${reef.riskScore}%`);
+  if (Number(reef?.riskScore) >= 50) reasons.push(`bleaching risk is ${reef.riskScore}%`);
   if (reef?.tempAnomaly !== null && reef?.tempAnomaly !== undefined) {
     reasons.push(`temperature anomaly is ${reef.tempAnomaly}°C`);
   }
@@ -96,9 +119,8 @@ export async function checkAndSendAlerts(reefs) {
   const criticalReefs = reefs.filter((reef) => isCriticalReef(reef, threshold));
 
   for (const reef of criticalReefs) {
-    const lastSent = sentAlerts.get(getReefAlertKey(reef));
-    const elapsed = lastSent ? Date.now() - new Date(lastSent.sentAt).getTime() : Number.POSITIVE_INFINITY;
-    if (Number.isFinite(elapsed) && elapsed < ALERT_COOLDOWN_MS) continue;
+    const storedAt = await getLastAlertSentAt(reef);
+    if (isWithinCooldown(storedAt)) continue;
 
     try {
       await sendReefAlert(reef);
@@ -117,10 +139,10 @@ export async function sendReefAlert(reef, options = {}) {
   }
 
   if (!options.bypassCooldown) {
-    const lastSent = sentAlerts.get(getReefAlertKey(reef));
-    const elapsed = lastSent ? Date.now() - new Date(lastSent.sentAt).getTime() : Number.POSITIVE_INFINITY;
-    if (Number.isFinite(elapsed) && elapsed < ALERT_COOLDOWN_MS) {
-      return { emailSent: false, skipped: true, reason: 'cooldown', reef: reef.name, sentTo: lastSent.sentTo };
+    const storedAt = await getLastAlertSentAt(reef);
+    if (isWithinCooldown(storedAt)) {
+      const inMemory = sentAlerts.get(getReefAlertKey(reef));
+      return { emailSent: false, skipped: true, reason: 'cooldown', reef: reef.name, sentTo: inMemory?.sentTo };
     }
   }
 
@@ -128,7 +150,7 @@ export async function sendReefAlert(reef, options = {}) {
   const brief = buildRuleBasedAlertMessage(reef);
   await sendAlertEmail(reef, brief, emailConfig);
   logAlertActivity(reef);
-  rememberAlert(reef, emailConfig.to);
+  await rememberAlert(reef, emailConfig.to);
   console.log(`[alert] sent email alert for ${reef.name}`);
 
   return { emailSent: true, skipped: false, reef: reef.name, sentTo: emailConfig.to };
