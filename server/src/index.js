@@ -10,7 +10,10 @@ import selfImprovementRoutes from './routes/selfImprovementRoutes.js';
 import settingsRoutes from './routes/settingsRoutes.js';
 import tracesRoutes from './routes/tracesRoutes.js';
 import { scheduleReefWatchJobs } from './services/scheduler.js';
-import { refreshStationsOnStartupIfEmpty } from './services/stationRefreshService.js';
+import { refreshStationsOnStartupIfEmpty, startStationRefresh } from './services/stationRefreshService.js';
+import { startStationEnrichment } from './services/stationEnrichmentService.js';
+import { hydrateEnrichedCacheFromDb } from './services/stationService.js';
+import { getActiveMonitoredReefs } from './db/database.js';
 
 const app = express();
 const port = process.env.PORT || 4000;
@@ -54,9 +57,20 @@ app.use((error, _req, res, _next) => {
 
 app.listen(port, host, () => {
   console.log(`ReefWatch AI backend running on http://localhost:${port}`);
+  hydrateEnrichedCacheFromDb();
   scheduleReefWatchJobs();
 
   if (process.env.STATION_REFRESH_ON_STARTUP !== 'false') {
-    if (!process.env.SKIP_STARTUP_REFRESH) refreshStationsOnStartupIfEmpty();
+    if (!process.env.SKIP_STARTUP_REFRESH) {
+      refreshStationsOnStartupIfEmpty();
+      // Also refresh any reefs that are stuck as unavailable from a previous failed fetch
+      const unavailable = getActiveMonitoredReefs().filter((r) => r.status === 'unavailable');
+      if (unavailable.length > 0) {
+        console.log(`[startup] ${unavailable.length} unavailable reefs — triggering background refresh`);
+        startStationRefresh({ reason: 'startup-unavailable-fix' });
+      }
+    }
   }
+
+  startStationEnrichment();
 });

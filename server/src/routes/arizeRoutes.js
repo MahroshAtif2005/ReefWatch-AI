@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { getArizeStatus, getLocalArizeTraces, logReefAssessmentTrace } from '../services/arizeService.js';
+import { getStoredActiveReefs } from '../services/monitoringService.js';
 
 const router = Router();
 

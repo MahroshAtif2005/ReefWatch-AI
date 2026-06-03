@@ -5,6 +5,7 @@ import {
   getLatestSelfImprovementRun,
   getPreviousSelfImprovementRun,
 } from './selfImprovementStorage.js';
+import { getStoredActiveReefs } from './monitoringService.js';
 
 const aiServiceUrl = process.env.AI_SERVICE_URL || 'http://localhost:8000';
 
@@ -75,6 +76,22 @@ function hasValidNoaaMetrics(trace) {
 
 function isValidReefAssessmentTrace(trace) {
   return isReefAssessmentTrace(trace) && hasValidNoaaMetrics(trace);
+}
+
+function filterToMonitoredTraces(traces) {
+  const monitoredKeys = new Set(
+    getStoredActiveReefs()
+      .flatMap((reef) => [reef.id, reef.stationId, reef.name])
+      .filter(Boolean)
+      .map((value) => String(value).toLowerCase()),
+  );
+
+  if (monitoredKeys.size === 0) return [];
+
+  return traces.filter((trace) => (
+    monitoredKeys.has(String(trace.reefId || '').toLowerCase())
+    || monitoredKeys.has(String(trace.reefName || '').toLowerCase())
+  ));
 }
 
 function traceToAssessment(trace) {
@@ -226,13 +243,13 @@ export async function runSelfImprovementLoop({
   console.log(`[self-improvement] date range ${startIso} -> ${endIso}`);
   console.log(`[self-improvement] Phoenix/local trace query result count=${exactDateTraces.length}`);
 
-  let traces = candidateTraces.filter(isValidReefAssessmentTrace);
+  let traces = filterToMonitoredTraces(candidateTraces.filter(isValidReefAssessmentTrace));
   console.log(`[self-improvement] reef assessment traces after filtering=${traces.length}`);
 
   if (traces.length === 0 && demo) {
     const today = getDateWindow(toIsoDate(new Date()));
     const todayTraces = getArizeTracesBetween(today.startIso, today.endIso);
-    const todayReefTraces = todayTraces.filter(isValidReefAssessmentTrace);
+    const todayReefTraces = filterToMonitoredTraces(todayTraces.filter(isValidReefAssessmentTrace));
     console.log(`[self-improvement] demo today fallback count=${todayReefTraces.length}`);
 
     if (todayReefTraces.length > 0) {
@@ -245,7 +262,7 @@ export async function runSelfImprovementLoop({
 
   if (traces.length === 0) {
     const recentTraces = getRecentArizeTraces(50);
-    const recentReefTraces = recentTraces.filter(isValidReefAssessmentTrace);
+    const recentReefTraces = filterToMonitoredTraces(recentTraces.filter(isValidReefAssessmentTrace));
     console.log(`[self-improvement] recent local fallback count=${recentReefTraces.length}`);
 
     if (recentReefTraces.length > 0) {
@@ -277,12 +294,31 @@ export async function runSelfImprovementLoop({
 
   if (assessments.length === 0 && !saveEmpty) {
     console.log('[self-improvement] empty run not saved; pass save_empty=true to persist');
-    return emptyRun({
-      date,
-      reason,
-      debug,
-      warning: warning || 'No reef assessment traces were found for the requested date or local fallback.',
-    });
+    const latest = getLatestSelfImprovementRun();
+    const cachedScores = latest && typeof latest.average_score === 'number' ? {
+      average_score: latest.average_score,
+      accuracy: latest.accuracy ?? null,
+      specificity: latest.specificity ?? null,
+      actionability: latest.actionability ?? null,
+      scientific_reliability: latest.scientific_reliability ?? null,
+      dhw_interpretation: latest.dhw_interpretation ?? latest.dhw_interpretation_accuracy ?? null,
+      dhw_interpretation_accuracy: latest.dhw_interpretation_accuracy ?? latest.dhw_interpretation ?? null,
+      uncertainty_communication: latest.uncertainty_communication ?? null,
+      hallucination_avoidance: latest.hallucination_avoidance ?? null,
+      issues: Array.isArray(latest.issues) ? latest.issues : [],
+      cached_from: latest.date,
+      cached: true,
+    } : {};
+    return {
+      ...emptyRun({
+        date,
+        reason,
+        debug,
+        warning: warning || 'No reef assessment traces were found for the requested date or local fallback.',
+      }),
+      status: 'no_traces',
+      ...cachedScores,
+    };
   }
 
   const response = await axios.post(`${aiServiceUrl}/self-improvement/run`, {

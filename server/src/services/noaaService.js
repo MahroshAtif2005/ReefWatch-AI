@@ -260,25 +260,75 @@ const traceReefAssessment = async (reef) => {
   });
 };
 
+// Offsets to try when the primary coordinate returns no data or 404.
+// The NOAA 5km grid (~0.045°/cell) can miss nearshore cells — stepping
+// outward finds the nearest valid ocean cell without leaving the region.
+// Fast (4 nearest) is used for time-sensitive paths; full (12) for background enrichment.
+const GRID_SNAP_OFFSETS_FAST = [
+  [0.05, 0], [-0.05, 0], [0, 0.05], [0, -0.05],
+];
+const GRID_SNAP_OFFSETS_FULL = [
+  ...GRID_SNAP_OFFSETS_FAST,
+  [0.10, 0], [-0.10, 0], [0, 0.10], [0, -0.10],
+  [0.10, 0.10], [-0.10, -0.10], [0.10, -0.10], [-0.10, 0.10],
+];
+
+async function fetchNoaaRow(lat, lng, reefId, options) {
+  const query = buildLatestPointQuery({ lat, lng });
+  const response = await getNoaaWithRetry(query, reefId, options);
+  return parseSingleRowCsv(response.data);
+}
+
+const parseNoaaRow = (row) => ({
+  seaSurfaceTemp: round(toNumber(row.CRW_SST)),
+  tempAnomaly: round(toNumber(row.CRW_SSTANOMALY)),
+  degreeHeatingWeeks: round(toNumber(row.CRW_DHW)),
+  alertArea: toNumber(row.CRW_BAA_7D_MAX),
+  time: row.time,
+});
+
+const hasNoaaData = ({ seaSurfaceTemp, tempAnomaly, degreeHeatingWeeks, alertArea }) =>
+  seaSurfaceTemp !== null || tempAnomaly !== null || degreeHeatingWeeks !== null || alertArea !== null;
+
 export async function fetchNoaaPointCondition(point, options = {}) {
-  const query = buildLatestPointQuery(point);
-  const response = await getNoaaWithRetry(query, point.id, options);
-  const row = parseSingleRowCsv(response.data);
+  let row = null;
+  // fast=true (default) limits snap to 4 nearest cells; set fast=false for background enrichment
+  const snapOffsets = options.fast === false ? GRID_SNAP_OFFSETS_FULL : GRID_SNAP_OFFSETS_FAST;
 
-  const seaSurfaceTemp = round(toNumber(row.CRW_SST));
-  const tempAnomaly = round(toNumber(row.CRW_SSTANOMALY));
-  const degreeHeatingWeeks = round(toNumber(row.CRW_DHW));
-  const alertArea = toNumber(row.CRW_BAA_7D_MAX);
+  // Try primary coordinate first
+  try {
+    row = parseNoaaRow(await fetchNoaaRow(point.lat, point.lng, point.id, options));
+  } catch (primaryError) {
+    // 404 = coordinate not in NOAA grid (nearshore/land cell); try nearby ocean cells
+    if (!isNoaaUnavailableError(primaryError) && !primaryError.message?.includes('no data')) {
+      throw primaryError;
+    }
+    console.warn(`[noaa] primary cell empty for ${point.id || point.name} (${point.lat},${point.lng}), trying nearby cells`);
+  }
 
-  if (
-    seaSurfaceTemp === null
-    && tempAnomaly === null
-    && degreeHeatingWeeks === null
-    && alertArea === null
-  ) {
+  // If primary returned all-nulls or missed, try offsets
+  if (!row || !hasNoaaData(row)) {
+    for (const [dLat, dLng] of snapOffsets) {
+      const snapLat = Math.round((point.lat + dLat) * 1000) / 1000;
+      const snapLng = Math.round((point.lng + dLng) * 1000) / 1000;
+      try {
+        const candidate = parseNoaaRow(await fetchNoaaRow(snapLat, snapLng, point.id, { ...options, retries: 0 }));
+        if (hasNoaaData(candidate)) {
+          console.log(`[noaa] snapped ${point.id || point.name} to (${snapLat},${snapLng})`);
+          row = candidate;
+          break;
+        }
+      } catch {
+        // Try next offset
+      }
+    }
+  }
+
+  if (!row || !hasNoaaData(row)) {
     throw new Error('NOAA returned no data for the nearest grid cell');
   }
 
+  const { seaSurfaceTemp, tempAnomaly, degreeHeatingWeeks, alertArea, time } = row;
   const risk = calculateRisk(degreeHeatingWeeks, alertArea);
 
   return {
@@ -290,7 +340,7 @@ export async function fetchNoaaPointCondition(point, options = {}) {
     status: risk.status,
     noaa_data_available: true,
     noaaDataAvailable: true,
-    lastUpdated: row.time || new Date().toISOString(),
+    lastUpdated: time || new Date().toISOString(),
     source: NOAA_SOURCE_LABEL,
   };
 }

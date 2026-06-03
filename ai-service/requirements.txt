@@ -4,6 +4,7 @@ python-dotenv
 google-generativeai
 arize-phoenix
 arize-phoenix-otel
+openinference-instrumentation-vertexai
 opentelemetry-sdk
 apscheduler
 httpx

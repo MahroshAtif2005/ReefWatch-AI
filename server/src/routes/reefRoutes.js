@@ -1,5 +1,4 @@
 import { Router } from 'express';
-import { fetchReefConditions } from '../services/noaaService.js';
 import { fetchVirtualStations } from '../services/stationService.js';
 import { getCachedStationReadings, startStationRefresh } from '../services/stationRefreshService.js';
 import { getHistoricalTrends } from '../services/historicalTrendsService.js';
@@ -14,18 +13,7 @@ const router = Router();
 
 router.get('/live', async (_req, res, next) => {
   try {
-    const cached = getCachedStationReadings();
-    const active = getStoredActiveReefs();
-    const reefs = [...cached, ...active];
-    if (reefs.length > 0) {
-      checkAndSendAlerts(reefs).catch(console.error);
-      return res.json(reefs);
-    }
-
-    const live = await fetchReefConditions();
-    const all = [...live, ...active];
-    checkAndSendAlerts(all).catch(console.error);
-    res.json(all);
+    res.json(getStoredActiveReefs());
   } catch (error) {
     next(error);
   }
@@ -83,7 +71,8 @@ router.get('/stations', async (_req, res, next) => {
     const stations = await fetchVirtualStations();
     res.json(stations);
   } catch (error) {
-    next(error);
+    console.error('[stations] all station sources failed:', error.message);
+    res.json([]);
   }
 });
 

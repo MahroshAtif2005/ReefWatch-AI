@@ -6,12 +6,13 @@ import {
   upsertActiveMonitoredReef,
 } from '../db/database.js';
 import { checkAndSendAlerts } from './alertService.js';
-import { fetchNoaaPointCondition, getBaseReefCount } from './noaaService.js';
+import { fetchNoaaPointCondition } from './noaaService.js';
+import { logReefAssessmentTrace } from './arizeService.js';
 
 const MAX_ACTIVE_REEFS = 20;
 const aiServiceUrl = process.env.AI_SERVICE_URL || 'http://localhost:8000';
-const MONITORING_NOAA_TIMEOUT_MS = 35000;
-const MONITORING_NOAA_RETRIES = 3;
+const MONITORING_NOAA_TIMEOUT_MS = 10000;
+const MONITORING_NOAA_RETRIES = 1;
 const AI_ANALYSIS_TIMEOUT_MS = 30000;
 
 const slugify = (value) => String(value || '')
@@ -74,7 +75,7 @@ export async function addStationToActiveMonitoring(station) {
   const currentCustomCount = getActiveMonitoredReefCount();
   const isExisting = getActiveMonitoredReefs().some((reef) => reef.id === id || reef.stationId === stationId);
 
-  if (!isExisting && getBaseReefCount() + currentCustomCount >= MAX_ACTIVE_REEFS) {
+  if (!isExisting && currentCustomCount >= MAX_ACTIVE_REEFS) {
     const error = new Error(`Active monitoring is capped at ${MAX_ACTIVE_REEFS} reefs.`);
     error.statusCode = 409;
     throw error;
@@ -103,9 +104,7 @@ export async function addStationToActiveMonitoring(station) {
   });
 
   let noaaDataStatus = 'fetched';
-  let aiAnalysisStatus = 'complete';
   let noaaData;
-  let aiAnalysis = null;
 
   try {
     noaaData = await fetchNoaaPointCondition(baseStation, {
@@ -114,28 +113,16 @@ export async function addStationToActiveMonitoring(station) {
     });
   } catch (error) {
     noaaDataStatus = 'unavailable';
-    aiAnalysisStatus = 'pending';
     noaaData = pendingNoaaData(baseStation, error);
     console.warn(`[monitoring] NOAA unavailable for ${baseStation.name}; adding as pending`, error.message);
-  }
-
-  if (noaaDataStatus === 'fetched') {
-    try {
-      aiAnalysis = await runAiAnalysis(baseStation, noaaData);
-    } catch (error) {
-      aiAnalysisStatus = 'pending';
-      console.warn(`[monitoring] AI analysis unavailable for ${baseStation.name}; adding without analysis`, error.message);
-    }
   }
 
   const monitoredReef = {
     ...baseStation,
     ...noaaData,
-    riskScore: typeof aiAnalysis?.risk_score === 'number' ? aiAnalysis.risk_score : noaaData.riskScore,
-    status: normalizeStatus(aiAnalysis?.risk_level, noaaData.status),
-    source: aiAnalysis ? `${noaaData.source} + ReefWatch Gemini AI` : noaaData.source,
-    aiAnalysis: aiAnalysis?.threat_summary || null,
-    confidence: typeof aiAnalysis?.confidence === 'number' ? aiAnalysis.confidence : null,
+    source: noaaData.source,
+    aiAnalysis: null,
+    confidence: null,
     createdAt: new Date().toISOString(),
     isCustomMonitored: true,
   };
@@ -143,16 +130,52 @@ export async function addStationToActiveMonitoring(station) {
   upsertActiveMonitoredReef(monitoredReef);
   checkAndSendAlerts([monitoredReef]).catch(console.error);
 
+  logReefAssessmentTrace({
+    reefId: monitoredReef.id,
+    reefName: monitoredReef.name,
+    coordinates: { lat: monitoredReef.lat, lng: monitoredReef.lng },
+    noaaInputData: {
+      seaSurfaceTemp: monitoredReef.seaSurfaceTemp,
+      tempAnomaly: monitoredReef.tempAnomaly,
+      degreeHeatingWeeks: monitoredReef.degreeHeatingWeeks,
+      bleachingAlertLevel: monitoredReef.bleachingAlertLevel,
+    },
+    aiRiskScore: monitoredReef.riskScore,
+    aiConfidence: monitoredReef.confidence ?? null,
+    modelName: 'NOAA Coral Reef Watch 5km',
+    status: monitoredReef.status,
+    timestamp: monitoredReef.lastUpdated || new Date().toISOString(),
+    source: monitoredReef.source,
+  }).catch(console.warn);
+
   console.log(`[monitoring] active ${baseStation.name}`, {
     status: monitoredReef.status,
     riskScore: monitoredReef.riskScore,
   });
 
+  // Run AI analysis in the background — update stored reef when it completes
+  if (noaaDataStatus === 'fetched') {
+    runAiAnalysis(baseStation, noaaData).then((aiAnalysis) => {
+      const enriched = {
+        ...monitoredReef,
+        riskScore: typeof aiAnalysis?.risk_score === 'number' ? aiAnalysis.risk_score : monitoredReef.riskScore,
+        status: normalizeStatus(aiAnalysis?.risk_level, monitoredReef.status),
+        source: `${noaaData.source} + ReefWatch Gemini AI`,
+        aiAnalysis: aiAnalysis?.threat_summary || null,
+        confidence: typeof aiAnalysis?.confidence === 'number' ? aiAnalysis.confidence : null,
+      };
+      upsertActiveMonitoredReef(enriched);
+      console.log(`[monitoring] AI enrichment complete for ${baseStation.name}`);
+    }).catch((error) => {
+      console.warn(`[monitoring] AI analysis background failed for ${baseStation.name}:`, error.message);
+    });
+  }
+
   return {
     success: true,
     station: monitoredReef,
     noaaData: noaaDataStatus,
-    aiAnalysis: aiAnalysisStatus,
+    aiAnalysis: 'pending',
   };
 }
 

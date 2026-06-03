@@ -1,8 +1,6 @@
 import { Router } from 'express';
 import { getAlertStatus, sendReefAlert } from '../services/alertService.js';
 import { getStoredActiveReefs } from '../services/monitoringService.js';
-import { fetchReefConditions } from '../services/noaaService.js';
-import { getCachedStationReadings } from '../services/stationRefreshService.js';
 
 const router = Router();
 
@@ -10,11 +8,7 @@ const reefKey = (reef) => reef?.id || reef?.stationId || reef?.station_id || ree
 const isCriticalReef = (reef) => reef?.status === 'critical' || Number(reef?.riskScore) >= 75;
 
 async function getAlertCandidateReefs() {
-  return [
-    ...await fetchReefConditions(),
-    ...getStoredActiveReefs(),
-    ...getCachedStationReadings(),
-  ];
+  return getStoredActiveReefs();
 }
 
 router.post('/test', async (req, res, next) => {

@@ -1,0 +1,14 @@
+.gcloudignore
+.git
+.gitignore
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.*
+dist/
+build/
+.next/
+*.log
+.DS_Store
