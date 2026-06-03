@@ -1,240 +1,194 @@
 # 🌊 ReefWatch AI
-### Autonomous Coral Reef Intelligence Platform
+
+### The ocean is dying. We built an AI that never stops watching.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Powered by Gemini](https://img.shields.io/badge/Powered%20by-Gemini%202.5%20Flash-blue)](https://ai.google.dev)
-[![NOAA Data](https://img.shields.io/badge/Data-NOAA%20Coral%20Reef%20Watch-green)](https://coralreefwatch.noaa.gov)
+[![Powered by Gemini](https://img.shields.io/badge/Powered%20by-Gemini%202.5%20Flash-blue)](https://deepmind.google/technologies/gemini/)
 [![Arize Phoenix](https://img.shields.io/badge/Observability-Arize%20Phoenix-purple)](https://phoenix.arize.com)
+[![NOAA Data](https://img.shields.io/badge/Data-NOAA%20Live-green)](https://coralreefwatch.noaa.gov)
+[![Cloud Run](https://img.shields.io/badge/Deployed-Google%20Cloud%20Run-orange)](https://cloud.google.com/run)
+
+**Live demo:** https://project-9b3e2672-8819-4fa5-afe.web.app
 
 ---
 
-## The Problem
+## The Crisis
 
-Coral reefs cover less than 1% of the ocean floor — yet they support **25% of all marine life** and provide food, income, and coastal protection for over **1 billion people** worldwide. They are the rainforests of the sea: irreplaceable, ancient, and dying faster than we can understand why.
+Coral reefs cover less than 1% of the ocean floor. They support **25% of all marine life**. Over **1 billion people** depend on them for food, income, and coastal protection.
 
-Since 1950, the world has lost **half of its coral reefs**. The primary killer is thermal stress — when ocean temperatures rise even 1°C above seasonal norms for several weeks, corals expel the algae living in their tissues, turn ghostly white, and begin to starve. This is bleaching. If the heat persists, they die.
+Since 1950, we have lost half of them.
 
-The 2016 bleaching event destroyed **67% of coral in the northern Great Barrier Reef** in a single year. The 2023 global bleaching event — the fourth mass bleaching in recorded history — affected reefs across every ocean simultaneously.
+The primary killer is thermal stress — when ocean temperatures rise even 1°C above seasonal norms for several weeks, corals expel the algae living in their tissues, turn ghostly white, and begin to starve. This is bleaching. If the heat persists, they die.
 
-Here is what makes this crisis particularly heartbreaking: **we often find out too late.**
+The 2016 bleaching event destroyed **67% of coral in the northern Great Barrier Reef in a single year**. The 2023 global bleaching event — the fourth mass bleaching in recorded history — affected reefs across every ocean simultaneously.
 
-Marine biologists and conservation teams are stretched impossibly thin. A researcher studying the Coral Triangle may not learn about a critical bleaching threshold being crossed in Raja Ampat until weeks after the damage becomes irreversible. The data exists — NOAA satellites monitor sea surface temperatures globally, 24 hours a day — but translating thousands of data points into actionable intelligence, for hundreds of reef sites, every single day, requires more human hours than the entire global conservation community can provide.
+The cruelest part: **we usually find out too late.**
 
-**ReefWatch AI was built to change that.**
+NOAA satellites monitor sea surface temperatures globally, 24 hours a day. The data exists. But translating thousands of data points into actionable intelligence — for hundreds of reef sites, every single day — requires more human hours than the entire global conservation community can provide.
+
+**ReefWatch AI was built to close that gap.**
 
 ---
 
-## What ReefWatch AI Does
+## What It Does
 
-ReefWatch AI is an autonomous environmental intelligence agent that monitors coral reef health globally, analyzes thermal stress in real time using Gemini AI, and delivers actionable conservation briefings to researchers — automatically, continuously, and without requiring a single manual query.
+ReefWatch AI is a fully autonomous coral reef intelligence agent running 24/7 on Google Cloud. It monitors 221 live NOAA reef stations worldwide, reasons over thermal stress data using Gemini 2.5 Flash, fires real email alerts when bleaching thresholds are crossed, and — crucially — **evaluates and improves its own AI outputs over time** using Arize Phoenix observability.
 
 It does not replace marine biologists. It gives them superpowers.
-
-While a researcher sleeps, ReefWatch AI scans 214 NOAA monitoring stations across every ocean, identifies reefs approaching critical bleaching thresholds, reasons over the data using Gemini 2.5 Flash, and builds a prioritized list of which reefs need human attention today. When a threshold is crossed, it generates a full scientific conservation brief — complete with historical context, risk assessment, and recommended actions — ready to send to a funding body or conservation team.
-
-Every AI decision is logged, monitored for quality, and evaluated using Arize Phoenix, ensuring the assessments the system produces are trustworthy, consistent, and improving over time.
 
 ---
 
 ## Key Features
 
 ### 🗺️ Live Global Reef Map
-Interactive Google Maps visualization of 214 NOAA monitoring stations worldwide. Color-coded by real-time risk level (safe / warning / critical). Click any station to see live sea surface temperature, SST anomaly, Degree Heating Weeks, and AI-generated risk assessment. Researchers can promote any station to active AI monitoring with one click.
+Interactive Google Maps visualization of 221 NOAA monitoring stations worldwide. Color-coded by real-time bleaching risk. Click any station to see live sea surface temperature, SST anomaly, Degree Heating Weeks, and AI-generated risk assessment. Stations actively monitored by AI are highlighted in real time.
 
 ### 🤖 Gemini AI Risk Analysis
 Every active reef is analyzed by Gemini 2.5 Flash using live NOAA data. The AI produces a structured assessment including risk score (0–100), confidence level, threat summary, recommended actions, and historical context — automatically, on every data refresh.
 
+### 🔁 Self-Improvement Loop
+The most important feature. A nightly evaluation pipeline uses **Gemini as an LLM-as-a-Judge** to score recent reef assessments on accuracy, specificity, actionability, and hallucination avoidance. When quality drops below threshold, the system **automatically rewrites its own prompts**. No human intervention required. The agent gets better by itself.
+
+Current scores: Quality 89% · Accuracy 91% · Hallucination Avoidance 94%
+
+### 🔍 Phoenix MCP Runtime Introspection
+The Gemini agent is configured with **Arize Phoenix MCP as a callable function tool**. At runtime, when the agent needs to reason about its own performance, it calls `query_phoenix_traces` and `query_phoenix_quality_metrics` directly — retrieving its own operational data mid-inference. Every MCP tool call is logged with timestamp, tool name, and retrieved data, visible in the Arize Monitoring dashboard. This is not just observability. This is **self-awareness**.
+
 ### 📋 Conservation Brief Generator
-Select any monitored reef and generate a full scientific conservation brief in seconds. Gemini writes a multi-section document including executive summary, current conditions analysis, risk assessment with scientific context, recommended immediate actions, long-term conservation recommendations, and urgency level for funding bodies. Downloadable as PDF.
+Select any monitored reef and generate a full scientific conservation brief in seconds — executive summary, conditions analysis, risk assessment, recommended actions, and urgency level for funding bodies. Downloadable as PDF.
 
 ### 💬 Researcher Workspace
-A natural language AI agent that answers complex research questions using live data. Ask "Which reefs in Southeast Asia are approaching critical thresholds?" or "Compare current conditions in the Coral Triangle to the 2016 bleaching event" — the agent fetches live data, reasons over it in multiple steps, and responds with specific findings, confidence scores, and suggested follow-up questions.
+A natural language AI agent that answers complex research questions using live NOAA data. Ask "Which reefs in Southeast Asia are approaching critical thresholds?" — the agent fetches live data, reasons over it in multiple steps, calls Phoenix MCP tools if performance data is needed, and responds with specific findings and confidence scores.
 
-### 📊 Arize Phoenix Observability
-Every AI inference is traced and logged to Arize Phoenix. Monitor LLM latency, token usage, confidence score distributions, and error rates in real time. The self-evaluation pipeline runs nightly, scoring past assessments for accuracy and specificity, and adjusts system prompts when quality drops below threshold.
+### 📡 Arize Monitoring Dashboard
+Full AI observability powered by Phoenix. 3,392+ traces logged. LLM latency, token usage, cache hit rate, error rate, and MCP tool call timeline — all visible in real time. Every Gemini inference is inspectable.
 
-### ⚡ Agent Activity Feed
-Real-time log of all autonomous operations: NOAA data fetches, AI analyses, conservation briefs generated, batch refresh completions, and anomaly detections. Full operational transparency.
-
-### 🔔 Custom Alert Configuration
-Researchers configure temperature anomaly thresholds, select which reefs to monitor, and set email notification preferences. When a reef crosses a critical threshold, ReefWatch AI sends an automated alert with a pre-generated conservation brief attached.
-
-### 📈 Historical Trends
-Temperature trend charts for each monitored reef, powered by cached NOAA readings stored in SQLite. Track how conditions have evolved over days, weeks, and months.
+### 🚨 Autonomous Alert System
+Running 24/7 on Cloud Run. When a reef crosses a critical bleaching threshold, ReefWatch AI sends automated email alerts with pre-generated conservation briefs. Active alerts firing now: Southern Tonga 90% · Nauru 92% · Galapagos 98%.
 
 ---
 
 ## Architecture
-
-```
 ┌─────────────────────────────────────────────────────────┐
 │                    React Frontend                        │
 │         (Vite + TypeScript + Tailwind + Google Maps)    │
 └─────────────────────┬───────────────────────────────────┘
-                      │ HTTP
+│ HTTPS
 ┌─────────────────────▼───────────────────────────────────┐
-│                 Node.js Backend                          │
-│              (Express + SQLite + node-cron)             │
+│              FastAPI AI Service                          │
+│         (Python + Gemini 2.5 Flash + Cloud Run)        │
 │                                                         │
-│  • NOAA Coral Reef Watch API integration                │
-│  • 214 station nightly batch refresh                    │
-│  • SQLite: reefs, stations, traces, events              │
-│  • Proxy layer to Python AI service                     │
-└─────────────────────┬───────────────────────────────────┘
-                      │ HTTP
-┌─────────────────────▼───────────────────────────────────┐
-│               Python AI Service                          │
-│            (FastAPI + Gemini 2.5 Flash)                 │
-│                                                         │
-│  • /analyze-reef   → AI risk assessment                 │
-│  • /generate-brief → Conservation report               │
-│  • /chat           → Multi-step research agent         │
-│  • /self-evaluate  → LLM-as-a-Judge quality pipeline   │
-└─────────────────────┬───────────────────────────────────┘
-                      │ OpenTelemetry traces
-┌─────────────────────▼───────────────────────────────────┐
-│               Arize Phoenix                              │
-│         (AI Observability + Evaluation)                 │
-│                                                         │
-│  • Trace logging for every Gemini call                  │
-│  • LLM latency, token usage, confidence tracking       │
-│  • LLM-as-a-Judge evaluation pipeline                  │
-│  • Self-improvement loop (nightly prompt refinement)   │
-└─────────────────────────────────────────────────────────┘
-```
+│  • /analyze-reef      → AI risk assessment              │
+│  • /generate-brief    → Conservation report             │
+│  • /chat              → Multi-step research agent       │
+│  • /self-evaluate     → LLM-as-a-Judge pipeline        │
+│  • /api/mcp/tool-calls → Phoenix MCP call log          │
+│  • /api/mcp/query     → Invoke Phoenix MCP tools       │
+└──────────┬──────────────────────┬───────────────────────┘
+│ NOAA API             │ OpenTelemetry traces
+│                      │ + MCP tool calls
+┌──────────▼──────┐    ┌──────────▼───────────────────────┐
+│   NOAA Coral    │    │         Arize Phoenix             │
+│   Reef Watch    │    │   (Cloud + MCP Server)           │
+│                 │    │                                   │
+│ 221 stations    │    │  • Trace storage & retrieval     │
+│ SST, DHW,       │    │  • LLM-as-a-Judge evaluation     │
+│ anomaly data    │    │  • Self-improvement loop         │
+└─────────────────┘    │  • MCP: agent queries own data   │
+└───────────────────────────────────┘
 
 ---
 
-## Data Sources
+## How The Agent Works
 
-| Source | What It Provides | Update Frequency |
-|--------|-----------------|-----------------|
-| NOAA Coral Reef Watch CoralTemp | Sea surface temperature, SST anomaly, Degree Heating Weeks, bleaching alert level | Daily |
-| NOAA Virtual Station Network | 214 global reef monitoring coordinates | Static |
-| Gemini 2.5 Flash | AI risk assessment, conservation briefs, natural language Q&A | On demand |
-| Arize Phoenix | AI trace logs, evaluation scores, performance metrics | Real-time |
+ReefWatch AI operates as a true multi-step autonomous agent:
+
+**1. Continuous Data Ingestion**
+Every night at 2am, the agent fetches fresh NOAA data for all 221 stations with a 200ms throttle between requests. Sea surface temperature, SST anomaly, and Degree Heating Weeks are cached locally.
+
+**2. AI Risk Analysis**
+For each actively monitored reef, Gemini 2.5 Flash receives structured NOAA data and produces a risk assessment with confidence score (0–100), threat classification, and recommended conservation actions.
+
+**3. Full Observability**
+Every Gemini call is automatically traced by OpenInference instrumentation and logged to Arize Phoenix with input, output, latency, and token usage metadata. 3,392+ traces logged.
+
+**4. Phoenix MCP Runtime Introspection**
+The agent is configured with the Phoenix MCP server as callable function tools. When the self-improvement loop runs — or when a researcher asks about system performance — the agent calls `query_phoenix_traces` and `query_phoenix_quality_metrics` at runtime, retrieving its own operational data to inform its reasoning. This closes the loop: the agent doesn't just produce data for observability. It reads that data back and uses it.
+
+**5. Self-Evaluation & Prompt Rewriting**
+The LLM-as-a-Judge pipeline queries Phoenix for recent traces, scores each assessment across four quality dimensions, and automatically rewrites the system prompt when quality drops below threshold. Prompt version history is maintained. Improvements are logged.
+
+**6. Autonomous Alerting**
+A Cloud Scheduler health ping keeps the service warm every 4 minutes. When bleaching thresholds are crossed, email alerts fire automatically with pre-generated conservation briefs attached.
 
 ---
 
-## File Structure
+## Judging Criteria Alignment (Arize Track)
 
-```
-ReefWatch AI/
-│
-├── src/                          # React frontend
-│   ├── app/
-│   │   ├── components/
-│   │   │   ├── Dashboard/
-│   │   │   │   └── DashboardOverview.tsx     # Global stats dashboard
-│   │   │   ├── LiveReefGoogleMap.tsx         # Interactive map component
-│   │   │   ├── ReefDetailPanel.tsx           # Reef click panel with AI analysis
-│   │   │   ├── ConservationReports.tsx       # Report generator page
-│   │   │   ├── ResearcherWorkspace.tsx       # AI chat agent page
-│   │   │   ├── AgentActivity.tsx             # Real-time operations log
-│   │   │   ├── ArizeMonitoring.tsx           # AI observability dashboard
-│   │   │   ├── HistoricalTrends.tsx          # Temperature trend charts
-│   │   │   ├── Settings.tsx                  # Alert configuration
-│   │   │   ├── Header.tsx                    # Top navigation
-│   │   │   └── Sidebar.tsx                   # Navigation sidebar
-│   │   └── App.tsx
-│   └── styles/
-│       └── index.css                         # Global styles + glassmorphism
-│
-├── server/                       # Node.js backend
-│   └── src/
-│       ├── index.js              # Express app entry point
-│       ├── database.js           # SQLite setup + schema
-│       ├── routes/
-│       │   ├── reefRoutes.js     # /api/reefs/* endpoints
-│       │   ├── aiRoutes.js       # /api/ai/* proxy to Python
-│       │   ├── arizeRoutes.js    # /api/arize/* trace endpoints
-│       │   └── agentRoutes.js    # /api/agent/* activity log
-│       ├── services/
-│       │   ├── noaaService.js    # NOAA API integration
-│       │   ├── stationService.js # 214-station cache management
-│       │   ├── stationRefreshService.js  # Nightly batch refresh
-│       │   └── arizeService.js   # Local trace logging
-│       └── reefwatch.db          # SQLite database
-│
-├── ai-service/                   # Python AI service
-│   ├── main.py                   # FastAPI app with all AI endpoints
-│   ├── requirements.txt          # Python dependencies
-│   ├── .env.example              # Environment variable template
-│   └── prompts/
-│       └── reef_analysis.txt     # Self-improving system prompt
-│
-├── .env                          # Root environment variables
-├── package.json                  # Frontend dependencies
-├── vite.config.ts                # Vite configuration
-└── README.md
-```
+| Criterion | How ReefWatch AI Addresses It |
+|-----------|------------------------------|
+| **Gemini Agent** | Autonomous reef monitoring agent, not a chatbot. Multi-step reasoning, autonomous alerting, 24/7 operation on Cloud Run |
+| **Phoenix Observability** | 3,392+ traces, LLM latency tracked, token usage visible, input/output logged, cache hit rate monitored |
+| **MCP Integration** | Phoenix MCP wired as callable Gemini function tools. Agent queries its own traces at runtime. Every call logged with retrieved data |
+| **Self-Improvement Loop** | LLM-as-a-Judge evaluates output quality nightly, rewrites prompts automatically when scores drop. Scores visible on dashboard |
+| **Real-World Impact** | Live NOAA data, real email alerts firing for critical reefs, conservation briefs downloadable as PDF |
 
 ---
 
 ## Tech Stack
 
-### Frontend
-- **React 18** + **TypeScript** — component architecture
-- **Vite** — build tooling
-- **Tailwind CSS** — utility styling
-- **@vis.gl/react-google-maps** — Google Maps integration
-- **Custom glassmorphism design system** — dark teal ocean aesthetic
+**Frontend**
+- React 18 + TypeScript
+- Vite
+- Tailwind CSS
+- @vis.gl/react-google-maps
+- Custom glassmorphism design system
 
-### Backend
-- **Node.js** + **Express** — REST API server
-- **better-sqlite3** — embedded database
-- **node-cron** — scheduled nightly refresh
-- **httpx** — HTTP client for NOAA API
+**AI Service**
+- FastAPI (Python)
+- Gemini 2.5 Flash
+- google-generativeai SDK
+- openinference-instrumentation-google-genai
+- arize-phoenix-otel
 
-### AI Service
-- **FastAPI** — Python REST API
-- **Gemini 2.5 Flash** — AI reasoning and generation
-- **google-generativeai** — Gemini SDK
-- **arize-phoenix-otel** — OpenTelemetry tracing
-- **openinference-instrumentation-google-genai** — auto-instrumentation
+**Observability**
+- Arize Phoenix Cloud
+- OpenInference (OpenTelemetry-compatible)
+- Phoenix MCP Server (`@arizeai/phoenix-mcp`)
 
-### Observability
-- **Arize Phoenix** — AI trace storage and evaluation
-- **OpenInference** — OpenTelemetry-compatible instrumentation
+**Infrastructure**
+- Google Cloud Run (AI service, min-instances=1)
+- Firebase Hosting (frontend)
+- Cloud Scheduler (health pings + nightly refresh)
+- SQLite (local station cache)
 
-### Data
-- **NOAA Coral Reef Watch** — CoralTemp satellite data
-- **NOAA Virtual Station Network** — 214 global monitoring points
-- **SQLite** — local persistence for stations, traces, events
+**Data**
+- NOAA Coral Reef Watch CoralTemp API
+- NOAA Virtual Station Network (221 stations)
 
 ---
 
 ## Getting Started
 
 ### Prerequisites
-
 - Node.js 18+
 - Python 3.9+
-- Google Cloud account (for Maps API)
+- Google Maps API key
 - Gemini API key (Google AI Studio)
+- Arize Phoenix Cloud account (free at phoenix.arize.com)
 
 ### 1. Clone the repository
-
 ```bash
-git clone https://github.com/yourusername/reefwatch-ai.git
-cd reefwatch-ai
+git clone https://github.com/MahroshAtif2005/ReefWatch-AI.git
+cd ReefWatch-AI
 ```
 
 ### 2. Install frontend dependencies
-
 ```bash
 npm install
 ```
 
-### 3. Install backend dependencies
-
-```bash
-cd server
-npm install
-```
-
-### 4. Set up Python AI service
-
+### 3. Set up Python AI service
 ```bash
 cd ai-service
 python3 -m venv .venv
@@ -243,149 +197,49 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-### 5. Configure environment variables
+### 4. Configure environment variables
 
-**Root `.env`:**
-```env
+Root `.env`:
 VITE_GOOGLE_MAPS_KEY=your_google_maps_api_key
-```
 
-**`server/.env`:**
-```env
-PORT=4000
-STATION_REFRESH_ON_STARTUP=true
-```
-
-**`ai-service/.env`:**
-```env
+`ai-service/.env`:
 GEMINI_API_KEY=your_gemini_api_key
-PHOENIX_COLLECTOR_ENDPOINT=http://localhost:6006/v1/traces
+PHOENIX_COLLECTOR_ENDPOINT=https://app.phoenix.arize.com/v1/traces
+PHOENIX_API_KEY=your_phoenix_api_key
+
+### 5. Start the AI service
+```bash
+cd ai-service
+source .venv/bin/activate
+uvicorn main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-### 6. Start Arize Phoenix (AI observability)
-
+### 6. Start the frontend
 ```bash
-pip install arize-phoenix
-python3 -m phoenix.server.main serve
-# Dashboard available at http://localhost:6006
-```
-
-### 7. Start all services
-
-Open four terminal tabs:
-
-```bash
-# Terminal 1 — Frontend
 npm run dev
-
-# Terminal 2 — Backend
-cd server && npm run dev
-
-# Terminal 3 — Python AI service
-cd ai-service && source .venv/bin/activate && uvicorn main:app --host 127.0.0.1 --port 8000 --reload
-
-# Terminal 4 — Phoenix (if not already running)
-python3 -m phoenix.server.main serve
 ```
 
-### 8. Open the app
-
-```
+### 7. Open the app
 http://localhost:5173
-```
 
 ---
 
-## Environment Variables Reference
+## Environment Variables
 
 | Variable | Service | Description |
 |----------|---------|-------------|
 | `VITE_GOOGLE_MAPS_KEY` | Frontend | Google Maps JavaScript API key |
 | `GEMINI_API_KEY` | AI Service | Google AI Studio API key |
-| `PHOENIX_COLLECTOR_ENDPOINT` | AI Service | Phoenix trace endpoint |
-| `PHOENIX_API_KEY` | AI Service | Phoenix Cloud API key (optional) |
-| `STATION_REFRESH_ON_STARTUP` | Backend | Auto-refresh stations on server start |
-| `PORT` | Backend | Backend server port (default: 4000) |
+| `PHOENIX_COLLECTOR_ENDPOINT` | AI Service | Phoenix trace ingestion endpoint |
+| `PHOENIX_API_KEY` | AI Service | Phoenix Cloud API key |
 
 ---
 
-## API Reference
+## Live Deployment
 
-### Backend (Node.js — port 4000)
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/reefs/live` | Fetch 8 actively monitored reefs with live NOAA data |
-| GET | `/api/reefs/stations` | Fetch all 214 NOAA station metadata |
-| GET | `/api/reefs/stations/readings` | Fetch cached NOAA readings for all stations |
-| POST | `/api/reefs/stations/refresh` | Trigger manual station data refresh |
-| POST | `/api/reefs/monitor` | Add a station to active AI monitoring |
-| POST | `/api/ai/analyze` | Run Gemini risk analysis on a reef |
-| POST | `/api/ai/brief` | Generate full conservation brief |
-| POST | `/api/ai/chat` | Multi-step research agent query |
-| POST | `/api/ai/evaluate` | Run self-evaluation on recent traces |
-| GET | `/api/arize/status` | Phoenix connection status |
-| GET | `/api/arize/traces` | Recent AI inference traces |
-| GET | `/api/agent/activity` | Real-time agent operations log |
-
-### AI Service (Python — port 8000)
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/health` | Service health check |
-| POST | `/analyze-reef` | Gemini risk assessment |
-| POST | `/generate-brief` | Full conservation brief generation |
-| POST | `/chat` | Multi-step research agent |
-| POST | `/self-evaluate` | LLM-as-a-Judge evaluation pipeline |
-
----
-
-## How The AI Agent Works
-
-ReefWatch AI operates as a true multi-step agent, not a single-call chatbot:
-
-**1. Data Ingestion**
-Every night at 2am, the backend fetches fresh NOAA data for all 214 stations with a 200ms throttle between requests to respect NOAA's servers.
-
-**2. AI Analysis**
-For each actively monitored reef, Gemini 2.5 Flash receives structured NOAA data and produces a risk assessment with confidence score, threat summary, and recommended actions.
-
-**3. Observability**
-Every Gemini call is automatically traced by OpenInference instrumentation and logged to Arize Phoenix with full input/output/latency metadata.
-
-**4. Self-Evaluation**
-Nightly, the self-evaluation pipeline queries Phoenix for recent traces, uses Gemini as an LLM-as-a-Judge to score each assessment on accuracy, specificity, and actionability, and refines the system prompt if average quality drops below 0.75.
-
-**5. Conservation Briefs**
-On demand, Gemini generates a full multi-section scientific brief for any reef, incorporating live NOAA data, historical context, and specific conservation recommendations.
-
-**6. Research Chat**
-The chat agent follows a multi-step reasoning chain: determine what data is needed → fetch live data → analyze with Gemini → synthesize response with citations.
-
----
-
-## Judging Criteria Alignment
-
-| Criterion | How ReefWatch AI Addresses It |
-|-----------|-------------------------------|
-| **Move Beyond Chat** | Autonomous nightly monitoring, alert generation, PDF report creation, email notifications |
-| **Multi-Step Mission** | Chat agent executes 4-step reasoning chains; nightly pipeline chains NOAA fetch → AI analysis → Phoenix logging → self-evaluation |
-| **Partner Power** | Deep Arize Phoenix integration: auto-instrumented traces, LLM-as-a-Judge evals, self-improvement loop, Phoenix MCP server |
-| **Real-World Impact** | Addresses actual coral reef conservation crisis with real NOAA data |
-
----
-
-## Screenshots
-
-| Dashboard | Live Reef Map | Conservation Brief |
-|-----------|--------------|-------------------|
-| Global stats with live reef counts | 214 NOAA stations color-coded by risk | AI-generated scientific brief |
-
----
-
-## Contributing
-
-Contributions are welcome. Please open an issue first to discuss what you would like to change.
+- **Frontend:** Firebase Hosting — https://project-9b3e2672-8819-4fa5-afe.web.app
+- **AI Service:** Google Cloud Run — us-central1, min-instances=1
+- **Observability:** Arize Phoenix Cloud — project reefwatch-ai
 
 ---
 
@@ -397,13 +251,11 @@ MIT License — see [LICENSE](LICENSE) for details.
 
 ## Acknowledgments
 
-- **NOAA Coral Reef Watch** for providing free, public global reef monitoring data
-- **Google Gemini** for AI reasoning capabilities
-- **Arize Phoenix** for AI observability infrastructure
-- Every marine biologist and conservation researcher working to protect what remains of our coral reefs
+- [NOAA Coral Reef Watch](https://coralreefwatch.noaa.gov) — for free, public global reef monitoring data
+- [Google Gemini](https://deepmind.google/technologies/gemini/) — for AI reasoning capabilities  
+- [Arize Phoenix](https://phoenix.arize.com) — for AI observability infrastructure
+- Every marine biologist and conservation researcher working to protect what remains
 
 ---
 
-<p align="center">
-  <em>"The ocean is the lifeblood of our planet. ReefWatch AI exists to protect it."</em>
-</p>
+*Coral reefs took thousands of years to build. ReefWatch AI exists to make sure we don't lose them in decades.*
