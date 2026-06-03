@@ -56,7 +56,7 @@ export function LiveAgentFeed() {
         setError(null);
       } catch {
         if (isMounted) {
-          setError('Agent activity is unavailable. Start the local backend on port 4000.');
+          setError('Agent activity is unavailable from the deployed ReefWatch backend.');
         }
       } finally {
         if (isMounted) setIsLoading(false);

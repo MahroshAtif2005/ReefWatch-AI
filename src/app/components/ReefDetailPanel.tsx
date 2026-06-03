@@ -150,7 +150,7 @@ export function ReefDetailPanel({ reef, onClose }: ReefDetailPanelProps) {
       });
       setBriefMarkdown(response.brief);
     } catch {
-      setBriefError('Unable to generate the conservation brief. Confirm the Node backend and Python AI service are running.');
+      setBriefError('Unable to generate the conservation brief from the deployed ReefWatch backend.');
     } finally {
       setIsGeneratingBrief(false);
     }

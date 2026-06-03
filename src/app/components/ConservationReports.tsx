@@ -203,7 +203,7 @@ export function ConservationReports() {
       })
       .catch(() => {
         if (isMounted) {
-          setError('Live reef data is unavailable. Start the local Node backend on port 4000.');
+          setError('Live reef data is unavailable from the deployed ReefWatch backend.');
         }
       })
       .finally(() => {
@@ -411,7 +411,7 @@ export function ConservationReports() {
       <section className="reef-panel rounded-2xl border border-gray-border/70 bg-ocean-dark/62 p-6">
         <div className="mb-5 flex items-center justify-between">
           <h3 className="text-2xl text-white">Recent Reports</h3>
-          <span className="text-sm text-gray-muted">Last 5 generated locally</span>
+          <span className="text-sm text-gray-muted">Last 5 generated</span>
         </div>
         <div className="grid gap-4 md:grid-cols-5">
           {reports.length === 0 && (

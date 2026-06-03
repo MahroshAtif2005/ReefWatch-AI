@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { AnimatePresence } from 'motion/react';
 import { checkBackendHealth } from './services/reefApi';
+import { ReefDataProvider } from './context/ReefDataContext';
 import { Sidebar } from './components/Sidebar';
 import { Header, type SearchNavigationTarget } from './components/Header';
 import { LiveReefGoogleMap } from './components/LiveReefGoogleMap';
@@ -36,6 +37,12 @@ export default function App() {
   const [activeView, setActiveView] = useState('dashboard');
   const [selectedReef, setSelectedReef] = useState<ReefData | null>(null);
   const [mapFocusTarget, setMapFocusTarget] = useState<SearchNavigationTarget | null>(null);
+  const [monitoredReefCount, setMonitoredReefCount] = useState(() => {
+    try {
+      const ids = JSON.parse(localStorage.getItem('reefwatch_monitored_reef_ids') || '[]');
+      return Array.isArray(ids) ? ids.length : 0;
+    } catch { return 0; }
+  });
 
   useEffect(() => {
     checkBackendHealth();
@@ -69,6 +76,7 @@ export default function App() {
   };
 
   return (
+    <ReefDataProvider>
     <div className="size-full flex text-foreground overflow-hidden relative" style={{ background: 'linear-gradient(135deg, #082e42 0%, #0d5068 35%, #0f6674 60%, #093d58 100%)' }}>
       <CoralBackground />
       <UnderwaterAmbientBackground />
@@ -83,23 +91,27 @@ export default function App() {
 
         <div className="flex-1 overflow-hidden">
           {activeView === 'dashboard' && (
-            <DashboardOverview onNavigate={handleNavigate} />
+            <DashboardOverview onNavigate={handleNavigate} monitoredReefCount={monitoredReefCount} />
           )}
 
           {activeView === 'map' && (
             <div className="h-full p-8">
               <div className="reef-panel-strong h-full rounded-3xl overflow-hidden border border-gray-border/70">
-                <LiveReefGoogleMap onReefSelect={setSelectedReef} focusTarget={mapFocusTarget} />
+                <LiveReefGoogleMap
+                  onReefSelect={setSelectedReef}
+                  focusTarget={mapFocusTarget}
+                  onMonitoredCountChange={setMonitoredReefCount}
+                />
               </div>
             </div>
           )}
 
-          {activeView === 'analysis' && (
+          {activeView === 'analytics' && (
             <div className="h-full overflow-auto p-8">
               <div className="max-w-7xl mx-auto space-y-8">
                 <div>
-                  <h2 className="text-4xl text-white mb-2">AI Analysis</h2>
-                  <p className="text-gray-muted">Intelligent bleaching risk assessment and forecasting</p>
+                  <h2 className="text-4xl text-white mb-2">Analytics</h2>
+                  <p className="text-gray-muted">Current reef conditions and historical trend analysis</p>
                 </div>
                 <AnalyticsDashboard />
               </div>
@@ -124,18 +136,6 @@ export default function App() {
                 <div className="reef-panel-soft rounded-2xl bg-ocean-dark/70 border border-gray-border/70 overflow-hidden">
                   <LiveAgentFeed />
                 </div>
-              </div>
-            </div>
-          )}
-
-          {activeView === 'trends' && (
-            <div className="h-full overflow-auto px-8 pb-8 pt-10">
-              <div className="max-w-7xl mx-auto space-y-8">
-                <div>
-                  <h2 className="text-4xl text-white mb-2">Historical Trends</h2>
-                  <p className="text-gray-muted">Long-term reef health patterns and environmental changes</p>
-                </div>
-                <AnalyticsDashboard />
               </div>
             </div>
           )}
@@ -180,5 +180,6 @@ export default function App() {
       {/* Live Activity Ticker - Show on Map Views */}
       {activeView === 'map' && <LiveActivityTicker />}
     </div>
+    </ReefDataProvider>
   );
 }

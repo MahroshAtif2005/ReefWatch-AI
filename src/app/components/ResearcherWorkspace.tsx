@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { motion } from 'motion/react';
 import { Bot, FileText, Loader2, Send, Sparkles, Zap } from 'lucide-react';
-import { fetchLiveReefs, generateConservationBrief, sendResearchChat, type LiveReef, type ReefChatMessage } from '../services/reefApi';
+import { REEF_API_BASE_URL, generateConservationBrief, sendResearchChat, type LiveReef, type ReefChatMessage } from '../services/reefApi';
+import { useReefData } from '../context/ReefDataContext';
 
 interface ChatEntry {
   id: string;
@@ -14,7 +15,7 @@ interface ChatEntry {
   report?: string;
 }
 
-const GREETING = "Hello, I'm your ReefWatch AI assistant. I have live data from 8 monitored reefs and 57 NOAA stations. What would you like to analyze today?";
+const GREETING = "Hello, I'm your ReefWatch AI assistant. I use only your actively monitored reefs for analysis, alerts, reports, and self-improvement. What would you like to analyze today?";
 
 const statusStyles = {
   safe: 'text-coral-safe bg-coral-safe/10 border-coral-safe/35',
@@ -74,8 +75,16 @@ function renderMessageContent(content: string) {
   );
 }
 
+function readLocalMonitoredCount(): number {
+  try {
+    const ids = JSON.parse(localStorage.getItem('reefwatch_monitored_reef_ids') || '[]');
+    return Array.isArray(ids) ? ids.length : 0;
+  } catch { return 0; }
+}
+
 export function ResearcherWorkspace() {
-  const [reefs, setReefs] = useState<LiveReef[]>([]);
+  const { reefs, error: reefError } = useReefData();
+  const [localMonitoredCount, setLocalMonitoredCount] = useState(readLocalMonitoredCount);
   const [messages, setMessages] = useState<ChatEntry[]>([
     {
       id: 'greeting',
@@ -86,13 +95,16 @@ export function ResearcherWorkspace() {
   ]);
   const [input, setInput] = useState('');
   const [agentStatus, setAgentStatus] = useState<'ready' | 'thinking' | 'fetching data'>('ready');
-  const [reefError, setReefError] = useState<string | null>(null);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
-    fetchLiveReefs()
-      .then(setReefs)
-      .catch(() => setReefError('Live reef context is unavailable. Start the local backend on port 4000.'));
+    const sync = () => setLocalMonitoredCount(readLocalMonitoredCount());
+    window.addEventListener('storage', sync);
+    window.addEventListener('reefwatch:monitoring-updated', sync);
+    return () => {
+      window.removeEventListener('storage', sync);
+      window.removeEventListener('reefwatch:monitoring-updated', sync);
+    };
   }, []);
 
   useEffect(() => {
@@ -150,7 +162,7 @@ export function ResearcherWorkspace() {
       const errorMessage = error instanceof Error ? error.message : 'The AI chat request failed.';
       console.error('[ResearcherWorkspace] AI chat request failed', {
         error: errorMessage,
-        endpoint: 'https://reefwatch-backend-876566369096.us-central1.run.app/api/ai/chat',
+        endpoint: `${REEF_API_BASE_URL}/api/ai/chat`,
         message: trimmed,
       });
       setMessages((current) => [
@@ -212,9 +224,9 @@ export function ResearcherWorkspace() {
         <motion.aside
           initial={{ opacity: 0, x: -14 }}
           animate={{ opacity: 1, x: 0 }}
-          className="reef-panel-strong overflow-hidden rounded-2xl border border-gray-border/70 bg-ocean-dark/68"
+          className="reef-panel-strong flex flex-col overflow-hidden rounded-2xl border border-gray-border/70 bg-ocean-dark/68"
         >
-          <div className="border-b border-cyan-glow/10 p-6">
+          <div className="shrink-0 border-b border-cyan-glow/10 p-6">
             <div className="mb-4 flex items-center justify-between">
               <h3 className="text-2xl text-white">Live Context</h3>
               <span className="inline-flex items-center gap-2 rounded-lg border border-cyan-glow/15 bg-cyan-glow/8 px-3 py-1 text-xs text-cyan-glow capitalize">
@@ -224,8 +236,8 @@ export function ResearcherWorkspace() {
             </div>
             <div className="grid grid-cols-3 gap-3">
               <div className="rounded-xl border border-cyan-glow/10 bg-ocean-medium/30 p-3">
-                <p className="text-2xl text-white">{reefs.length || '...'}</p>
-                <p className="text-xs text-gray-muted">Live reefs</p>
+                <p className="text-2xl text-white">{localMonitoredCount || reefs.length || '...'}</p>
+                <p className="text-xs text-gray-muted">Monitored</p>
               </div>
               <div className="rounded-xl border border-coral-critical/18 bg-coral-critical/7 p-3">
                 <p className="text-2xl text-coral-critical">{reefs.filter((reef) => reef.status === 'critical').length}</p>
@@ -239,7 +251,7 @@ export function ResearcherWorkspace() {
             {reefError && <p className="mt-4 text-sm text-coral-warning">{reefError}</p>}
           </div>
 
-          <div className="space-y-6 overflow-auto p-6">
+          <div className="min-h-0 flex-1 space-y-6 overflow-y-auto p-6">
             <section>
               <h4 className="mb-3 text-sm uppercase tracking-wide text-gray-muted">Active Alerts</h4>
               <div className="space-y-3">

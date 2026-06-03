@@ -155,6 +155,7 @@ export interface ArizeStatus {
     average_latency_ms: number;
     average_llm_latency_ms: number;
     average_noaa_latency_ms: number;
+    noaa_api_latency_ms: number;
     high_risk_count: number;
     fallback_count: number;
     cache_hit_rate: number;
@@ -209,7 +210,9 @@ export interface TestAlertResponse {
 }
 
 export interface SelfImprovementRun {
-  status?: 'completed' | 'partial' | 'insufficient_data' | 'timeout' | 'error' | string;
+  status?: 'completed' | 'partial' | 'insufficient_data' | 'timeout' | 'error' | 'no_traces' | string;
+  cached_from?: string | null;
+  cached?: boolean;
   date: string | null;
   assessment_count: number;
   average_score: number | null;
@@ -261,7 +264,8 @@ export interface SelfImprovementHistory {
   count: number;
 }
 
-const REEF_API_BASE_URL = 'https://reefwatch-backend-876566369096.us-central1.run.app';
+export const REEF_API_BASE_URL = 'https://reefwatch-ai-service-876566369096.us-central1.run.app';
+const BACKEND_HEALTH_TIMEOUT_MS = 4500;
 const SELF_EVALUATION_TIMEOUT_MS = 120000;
 export const SELF_EVALUATION_SLOW_MESSAGE =
   'AI evaluation is taking longer than expected. Try again with a smaller limit or check Gemini quota.';
@@ -287,20 +291,20 @@ export function normalizeBleachingAlertLevel(
 
 export async function checkBackendHealth(): Promise<boolean> {
   try {
-    const response = await fetch(`${REEF_API_BASE_URL}/api/health`, { signal: AbortSignal.timeout(4000) });
+    const response = await fetch(`${REEF_API_BASE_URL}/api/health`, { signal: AbortSignal.timeout(BACKEND_HEALTH_TIMEOUT_MS) });
     if (!response.ok) {
-      console.warn('[reefwatch] Node backend unavailable (non-OK response)');
+      console.warn('[reefwatch] Cloud Run backend unavailable (non-OK response)');
       return false;
     }
     const data = await response.json();
     if (data?.ok === true) {
-      console.log('[reefwatch] Node backend connected on port 4000');
+      console.log('[reefwatch] Cloud Run backend connected');
       return true;
     }
-    console.warn('[reefwatch] Node backend unavailable (unexpected response)');
+    console.warn('[reefwatch] Cloud Run backend unavailable (unexpected response)');
     return false;
   } catch {
-    console.warn('[reefwatch] Node backend unavailable');
+    console.warn('[reefwatch] Cloud Run backend unavailable');
     return false;
   }
 }
@@ -325,7 +329,9 @@ export async function fetchLiveReefs(): Promise<LiveReef[]> {
 }
 
 export async function fetchReefStations(): Promise<ReefStation[]> {
-  const response = await fetch(`${REEF_API_BASE_URL}/api/reefs/stations`);
+  const response = await fetch(`${REEF_API_BASE_URL}/api/reefs/stations`, {
+    signal: AbortSignal.timeout(20000),
+  });
 
   if (!response.ok) {
     throw new Error(`Reef station request failed with ${response.status}`);
@@ -526,10 +532,9 @@ export async function runSelfEvaluationNow(): Promise<SelfImprovementRun> {
   const controller = new AbortController();
   const fetchTimeout = setTimeout(() => controller.abort(), SELF_EVALUATION_TIMEOUT_MS);
   try {
-    const response = await fetch(`${REEF_API_BASE_URL}/api/ai/evaluate`, {
+    const response = await fetch(`${REEF_API_BASE_URL}/api/self-improvement/run`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ reason: 'manual-ui', limit: 2 }),
       signal: controller.signal,
     });
 

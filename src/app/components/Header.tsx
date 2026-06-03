@@ -20,7 +20,6 @@ import { AnimatePresence, motion } from 'motion/react';
 import {
   fetchHistoricalTrends,
   fetchLiveReefs,
-  fetchReefStationReadings,
   fetchReefStations,
   type HistoricalTrendsResponse,
   type LiveReef,
@@ -63,8 +62,7 @@ type NotificationItem = {
 const pageResults: SearchResult[] = [
   { id: 'page-map', title: 'Live Reef Map', subtitle: 'Explore NOAA-backed reef locations', view: 'map', type: 'page', group: 'Pages' },
   { id: 'page-reports', title: 'Conservation Reports', subtitle: 'Generate and export reef management reports', view: 'reports', type: 'page', group: 'Pages' },
-  { id: 'page-analysis', title: 'AI Analysis', subtitle: 'Risk assessment and ReefWatch intelligence', view: 'analysis', type: 'page', group: 'Pages' },
-  { id: 'page-trends', title: 'Historical Trends', subtitle: 'NOAA snapshot and historical trend monitoring', view: 'trends', type: 'page', group: 'Pages' },
+  { id: 'page-analytics', title: 'Analytics', subtitle: 'Current conditions, risk assessment and ocean trend monitoring', view: 'analytics', type: 'page', group: 'Pages' },
   { id: 'page-agents', title: 'Agent Activity', subtitle: 'Autonomous ReefWatch AI operations', view: 'agents', type: 'page', group: 'Pages' },
   { id: 'page-workspace', title: 'Researcher Workspace', subtitle: 'Ask research questions against live reef context', view: 'workspace', type: 'page', group: 'Pages' },
 ];
@@ -86,7 +84,7 @@ const initialNotifications: NotificationItem[] = [
     time: '12 min ago',
     unread: true,
     tone: 'info',
-    view: 'trends',
+    view: 'analytics',
   },
   {
     id: 'ai-insight',
@@ -95,7 +93,7 @@ const initialNotifications: NotificationItem[] = [
     time: '28 min ago',
     unread: false,
     tone: 'warning',
-    view: 'analysis',
+    view: 'analytics',
   },
 ];
 
@@ -156,7 +154,7 @@ export function Header({ onNavigate }: HeaderProps) {
     setIsSearchLoading(true);
     Promise.all([
       fetchLiveReefs(),
-      fetchReefStationReadings().catch(() => fetchReefStations()),
+      fetchReefStations(),
       fetchHistoricalTrends().catch(() => null),
     ])
       .then(([liveReefs, stationResults, trendResults]) => {
@@ -247,7 +245,7 @@ export function Header({ onNavigate }: HeaderProps) {
         id: `analysis-${reef.id}`,
         title: `${reef.name} AI analysis`,
         subtitle: `Risk ${reef.riskScore}% · ${reef.bleachingAlertLevel}`,
-        view: 'analysis',
+        view: 'analytics',
         type: 'analysis' as const,
         group: 'AI Analyses' as const,
         target: { ...reef, searchTargetType: 'analysis' as const },
@@ -258,7 +256,7 @@ export function Header({ onNavigate }: HeaderProps) {
           id: 'trend-live-snapshot',
           title: trends.mode === 'snapshot' ? 'Latest NOAA snapshot' : 'Historical NOAA trends',
           subtitle: `${trends.sourceLabel} · ${trends.totalMonitoredReefs} monitored reefs`,
-          view: 'trends',
+          view: 'analytics',
           type: 'trend',
           group: 'Historical Data',
         }]

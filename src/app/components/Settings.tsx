@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { motion } from 'motion/react';
 import { Github, Mail, RefreshCw, Save, Settings as SettingsIcon } from 'lucide-react';
-import { fetchArizeStatus, fetchLiveReefs, fetchSettings, saveSettings, type LiveReef } from '../services/reefApi';
+import { REEF_API_BASE_URL, fetchArizeStatus, fetchLiveReefs, fetchSettings, saveSettings, type LiveReef } from '../services/reefApi';
 import { Switch } from './ui/switch';
 
 interface AlertSettings {
@@ -21,7 +21,6 @@ interface RefreshSettings {
 const ALERT_SETTINGS_KEY = 'reefwatch:alert-settings';
 const ANOMALY_THRESHOLD_KEY = 'anomaly_threshold';
 const GITHUB_URL = 'https://github.com/MahroshAtif2005/ReefWatch-AI';
-const MONITORED_REEFS_KEY = 'monitored_reefs';
 const REFRESH_SETTINGS_KEY = 'reefwatch:refresh-settings';
 
 const defaultAlertSettings: AlertSettings = {
@@ -127,7 +126,6 @@ export function Settings() {
     };
   });
   const [refreshSettings, setRefreshSettings] = useState<RefreshSettings>(() => readStorage(REFRESH_SETTINGS_KEY, defaultRefreshSettings));
-  const [monitoredReefIds, setMonitoredReefIds] = useState<string[]>(() => readStorage(MONITORED_REEFS_KEY, []));
   const [alertSaveStatus, setAlertSaveStatus] = useState<'idle' | 'success' | 'error'>('idle');
   const [isSavingAlerts, setIsSavingAlerts] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -141,17 +139,9 @@ export function Settings() {
     loadServerSettings();
   }, []);
 
-  useEffect(() => {
-    if (reefs.length > 0 && monitoredReefIds.length === 0) {
-      const allIds = reefs.map((reef) => reef.id);
-      setMonitoredReefIds(allIds);
-      writeStorage(MONITORED_REEFS_KEY, allIds);
-    }
-  }, [reefs, monitoredReefIds.length]);
-
   const monitoredCount = useMemo(
-    () => reefs.filter((reef) => monitoredReefIds.includes(reef.id)).length,
-    [reefs, monitoredReefIds]
+    () => reefs.length,
+    [reefs]
   );
 
   async function loadReefs() {
@@ -218,24 +208,12 @@ export function Settings() {
     writeStorage(REFRESH_SETTINGS_KEY, updated);
   }
 
-  function setMonitored(ids: string[]) {
-    setMonitoredReefIds(ids);
-    writeStorage(MONITORED_REEFS_KEY, ids);
-  }
-
-  function toggleReef(id: string) {
-    const nextIds = monitoredReefIds.includes(id)
-      ? monitoredReefIds.filter((reefId) => reefId !== id)
-      : [...monitoredReefIds, id];
-    setMonitored(nextIds);
-  }
-
   async function checkSystemStatus() {
     fetchLiveReefs()
       .then(() => setNoaaStatus('operational'))
       .catch(() => setNoaaStatus('offline'));
 
-    fetch('http://localhost:8000/health')
+    fetch(`${REEF_API_BASE_URL}/api/ai/health`)
       .then(async (response) => {
         if (!response.ok) throw new Error('AI service offline');
         const health = await response.json();
@@ -382,28 +360,14 @@ export function Settings() {
         <div className="mb-5 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <div>
             <h3 className="text-2xl text-white">Monitored Reefs</h3>
-            <p className="text-sm text-gray-muted">{monitoredCount} of {reefs.length || 8} reefs selected for active monitoring</p>
-          </div>
-          <div className="flex gap-3">
-            <button onClick={() => setMonitored(reefs.map((reef) => reef.id))} className="rounded-xl border border-cyan-glow/15 px-4 py-2 text-sm text-cyan-glow transition hover:bg-cyan-glow/10">
-              Select All
-            </button>
-            <button onClick={() => setMonitored([])} className="rounded-xl border border-cyan-glow/15 px-4 py-2 text-sm text-gray-light transition hover:bg-ocean-medium/35">
-              Deselect All
-            </button>
+            <p className="text-sm text-gray-muted">{monitoredCount} reefs selected for active monitoring</p>
           </div>
         </div>
 
         <div className="grid gap-3 md:grid-cols-2">
           {reefs.map((reef) => (
-            <label key={reef.id} className="flex cursor-pointer items-center justify-between gap-4 rounded-xl border border-cyan-glow/10 bg-ocean-medium/25 p-4 transition hover:bg-ocean-medium/35">
+            <div key={reef.id} className="flex items-center justify-between gap-4 rounded-xl border border-cyan-glow/10 bg-ocean-medium/25 p-4">
               <div className="flex items-center gap-3">
-                <input
-                  type="checkbox"
-                  checked={monitoredReefIds.includes(reef.id)}
-                  onChange={() => toggleReef(reef.id)}
-                  className="h-4 w-4 accent-cyan-glow"
-                />
                 <div>
                   <span className="block text-sm text-white">{reef.name}</span>
                   <span className="text-xs text-gray-muted">Current temperature: {formatTemperature(reef.seaSurfaceTemp)}</span>
@@ -412,11 +376,11 @@ export function Settings() {
               <span className={`shrink-0 rounded-lg border px-2 py-1 text-[11px] capitalize ${statusStyles[reef.status]}`}>
                 {reef.status} risk
               </span>
-            </label>
+            </div>
           ))}
           {reefs.length === 0 && (
             <div className="rounded-xl border border-cyan-glow/10 bg-ocean-medium/25 p-5 text-sm text-gray-light">
-              Reef list will load when the local backend is available.
+              No reefs are actively monitored. Use the global map to select NOAA reef locations for monitoring.
             </div>
           )}
         </div>

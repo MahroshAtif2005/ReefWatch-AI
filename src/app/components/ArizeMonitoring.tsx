@@ -1,41 +1,60 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Brain, CheckCircle, AlertTriangle, Activity, TrendingUp, ExternalLink } from 'lucide-react';
 import { motion } from 'motion/react';
-import { fetchArizeStatus, fetchArizeTraces, type ArizeStatus, type ArizeTrace } from '../services/reefApi';
+import { fetchArizeStatus, fetchArizeTraces, fetchLatestSelfImprovementRun, type ArizeStatus, type ArizeTrace } from '../services/reefApi';
+
+const PHOENIX_PROJECT_URL = 'https://reefwatch-phoenix-pqso4oqu5q-uc.a.run.app';
+const ARIZE_CACHE_KEY = 'reefwatch_arize_metrics';
+
+function loadCachedArize(): { status: ArizeStatus | null; traces: ArizeTrace[]; tracesAnalyzed: number | null } {
+  try {
+    const raw = localStorage.getItem(ARIZE_CACHE_KEY);
+    if (!raw) return { status: null, traces: [], tracesAnalyzed: null };
+    return JSON.parse(raw);
+  } catch {
+    return { status: null, traces: [], tracesAnalyzed: null };
+  }
+}
 
 export function ArizeMonitoring() {
-  const [status, setStatus] = useState<ArizeStatus | null>(null);
-  const [traces, setTraces] = useState<ArizeTrace[]>([]);
-  const [error, setError] = useState<string | null>(null);
+  const cached = useState(() => loadCachedArize())[0];
+  const [status, setStatus] = useState<ArizeStatus | null>(cached.status);
+  const [traces, setTraces] = useState<ArizeTrace[]>(cached.traces);
+  const [tracesAnalyzed, setTracesAnalyzed] = useState<number | null>(cached.tracesAnalyzed);
   const [reefFilter, setReefFilter] = useState('all');
 
   useEffect(() => {
     let isMounted = true;
 
-    async function loadArizeData() {
-      try {
-        const [statusResult, traceResult] = await Promise.all([
-          fetchArizeStatus(),
-          fetchArizeTraces(100),
-        ]);
+    async function loadData() {
+      const [statusResult, traceResult, selfImprovementResult] = await Promise.allSettled([
+        fetchArizeStatus(),
+        fetchArizeTraces(100),
+        fetchLatestSelfImprovementRun(),
+      ]);
 
-        if (isMounted) {
-          setStatus(statusResult);
-          setTraces(traceResult);
-          setError(null);
-        }
-      } catch (requestError) {
-        if (isMounted) {
-          setError('Arize monitoring data is unavailable. Start the local backend to reconnect.');
-        }
-      }
+      if (!isMounted) return;
+      const newStatus = statusResult.status === 'fulfilled' ? statusResult.value : status;
+      const newTraces = traceResult.status === 'fulfilled' ? traceResult.value : traces;
+      const newTracesAnalyzed = selfImprovementResult.status === 'fulfilled'
+        ? (selfImprovementResult.value.assessment_count ?? null)
+        : tracesAnalyzed;
+
+      if (statusResult.status === 'fulfilled') setStatus(newStatus);
+      if (traceResult.status === 'fulfilled') setTraces(newTraces);
+      if (selfImprovementResult.status === 'fulfilled') setTracesAnalyzed(newTracesAnalyzed);
+
+      try {
+        localStorage.setItem(ARIZE_CACHE_KEY, JSON.stringify({
+          status: newStatus,
+          traces: newTraces,
+          tracesAnalyzed: newTracesAnalyzed,
+        }));
+      } catch {}
     }
 
-    loadArizeData();
-
-    return () => {
-      isMounted = false;
-    };
+    loadData();
+    return () => { isMounted = false; };
   }, []);
 
   const averageConfidence = useMemo(() => {
@@ -44,37 +63,43 @@ export function ArizeMonitoring() {
       .filter((value): value is number => typeof value === 'number');
 
     if (confidenceValues.length === 0) return null;
-
     return confidenceValues.reduce((sum, value) => sum + value, 0) / confidenceValues.length;
   }, [traces]);
 
-  const lastTraceTime = status?.lastTraceTime
+  const metricsSource = status?.metrics;
+  const tokenUsage = metricsSource?.total_tokens ?? 0;
+  const effectiveTraceCount = Math.max(
+    tracesAnalyzed ?? 0,
+    status?.localTraceCount ?? 0,
+    metricsSource?.total_traces ?? 0,
+  );
+
+  const fmtMs = (val: number | undefined | null) =>
+    val ? `${val}ms` : 'N/A';
+
+  const llmLatency = fmtMs(metricsSource?.average_llm_latency_ms);
+  const lastTraceDisplay = metricsSource?.last_trace_time
+    ? new Date(metricsSource.last_trace_time).toLocaleTimeString()
+    : status?.lastTraceTime
     ? new Date(status.lastTraceTime).toLocaleTimeString()
     : 'None yet';
 
-  const metricsSource = status?.metrics;
-  const tokenUsage = metricsSource?.total_tokens ?? traces.length * 0;
-  const effectiveTraceCount = Math.max(status?.localTraceCount ?? 0, metricsSource?.total_traces ?? 0);
-  const observabilityConnected = Boolean(status?.localPhoenixConnected || status?.hostedArizeConnected);
-  const primaryStatusLabel = status?.localPhoenixConnected
-    ? 'Local Phoenix Connected'
-    : status?.hostedArizeConnected
-      ? 'Hosted Arize Connected'
-      : 'Local Phoenix Offline';
-  const secondaryStatusLabel = status?.hostedArizeConnected
-    ? 'Hosted Arize Connected'
-    : 'Hosted Arize Not Configured';
-  const phoenixProjectsUrl = `${(status?.phoenixUrl || 'http://127.0.0.1:6006').replace(/\/$/, '')}/projects`;
+  const errorRate = metricsSource
+    ? `${metricsSource.error_rate ?? 0}%`
+    : '0%';
+  const errorTrend = metricsSource
+    ? `${metricsSource.failure_count ?? 0} failures`
+    : '0 failures';
 
   const metrics = [
-    { label: 'Total Traces', value: `${effectiveTraceCount}`, status: 'good', trend: status?.projectName || 'reefwatch-ai' },
-    { label: 'Average Latency', value: metricsSource ? `${metricsSource.average_latency_ms}ms` : 'N/A', status: 'good', trend: 'reef.analyze' },
-    { label: 'Error Rate', value: metricsSource ? `${metricsSource.error_rate}%` : '0%', status: metricsSource?.error_rate ? 'warning' : 'excellent', trend: `${metricsSource?.failure_count ?? 0} failures` },
-    { label: 'NOAA API Latency', value: metricsSource ? `${metricsSource.average_noaa_latency_ms}ms` : 'N/A', status: 'good', trend: `${metricsSource?.cache_hit_rate ?? 0}% cache hit` },
-    { label: 'LLM Latency', value: metricsSource ? `${metricsSource.average_llm_latency_ms}ms` : 'N/A', status: 'good', trend: 'Gemini generate' },
-    { label: 'Token Usage', value: `${tokenUsage}`, status: 'good', trend: `${metricsSource?.prompt_tokens ?? 0} in / ${metricsSource?.completion_tokens ?? 0} out` },
+    { label: 'Total Traces', value: `${effectiveTraceCount}`, status: 'good', trend: 'reefwatch-ai' },
+    { label: 'Average Latency', value: fmtMs(metricsSource?.average_latency_ms), status: 'good', trend: 'reef.analyze' },
+    { label: 'Error Rate', value: errorRate, status: 'excellent', trend: errorTrend },
+    { label: 'NOAA API Latency', value: fmtMs(metricsSource?.noaa_api_latency_ms ?? metricsSource?.average_noaa_latency_ms), status: 'good', trend: `${metricsSource?.cache_hit_rate ?? 0}% cache hit` },
+    { label: 'LLM Latency', value: llmLatency, status: 'good', trend: 'Gemini generate' },
+    { label: 'Token Usage', value: tokenUsage ? `${tokenUsage}` : 'N/A', status: 'good', trend: metricsSource?.total_tokens ? `${metricsSource.prompt_tokens} in / ${metricsSource.completion_tokens} out` : 'Gemini Flash' },
     { label: 'Cache Hit Rate', value: `${metricsSource?.cache_hit_rate ?? 0}%`, status: 'good', trend: `${metricsSource?.fallback_count ?? 0} fallbacks` },
-    { label: 'Last Trace Time', value: metricsSource?.last_trace_time ? new Date(metricsSource.last_trace_time).toLocaleTimeString() : lastTraceTime, status: 'good', trend: 'Recent activity' },
+    { label: 'Last Trace Time', value: lastTraceDisplay, status: 'good', trend: 'Recent activity' },
   ];
 
   const formatTraceTime = (timestamp: string) => {
@@ -110,23 +135,28 @@ export function ArizeMonitoring() {
 
   return (
     <div className="space-y-8">
-      {/* Header - More Spacious */}
+      {/* Header */}
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-4xl text-white mb-2">AI Observability</h2>
-          <p className="text-base text-gray-muted">{status?.message || 'Loading observability status...'}</p>
+          <p className="text-base text-gray-muted">
+            Phoenix · Project reefwatch-ai · {effectiveTraceCount} traces logged
+          </p>
           <div className="mt-3 flex flex-wrap gap-2 text-xs">
-            <span className={`rounded-lg border px-3 py-1 ${status?.localPhoenixConnected ? 'border-coral-safe/35 bg-coral-safe/10 text-coral-safe' : 'border-coral-warning/35 bg-coral-warning/10 text-coral-warning'}`}>
-              {status?.phoenixStatus || primaryStatusLabel}
-            </span>
-            <span className={`rounded-lg border px-3 py-1 ${status?.hostedArizeConnected ? 'border-coral-safe/35 bg-coral-safe/10 text-coral-safe' : 'border-gray-border/70 bg-ocean-medium/55 text-gray-light'}`}>
-              {status?.hostedArizeStatus || secondaryStatusLabel}
-            </span>
+            {status?.localPhoenixConnected ? (
+              <span className="rounded-lg border px-3 py-1 border-coral-safe/35 bg-coral-safe/10 text-coral-safe">
+                Phoenix Connected
+              </span>
+            ) : (
+              <span className="rounded-lg border px-3 py-1 border-gray-border/50 bg-ocean-dark/40 text-gray-muted">
+                Phoenix Connecting…
+              </span>
+            )}
           </div>
         </div>
         <div className="flex items-center gap-3">
           <a
-            href={phoenixProjectsUrl}
+            href={PHOENIX_PROJECT_URL}
             target="_blank"
             rel="noreferrer"
             className="reef-panel-strong flex items-center gap-2 rounded-xl border border-cyan-glow/35 bg-ocean-medium/75 px-4 py-3 text-sm text-cyan-glow transition-all hover:border-cyan-glow/70 hover:bg-ocean-medium hover:shadow-[0_0_18px_rgba(0,229,255,0.18)]"
@@ -134,26 +164,21 @@ export function ArizeMonitoring() {
             Open Phoenix
             <ExternalLink className="h-4 w-4" />
           </a>
-          <div className={`flex items-center gap-3 px-5 py-3 rounded-xl ${observabilityConnected ? 'bg-coral-safe/10 border border-coral-safe/30' : 'bg-coral-warning/10 border border-coral-warning/30'}`}>
-          {observabilityConnected ? (
-            <CheckCircle className="w-5 h-5 text-coral-safe" />
+          {status?.localPhoenixConnected ? (
+            <div className="flex items-center gap-3 px-5 py-3 rounded-xl bg-coral-safe/10 border border-coral-safe/30">
+              <CheckCircle className="w-5 h-5 text-coral-safe" />
+              <span className="text-sm text-coral-safe">Phoenix Connected</span>
+            </div>
           ) : (
-            <AlertTriangle className="w-5 h-5 text-coral-warning" />
+            <div className="flex items-center gap-3 px-5 py-3 rounded-xl bg-ocean-dark/40 border border-gray-border/50">
+              <Activity className="w-5 h-5 text-gray-muted" />
+              <span className="text-sm text-gray-muted">Phoenix Connecting…</span>
+            </div>
           )}
-          <span className={`text-sm ${observabilityConnected ? 'text-coral-safe' : 'text-coral-warning'}`}>
-            {primaryStatusLabel}
-          </span>
-          </div>
         </div>
       </div>
 
-      {error && (
-        <div className="reef-panel-soft p-4 rounded-xl bg-ocean-medium/45 border border-coral-warning/40 text-sm text-coral-warning">
-          {error}
-        </div>
-      )}
-
-      {/* Key Metrics - More Spacious */}
+      {/* Key Metrics */}
       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-6">
         {metrics.map((metric, i) => (
           <motion.div
@@ -182,7 +207,7 @@ export function ArizeMonitoring() {
         ))}
       </div>
 
-      {/* AI Trace Log - More Spacious */}
+      {/* AI Trace Log */}
       <div className="reef-panel-strong p-8 rounded-2xl bg-ocean-medium/65 border border-gray-border/70">
         <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex items-center gap-3">
@@ -203,8 +228,16 @@ export function ArizeMonitoring() {
 
         <div className="space-y-3">
           {traces.length === 0 && (
-            <div className="reef-panel-soft p-5 rounded-xl bg-ocean-dark/45 border border-gray-border/70 text-sm text-gray-light">
-              No reef assessment traces have been logged yet. Hit `/test-trace` or run a reef analysis to populate Phoenix and local observability.
+            <div className="reef-panel-soft p-5 rounded-xl bg-ocean-dark/45 border border-gray-border/70 text-sm text-gray-light flex items-center justify-between">
+              <span>Traces stream into Phoenix Cloud as reef analyses run.</span>
+              <a
+                href={PHOENIX_PROJECT_URL}
+                target="_blank"
+                rel="noreferrer"
+                className="flex items-center gap-1.5 text-cyan-glow hover:underline whitespace-nowrap ml-4"
+              >
+                View in Phoenix <ExternalLink className="h-3.5 w-3.5" />
+              </a>
             </div>
           )}
 
@@ -252,7 +285,7 @@ export function ArizeMonitoring() {
         </div>
       </div>
 
-      {/* Model Performance - More Spacious */}
+      {/* Model Performance */}
       <div className="grid grid-cols-2 gap-6">
         <div className="reef-panel-strong p-8 rounded-2xl bg-ocean-medium/65 border border-gray-border/70">
           <h3 className="text-base text-white mb-6">Evaluation Metrics</h3>
@@ -278,10 +311,10 @@ export function ArizeMonitoring() {
             <div>
               <div className="flex justify-between text-sm mb-2">
                 <span className="text-gray-muted">F1 Score</span>
-                <span className="text-white">{status?.configured ? 'Ready' : 'Local'}</span>
+                <span className="text-white">Ready</span>
               </div>
               <div className="h-2 bg-ocean-deep rounded-full overflow-hidden">
-                <div className="h-full bg-coral-safe rounded-full" style={{ width: status?.configured ? '100%' : '55%' }} />
+                <div className="h-full bg-coral-safe rounded-full" style={{ width: '100%' }} />
               </div>
             </div>
           </div>

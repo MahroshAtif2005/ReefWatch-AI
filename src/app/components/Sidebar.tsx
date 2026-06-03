@@ -1,4 +1,4 @@
-import { Activity, Map, Brain, TrendingUp, FileText, Microscope, Cpu, Settings, Waves } from 'lucide-react';
+import { Activity, Map, TrendingUp, FileText, Microscope, Cpu, Settings, Waves } from 'lucide-react';
 import { motion } from 'motion/react';
 
 interface SidebarProps {
@@ -9,8 +9,7 @@ interface SidebarProps {
 const menuItems = [
   { id: 'dashboard', label: 'Dashboard', icon: Activity },
   { id: 'map', label: 'Live Reef Map', icon: Map },
-  { id: 'analysis', label: 'AI Analysis', icon: Brain },
-  { id: 'trends', label: 'Historical Trends', icon: TrendingUp },
+  { id: 'analytics', label: 'Analytics', icon: TrendingUp },
   { id: 'reports', label: 'Conservation Reports', icon: FileText },
   { id: 'workspace', label: 'Researcher Workspace', icon: Microscope },
   { id: 'agents', label: 'Agent Activity', icon: Cpu },
