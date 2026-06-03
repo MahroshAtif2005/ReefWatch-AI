@@ -28,6 +28,8 @@ NOAA satellites monitor sea surface temperatures globally, 24 hours a day. The d
 
 **ReefWatch AI was built to close that gap.**
 
+![ReefWatch AI - Live Reef Map](public/Reefwatch Al Q.png)
+
 ---
 
 ## What It Does
