@@ -18,13 +18,13 @@ Coral reefs cover less than 1% of the ocean floor. They support **25% of all mar
 
 Since 1950, we have lost half of them.
 
-The primary killer is thermal stress — when ocean temperatures rise even 1°C above seasonal norms for several weeks, corals expel the algae living in their tissues, turn ghostly white, and begin to starve. This is bleaching. If the heat persists, they die.
+The primary killer is thermal stress, when ocean temperatures rise even 1°C above seasonal norms for several weeks, corals expel the algae living in their tissues, turn ghostly white, and begin to starve. This is bleaching. If the heat persists, they die.
 
 The 2016 bleaching event destroyed **67% of coral in the northern Great Barrier Reef in a single year**. The 2023 global bleaching event, the fourth mass bleaching in recorded history, affected reefs across every ocean simultaneously.
 
 The cruelest part: **we usually find out too late.**
 
-NOAA satellites monitor sea surface temperatures globally, 24 hours a day. The data exists. But translating thousands of data points into actionable intelligence — for hundreds of reef sites, every single day, requires more human hours than the entire global conservation community can provide.
+NOAA satellites monitor sea surface temperatures globally, 24 hours a day. The data exists. But translating thousands of data points into actionable intelligence, for hundreds of reef sites, every single day, requires more human hours than the entire global conservation community can provide.
 
 **ReefWatch AI was built to close that gap.**
 
@@ -51,7 +51,7 @@ Every active reef is analyzed by Gemini 2.5 Flash using live NOAA data. The AI p
 ### 🔁 Self-Improvement Loop
 The most important feature. A nightly evaluation pipeline uses **Gemini as an LLM as a Judge** to score recent reef assessments on accuracy, specificity, actionability, and hallucination avoidance. When quality drops below threshold, the system **automatically rewrites its own prompts**. No human intervention required. The agent gets better by itself.
 
-Current scores: Quality 89% · Accuracy 91% · Hallucination Avoidance 94%
+The loop actively triggered during submission week — scores dipped to 39%, the system detected the drop, a prompt rewrite was triggered, and scores recovered to 66% Quality · 90% Specificity.
 
 ### 🔍 Phoenix MCP Runtime Introspection
 The Gemini agent is configured with **Arize Phoenix MCP as a callable function tool**. At runtime, when the agent needs to reason about its own performance, it calls `query_phoenix_traces` and `query_phoenix_quality_metrics` directly — retrieving its own operational data mid-inference. Every MCP tool call is logged with timestamp, tool name, and retrieved data, visible in the Arize Monitoring dashboard. This is not just observability. This is **self-awareness**.
@@ -74,7 +74,8 @@ Running 24/7 on Cloud Run. When a reef crosses a critical bleaching threshold, R
 
 ```mermaid
 graph TD
-    A[React Frontend<br/>Vite + TypeScript + Tailwind + Google Maps] -->|HTTPS| B[FastAPI AI Service<br/>Python + Gemini 2.5 Flash + Cloud Run]
+    A[React Frontend<br/>Vite + TypeScript + Tailwind + Google Maps] -->|HTTPS| ADK[Google Cloud ADK Agent<br/>reefwatch_agent · Agent Platform Registry]
+    ADK -->|routes queries| B[FastAPI AI Service<br/>Python + Gemini 2.5 Flash + Cloud Run]
     B -->|NOAA Coral Reef Watch API| C[NOAA Data<br/>221 stations · SST · DHW · Anomaly]
     B -->|OpenTelemetry traces| D[Arize Phoenix Cloud<br/>Traces · Evals · MCP Server]
     D -->|Phoenix MCP tools at runtime| B
@@ -91,6 +92,7 @@ graph TD
 | Data | NOAA Coral Reef Watch | Live SST, DHW, bleaching alert levels for 221 stations |
 | Infrastructure | Google Cloud Run + Firebase | 24/7 deployment, min-instances=1, cold start protection |
 | Database | SQLite | Station cache, historical readings, event log |
+| Agent Framework | Google Cloud ADK (google-adk) | Official ADK Agent class, registered in Google Cloud Agent Platform Registry |
 ## How The Agent Works
 
 ReefWatch AI operates as a true multi-step autonomous agent:
@@ -119,7 +121,7 @@ A Cloud Scheduler health ping keeps the service warm every 4 minutes. When bleac
 
 | Criterion | How ReefWatch AI Addresses It |
 |-----------|------------------------------|
-| **Gemini Agent** | Autonomous reef monitoring agent, not a chatbot. Multi-step reasoning, autonomous alerting, 24/7 operation on Cloud Run |
+| **Gemini Agent** | Built with Google Cloud ADK — official ADK Agent class registered in Agent Platform Registry. Researcher Workspace routes through ADK natively. Multi-step reasoning, autonomous alerting, 24/7 operation |
 | **Phoenix Observability** | 3,392+ traces, LLM latency tracked, token usage visible, input/output logged, cache hit rate monitored |
 | **MCP Integration** | Phoenix MCP wired as callable Gemini function tools. Agent queries its own traces at runtime. Every call logged with retrieved data |
 | **Self-Improvement Loop** | LLM-as-a-Judge evaluates output quality nightly, rewrites prompts automatically when scores drop. Scores visible on dashboard |
@@ -142,6 +144,7 @@ A Cloud Scheduler health ping keeps the service warm every 4 minutes. When bleac
 - google-generativeai SDK
 - openinference-instrumentation-google-genai
 - arize-phoenix-otel
+- google-adk (Google Cloud Agent Development Kit)
 
 **Observability**
 - Arize Phoenix Cloud
