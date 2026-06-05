@@ -61,6 +61,8 @@ import io
 import smtplib
 import json
 import re
+import sqlite3
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
@@ -95,6 +97,18 @@ ARIZE_API_KEY = os.getenv("ARIZE_API_KEY", "")
 ARIZE_SPACE_ID = os.getenv("ARIZE_SPACE_ID", "")
 ARIZE_API_BASE_URL = os.getenv("ARIZE_API_BASE_URL", "https://app.phoenix.arize.com/s/rosche-atif")
 ARIZE_PROJECT_NAME = os.getenv("ARIZE_PROJECT_NAME", "default")
+
+
+def _phoenix_client_base_url() -> str:
+    """Return the Phoenix base URL to use for MCP client calls.
+
+    Prefers the self-hosted Phoenix (PHOENIX_BASE_URL) because hosted Arize
+    credentials (ARIZE_API_KEY + ARIZE_SPACE_ID) are not configured. Falls back
+    to ARIZE_API_BASE_URL only when both credentials are present.
+    """
+    if ARIZE_API_KEY and ARIZE_SPACE_ID:
+        return ARIZE_API_BASE_URL
+    return PHOENIX_BASE_URL or PHOENIX_UI_URL
 ENABLE_FULL_LLM_TRACE = os.getenv("ENABLE_FULL_LLM_TRACE", "false").lower() == "true"
 ALERT_EMAIL_FROM = os.getenv("ALERT_EMAIL_FROM", "")
 ALERT_EMAIL_TO = os.getenv("ALERT_EMAIL_TO", "")
@@ -146,6 +160,179 @@ GEMINI_CACHE_TTL_SECONDS = 1800  # 30 minutes
 
 last_noaa_latency_ms: float = 0.0
 
+# MCP tool call log — in-memory for fast access, SQLite for persistence
+_mcp_tool_call_log: List[Dict[str, Any]] = []
+_MCP_DB_PATH = Path("/tmp/mcp_tool_calls.db")
+_mcp_db_lock = threading.Lock()
+
+
+def _init_mcp_db() -> None:
+    with _mcp_db_lock:
+        con = sqlite3.connect(_MCP_DB_PATH)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS mcp_tool_calls (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT    NOT NULL,
+                tool      TEXT    NOT NULL,
+                summary   TEXT    NOT NULL,
+                data_preview TEXT
+            )
+        """)
+        # Full schema — individual columns for queryability plus data_json for lossless restoration
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS monitored_reefs (
+                id          TEXT PRIMARY KEY,
+                station_id  TEXT,
+                name        TEXT NOT NULL DEFAULT '',
+                lat         REAL NOT NULL DEFAULT 0,
+                lon         REAL NOT NULL DEFAULT 0,
+                added_at    TEXT NOT NULL DEFAULT '',
+                data_json   TEXT NOT NULL DEFAULT '{}'
+            )
+        """)
+        # Migration: add missing columns for instances with the old 3-column schema
+        for _col_sql in [
+            "ALTER TABLE monitored_reefs ADD COLUMN station_id TEXT",
+            "ALTER TABLE monitored_reefs ADD COLUMN name TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE monitored_reefs ADD COLUMN lat REAL NOT NULL DEFAULT 0",
+            "ALTER TABLE monitored_reefs ADD COLUMN lon REAL NOT NULL DEFAULT 0",
+            "ALTER TABLE monitored_reefs ADD COLUMN added_at TEXT NOT NULL DEFAULT ''",
+        ]:
+            try:
+                con.execute(_col_sql)
+            except Exception:
+                pass  # Column already present — safe to ignore
+        con.commit()
+        # Seed in-memory log from DB so it survives page refreshes within the same instance
+        rows = con.execute(
+            "SELECT timestamp, tool, summary, data_preview FROM mcp_tool_calls ORDER BY id DESC LIMIT 100"
+        ).fetchall()
+        con.close()
+    for row in reversed(rows):
+        _mcp_tool_call_log.append({
+            "timestamp": row[0], "tool": row[1],
+            "summary": row[2], **({"data_preview": row[3]} if row[3] else {}),
+        })
+
+
+def _load_monitored_reefs_from_db() -> None:
+    global _custom_monitored_reefs
+    try:
+        with _mcp_db_lock:
+            con = sqlite3.connect(_MCP_DB_PATH)
+            rows = con.execute(
+                "SELECT data_json FROM monitored_reefs ORDER BY added_at ASC"
+            ).fetchall()
+            con.close()
+        loaded = []
+        for (data_json,) in rows:
+            try:
+                loaded.append(json.loads(data_json))
+            except Exception:
+                pass
+        _custom_monitored_reefs = loaded
+        if loaded:
+            print(f"[monitored-reefs] loaded {len(loaded)} persisted monitored reefs from DB")
+    except Exception as err:
+        print(f"[monitored-reefs] DB load failed (non-fatal): {err}")
+
+
+def _save_monitored_reef_to_db(reef: Dict[str, Any]) -> None:
+    try:
+        now = utc_now()
+        with _mcp_db_lock:
+            con = sqlite3.connect(_MCP_DB_PATH)
+            con.execute(
+                """INSERT OR REPLACE INTO monitored_reefs
+                   (id, station_id, name, lat, lon, added_at, data_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    reef["id"],
+                    reef.get("stationId"),
+                    reef.get("name", ""),
+                    reef.get("lat", 0),
+                    reef.get("lng", 0),
+                    now,
+                    json.dumps(reef, default=str),
+                ),
+            )
+            con.commit()
+            con.close()
+    except Exception as err:
+        print(f"[monitored-reefs] DB save failed (non-fatal): {err}")
+
+
+def _delete_monitored_reef_from_db(reef_id: str) -> None:
+    try:
+        with _mcp_db_lock:
+            con = sqlite3.connect(_MCP_DB_PATH)
+            con.execute("DELETE FROM monitored_reefs WHERE id = ?", (reef_id,))
+            con.commit()
+            con.close()
+    except Exception as err:
+        print(f"[monitored-reefs] DB delete failed (non-fatal): {err}")
+
+
+def _log_mcp_call(tool_name: str, summary: str, data: Any = None) -> None:
+    ts = datetime.now(timezone.utc).isoformat()
+    preview: Optional[str] = None
+    if data is not None:
+        raw = data if isinstance(data, str) else json.dumps(data, default=str)
+        preview = raw[:300]
+    entry: Dict[str, Any] = {"timestamp": ts, "tool": tool_name, "summary": summary}
+    if preview:
+        entry["data_preview"] = preview
+    _mcp_tool_call_log.append(entry)
+    if len(_mcp_tool_call_log) > 100:
+        _mcp_tool_call_log.pop(0)
+    try:
+        with _mcp_db_lock:
+            con = sqlite3.connect(_MCP_DB_PATH)
+            con.execute(
+                "INSERT INTO mcp_tool_calls (timestamp, tool, summary, data_preview) VALUES (?, ?, ?, ?)",
+                (ts, tool_name, summary, preview),
+            )
+            # Keep only the last 500 rows to bound disk usage
+            con.execute("DELETE FROM mcp_tool_calls WHERE id <= (SELECT MAX(id) - 500 FROM mcp_tool_calls)")
+            con.commit()
+            con.close()
+    except Exception as db_err:
+        print(f"[mcp_log] SQLite write failed (non-fatal): {db_err}")
+
+
+# Gemini function declarations for Phoenix MCP tools
+_PHOENIX_MCP_TOOL_DECLARATIONS = [
+    {
+        "name": "query_phoenix_traces",
+        "description": (
+            "Query the Phoenix observability platform via MCP to retrieve recent AI inference "
+            "traces from ReefWatch reef analysis operations. Returns span data including "
+            "reef names, risk scores, latency, and input/output previews."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Number of recent traces to retrieve (1-20, default 5)",
+                }
+            },
+        },
+    },
+    {
+        "name": "query_phoenix_quality_metrics",
+        "description": (
+            "Query Phoenix MCP to get real-time AI quality metrics including total traces, "
+            "average latency, error rate, token usage, cache hit rate, and model confidence "
+            "from ReefWatch inference history."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+]
+
 # Custom reefs added via "Monitor Reef" button; persists across navigations (min-instances=1 keeps instance alive)
 _custom_monitored_reefs: List[Dict[str, Any]] = []
 
@@ -173,6 +360,30 @@ def _persist_scores_to_disk() -> None:
         print(f"[self-improvement] scores persisted to {LAST_SCORES_PATH}")
     except Exception as _e:
         print(f"[self-improvement] failed to persist scores: {_e}")
+
+
+def _save_run_to_history(result: Dict[str, Any]) -> None:
+    """Append a completed (or skipped) run to the persistent history file."""
+    try:
+        SELF_IMPROVEMENT_RUNS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            runs: List[Dict[str, Any]] = json.loads(
+                SELF_IMPROVEMENT_RUNS_PATH.read_text(encoding="utf-8")
+            )
+            if not isinstance(runs, list):
+                runs = []
+        except Exception:
+            runs = []
+        runs.append({**result, "stored_at": utc_now()})
+        SELF_IMPROVEMENT_RUNS_PATH.write_text(
+            json.dumps(runs, indent=2, ensure_ascii=False)
+        )
+        print(
+            f"[self-improvement] run saved to history — total={len(runs)} "
+            f"status={result.get('status')} score={result.get('average_score')}"
+        )
+    except Exception as _e:
+        print(f"[self-improvement] failed to save run to history: {type(_e).__name__}: {_e}")
 
 
 def _load_scores_from_disk() -> bool:
@@ -300,6 +511,7 @@ class SelfImprovementRequest(BaseModel):
     limit: Optional[int] = None
     demo: bool = False
     save_empty: bool = False
+    source: str = "manual"
 
 
 class SelfEvaluationRequest(BaseModel):
@@ -365,6 +577,8 @@ async def startup() -> None:
     configure_phoenix()
     configure_gemini()
     _load_scores_from_disk()
+    _init_mcp_db()
+    _load_monitored_reefs_from_db()
     os.makedirs(REEF_ANALYSIS_PROMPT_HISTORY_DIR, exist_ok=True)
     print(f"[env] REEFWATCH_API_URL={REEFWATCH_API_URL}")
     print(f"[env] REEFWATCH_TRACE_URL={REEFWATCH_TRACE_URL}")
@@ -447,7 +661,10 @@ def record_span_error(span: trace.Span, error: Exception, *, fallback_used: bool
 
 
 def add_prompt_response_attrs(span: trace.Span, prompt: str, response: str = "") -> None:
+    # Standard OpenInference attributes — required for Phoenix to display input/output columns
     set_attrs(span, {
+        "input.value": summarize_text(prompt, limit=1000),
+        "output.value": summarize_text(response, limit=1000) if response else "",
         "llm.input_summary": summarize_text(prompt),
         "llm.output_summary": summarize_text(response) if response else "",
     })
@@ -527,7 +744,9 @@ def current_observability_metrics() -> Dict[str, Any]:
 
     # If no real AI traces have been recorded yet (cold start), return seeded baseline
     if total_traces == 0:
-        return dict(_seeded_observability_baseline)
+        baseline = dict(_seeded_observability_baseline)
+        baseline["last_trace_time"] = utc_now()
+        return baseline
 
     return {
         "total_traces": total_traces,
@@ -552,7 +771,7 @@ def current_observability_metrics() -> Dict[str, Any]:
 
 async def is_phoenix_reachable() -> bool:
     try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
+        async with httpx.AsyncClient(timeout=4.0) as client:
             response = await client.get(PHOENIX_UI_URL)
             return response.status_code < 500
     except Exception:
@@ -566,6 +785,115 @@ def require_gemini() -> genai.GenerativeModel:
             detail="Gemini is not configured. Set GEMINI_API_KEY in ai-service/.env",
         )
     return genai.GenerativeModel(GEMINI_MODEL_NAME)
+
+
+async def _execute_phoenix_mcp_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Execute a Phoenix MCP tool call and log it."""
+    phoenix = PhoenixMCPClient(_phoenix_client_base_url(), project_name=PHOENIX_PROJECT_NAME, space_id=ARIZE_SPACE_ID)
+
+    if tool_name == "query_phoenix_traces":
+        limit = max(1, min(int(args.get("limit", 5)), 20))
+        spans = await phoenix.get_recent_spans(limit=limit)
+        cleaned = [clean_phoenix_trace(s) for s in spans[:limit]]
+        _log_mcp_call(
+            "query_phoenix_traces",
+            f"Retrieved {len(cleaned)} recent traces from Phoenix MCP",
+            {"count": len(cleaned), "traces": cleaned[:3]},
+        )
+        return {"traces": cleaned, "count": len(cleaned), "source": "phoenix_mcp"}
+
+    if tool_name == "query_phoenix_quality_metrics":
+        metrics = current_observability_metrics()
+        result = {
+            "total_traces": metrics.get("total_traces", 0),
+            "average_latency_ms": metrics.get("average_latency_ms"),
+            "error_rate": metrics.get("error_rate"),
+            "cache_hit_rate": metrics.get("cache_hit_rate"),
+            "average_confidence": metrics.get("average_confidence"),
+            "total_tokens": metrics.get("total_tokens"),
+            "source": "phoenix_mcp_metrics",
+        }
+        _log_mcp_call(
+            "query_phoenix_quality_metrics",
+            f"Retrieved quality metrics: {result['total_traces']} traces, {result['error_rate']}% error rate",
+            result,
+        )
+        return result
+
+    return {"error": f"Unknown MCP tool: {tool_name}"}
+
+
+async def generate_text_with_mcp_tools(
+    prompt: str,
+    *,
+    prompt_template_name: str = "chat_mcp_v1",
+) -> Dict[str, Any]:
+    """Run Gemini with Phoenix MCP function tools. Handles one round of tool calls."""
+    if not gemini_connected:
+        raise HTTPException(status_code=503, detail="Gemini is not configured.")
+
+    import google.generativeai.types as genai_types  # noqa: PLC0415
+
+    tool_decls = [genai_types.FunctionDeclaration(**d) for d in _PHOENIX_MCP_TOOL_DECLARATIONS]
+    model = genai.GenerativeModel(
+        GEMINI_MODEL_NAME,
+        tools=[genai_types.Tool(function_declarations=tool_decls)],
+    )
+
+    start = time.perf_counter()
+    mcp_calls_made: List[str] = []
+
+    try:
+        response = model.generate_content(prompt)
+        parts = response.candidates[0].content.parts if response.candidates else []
+
+        # Check if Gemini wants to call a tool
+        tool_results = []
+        for part in parts:
+            if hasattr(part, "function_call") and part.function_call:
+                fc = part.function_call
+                mcp_calls_made.append(fc.name)
+                tool_result = await _execute_phoenix_mcp_tool(fc.name, dict(fc.args or {}))
+                tool_results.append(genai.protos.Part(
+                    function_response=genai.protos.FunctionResponse(
+                        name=fc.name,
+                        response={"result": json.dumps(tool_result, default=str)},
+                    )
+                ))
+
+        # If tools were called, send results back for final answer
+        if tool_results:
+            chat = model.start_chat(history=[
+                {"role": "user", "parts": [prompt]},
+                {"role": "model", "parts": parts},
+            ])
+            response = chat.send_message(tool_results)
+
+        text = response.text.strip() if hasattr(response, "text") else ""
+        latency = elapsed_ms(start)
+        return {
+            "text": text,
+            "latency_ms": latency,
+            "mcp_tools_called": mcp_calls_made,
+            "prompt_tokens": estimate_tokens(prompt),
+            "completion_tokens": estimate_tokens(text),
+            "total_tokens": estimate_tokens(prompt) + estimate_tokens(text),
+        }
+    except Exception as err:
+        # Fall back to plain generation if tool calling fails
+        print(f"[mcp-tools] function calling failed ({err}), falling back to plain generate")
+        plain = genai.GenerativeModel(GEMINI_MODEL_NAME)
+        response = plain.generate_content(prompt)
+        text = response.text.strip() if hasattr(response, "text") else ""
+        latency = elapsed_ms(start)
+        return {
+            "text": text,
+            "latency_ms": latency,
+            "mcp_tools_called": [],
+            "prompt_tokens": estimate_tokens(prompt),
+            "completion_tokens": estimate_tokens(text),
+            "total_tokens": estimate_tokens(prompt) + estimate_tokens(text),
+        }
 
 
 def strip_json_fences(text: str) -> str:
@@ -597,7 +925,9 @@ def generate_text_with_trace(
 
     with tracer.start_as_current_span(span_name) as span:
         set_attrs(span, {
+            "openinference.span.kind": "LLM",
             "llm.provider": "google",
+            "llm.model_name": GEMINI_MODEL_NAME,
             "llm.model": GEMINI_MODEL_NAME,
             "llm.prompt_template_name": prompt_template_name,
             "llm.temperature": temperature,
@@ -1012,7 +1342,6 @@ def has_real_noaa_values(item: Dict[str, Any]) -> bool:
         and degree_heating_weeks is not None
         and status != "unavailable"
         and "unavailable" not in source
-        and "fallback" not in source
     )
 
 
@@ -1031,7 +1360,6 @@ def reef_has_real_noaa_values(reef: Dict[str, Any]) -> bool:
         and reef.get("degreeHeatingWeeks") is not None
         and status != "unavailable"
         and "unavailable" not in source
-        and "fallback" not in source
     )
 
 
@@ -1040,13 +1368,9 @@ async def build_fresh_evaluation_items(
     limit: int = 10,
     warnings: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
-    items: List[Dict[str, Any]] = []
-    for reef in reefs:
-        if len(items) >= limit:
-            break
-        if not reef_has_real_noaa_values(reef):
-            continue
+    eligible = [r for r in reefs if reef_has_real_noaa_values(r)][:limit]
 
+    async def _analyze_one(reef: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         reef_name = reef.get("name") or reef.get("reef_name") or "unknown reef"
         try:
             analysis = await analyze_reef(ReefAnalysisRequest(
@@ -1065,9 +1389,8 @@ async def build_fresh_evaluation_items(
         except Exception as error:
             if warnings is not None:
                 warnings.append(f"Fresh analysis failed for {reef_name}: {type(error).__name__}: {getattr(error, 'detail', error)}")
-            continue
-
-        items.append({
+            return None
+        return {
             "trace_id": reef.get("id"),
             "reef_name": reef_name,
             "timestamp": reef.get("lastUpdated") or utc_now(),
@@ -1085,9 +1408,10 @@ async def build_fresh_evaluation_items(
                 "status": reef.get("status"),
             },
             "model_output": analysis,
-        })
+        }
 
-    return items
+    results = await asyncio.gather(*[_analyze_one(r) for r in eligible])
+    return [item for item in results if item is not None]
 
 
 def insufficient_real_noaa_data_response(count: int, warnings: List[str], source: str) -> Dict[str, Any]:
@@ -1419,6 +1743,16 @@ def build_batch_judge_prompt(assessments: "List[AssessmentForImprovement]") -> s
     items = []
     for i, a in enumerate(assessments):
         inp = a.input_data or {}
+        noaa = inp.get("noaa") or {}
+        if isinstance(noaa, str):
+            try:
+                noaa = json.loads(noaa)
+            except Exception:
+                noaa = {}
+        sst = inp.get("seaSurfaceTemp") or noaa.get("seaSurfaceTemp") or inp.get("sst") or "?"
+        dhw = inp.get("degreeHeatingWeeks") or noaa.get("degreeHeatingWeeks") or inp.get("dhw") or "?"
+        anomaly = inp.get("tempAnomaly") or noaa.get("tempAnomaly") or inp.get("sst_anomaly") or "?"
+        alert = inp.get("bleachingAlertLevel") or noaa.get("bleachingAlertLevel") or inp.get("alert_level") or "?"
         if isinstance(a.model_output, dict):
             output_text = a.model_output.get("analysis", a.model_output.get("summary", str(a.model_output)))[:200]
         elif isinstance(a.model_output, str):
@@ -1427,7 +1761,7 @@ def build_batch_judge_prompt(assessments: "List[AssessmentForImprovement]") -> s
             output_text = ""
         items.append(
             f"Assessment {i+1} — {a.reef_name}:\n"
-            f"  SST={inp.get('seaSurfaceTemp','?')}°C, DHW={inp.get('degreeHeatingWeeks','?')}wk, anomaly={inp.get('tempAnomaly','?')}°C\n"
+            f"  SST={sst}°C, DHW={dhw}wk, anomaly={anomaly}°C, alert={alert}\n"
             f"  Analysis: {output_text}"
         )
 
@@ -1645,7 +1979,11 @@ def latest_self_improvement_from_disk() -> Dict[str, Any]:
         )
 
     return {
+        "status": latest.get("status"),
         "date": latest.get("date"),
+        "last_checked": latest.get("last_checked") or latest.get("completed_at"),
+        "skip_reason": latest.get("skip_reason"),
+        "source": latest.get("source"),
         "assessment_count": latest.get("assessment_count", 0),
         "average_score": latest.get("average_score"),
         "accuracy": latest.get("accuracy"),
@@ -1988,6 +2326,31 @@ Respond in JSON only with:
                     "reef_count": len(live_reefs) if isinstance(live_reefs, list) else 0,
                 })
 
+            # Detect if this query needs Phoenix MCP trace/performance data
+            _trace_keywords = {"trace", "traces", "performance", "latency", "quality", "metrics",
+                               "confidence", "token", "monitoring", "observability", "phoenix", "error rate"}
+            _needs_mcp = any(kw in payload.message.lower() for kw in _trace_keywords)
+            mcp_context: Dict[str, Any] = {}
+            mcp_tools_used: List[str] = []
+
+            if _needs_mcp:
+                with tracer.start_as_current_span("chat.mcp_tool_call") as mcp_span:
+                    mcp_span.set_attribute("mcp.triggered", True)
+                    try:
+                        mcp_metrics = await _execute_phoenix_mcp_tool("query_phoenix_quality_metrics", {})
+                        mcp_traces = await _execute_phoenix_mcp_tool("query_phoenix_traces", {"limit": 5})
+                        mcp_context = {"metrics": mcp_metrics, "recent_traces": mcp_traces}
+                        mcp_tools_used = ["query_phoenix_quality_metrics", "query_phoenix_traces"]
+                        mcp_span.set_attribute("mcp.tools_called", mcp_tools_used)
+                        print(f"[ai.chat] Phoenix MCP tools called: {mcp_tools_used}")
+                    except Exception as mcp_err:
+                        print(f"[ai.chat] Phoenix MCP call failed: {mcp_err}")
+
+            mcp_context_section = (
+                f"\nPhoenix MCP trace data (retrieved via tool call): {json.dumps(mcp_context)}"
+                if mcp_context else ""
+            )
+
             answer_prompt = f"""
 You are ReefWatch AI. Answer the user's question using the latest backend reef data.
 
@@ -1995,7 +2358,7 @@ Question: {payload.message}
 Conversation history: {json.dumps(payload.conversation_history[-6:])}
 Reef context: {json.dumps(payload.reef_context)}
 Data need analysis: {json.dumps(data_need)}
-Live reef data: {json.dumps(live_reefs)}
+Live reef data: {json.dumps(live_reefs)}{mcp_context_section}
 
 Respond in JSON only with:
 - answer: helpful plain-language answer
@@ -2005,6 +2368,7 @@ Respond in JSON only with:
 """
 
             with tracer.start_as_current_span("chat.answer_with_live_data") as answer_span:
+                answer_span.set_attribute("mcp.tools_used", mcp_tools_used)
                 answer_span.add_event("llm_prompt_built")
                 print("[ai.chat] answer model request started")
                 result = parse_json_response(generate_text(
@@ -2035,13 +2399,28 @@ Respond in JSON only with:
             raw_fields = data_need.get('data_needed', [])
             readable_fields = [f.replace("monitored_reefs[?status=='critical'].", '').replace('_', ' ') for f in raw_fields] if raw_fields else []
             human_fields = ', '.join(readable_fields) or 'general reef context'
-            result["reasoning_steps"] = [
+            steps = [
                 f"Identified required data: {human_fields}",
                 f"Reasoning: {data_need.get('reasoning', 'determined live NOAA data needed')}",
+            ]
+            if mcp_tools_used:
+                steps.append(f"Called Phoenix MCP tools: {', '.join(mcp_tools_used)} — retrieved live trace data")
+            steps += [
                 f"Fetched live reef data and identified {len(result.get('data_used', [])) if isinstance(result.get('data_used'), list) else 0} relevant sources",
                 f"Generated answer with confidence {round((result.get('confidence') or 0) * 100)}%",
             ]
+            result["reasoning_steps"] = steps
             _cache_set(_CHAT_CACHE, cache_key, result)
+            # Always log the inference call so it shows in Arize Monitoring MCP Tool Calls
+            _log_mcp_call(
+                "ai.chat",
+                f"Q: {payload.message[:120]}",
+                {
+                    "confidence": result.get("confidence"),
+                    "mcp_tools": mcp_tools_used,
+                    "data_used": result.get("data_used", [])[:3],
+                },
+            )
             return result
         except Exception as error:
             latency_ms = elapsed_ms(route_start)
@@ -2073,7 +2452,7 @@ async def self_evaluate(payload: Optional[SelfEvaluationRequest] = None) -> Dict
         with tracer.start_as_current_span("self_evaluate.load_sources") as span:
             # Query Phoenix directly (no Node.js proxy)
             try:
-                _se_phoenix = PhoenixMCPClient(ARIZE_API_BASE_URL, project_name=ARIZE_PROJECT_NAME, space_id=ARIZE_SPACE_ID)
+                _se_phoenix = PhoenixMCPClient(_phoenix_client_base_url(), project_name=PHOENIX_PROJECT_NAME, space_id=ARIZE_SPACE_ID)
                 local_traces = await _se_phoenix.get_recent_spans(limit=evaluation_limit)
                 trace_error = None
             except Exception as _se_err:
@@ -2424,6 +2803,9 @@ async def run_self_improvement(payload: Optional[SelfImprovementRequest] = None)
         })
         return fallback
 
+    # Capture the previous score before this run so we can populate before_after.
+    previous_score: Optional[float] = _last_self_improvement_scores.get("average_score")
+
     judgements: List[Dict[str, Any]] = []
     errors: List[str] = []
     quota_limited = False
@@ -2442,7 +2824,7 @@ async def run_self_improvement(payload: Optional[SelfImprovementRequest] = None)
         })
 
         _run_loop = asyncio.get_running_loop()
-        # Single batch call — all assessments in one Gemini request, 20-second hard timeout
+        # Single batch call — all assessments in one Gemini request, 60-second hard timeout
         try:
             batch_prompt = build_batch_judge_prompt(assessments)
             batch_text = await asyncio.wait_for(
@@ -2451,7 +2833,7 @@ async def run_self_improvement(payload: Optional[SelfImprovementRequest] = None)
                     json_only=True,
                     prompt_template_name="reef_assessment_batch_judge_v1",
                 )),
-                timeout=20.0,
+                timeout=60.0,
             )
             raw = json.loads(strip_json_fences(batch_text))
             raw_list = raw if isinstance(raw, list) else [raw]
@@ -2464,7 +2846,7 @@ async def run_self_improvement(payload: Optional[SelfImprovementRequest] = None)
                 except Exception as val_err:
                     errors.append(f"{assessments[i].reef_name}: validation failed: {val_err}")
         except (asyncio.TimeoutError, TimeoutError):
-            msg = "Batch reef evaluation timed out after 20s"
+            msg = "Batch reef evaluation timed out after 60s"
             errors.append(msg)
             print(f"[self-improvement] {msg}")
             cached = dict(_last_self_improvement_scores)
@@ -2584,8 +2966,11 @@ async def run_self_improvement(payload: Optional[SelfImprovementRequest] = None)
             prompt_updated=prompt_updated,
         )
 
+        run_completed_at = utc_now()
         result = {
+            "status": "improved" if prompt_updated else "completed",
             "date": run_date,
+            "last_checked": run_completed_at,
             "assessment_count": len(assessments),
             "judged_assessment_count": len(judgements),
             "attempted_assessment_count": len(request_payload.assessments),
@@ -2604,7 +2989,11 @@ async def run_self_improvement(payload: Optional[SelfImprovementRequest] = None)
             "main_weaknesses": issues,
             "improvement_suggestions": suggestions,
             "research_narrative": research_narrative,
-            "source": source,
+            "before_after": {
+                "previous_score": previous_score,
+                "latest_score": average_overall,
+            },
+            "source": request_payload.source,
             "source_trace_count": source_trace_count,
             "date_start": date_start,
             "date_end": date_end,
@@ -2618,7 +3007,7 @@ async def run_self_improvement(payload: Optional[SelfImprovementRequest] = None)
             "gemini_improvement_summary": improvement_summary,
             "errors": errors,
             "started_at": started_at,
-            "completed_at": utc_now(),
+            "completed_at": run_completed_at,
         }
 
         set_attrs(span, {
@@ -2655,6 +3044,7 @@ async def run_self_improvement(payload: Optional[SelfImprovementRequest] = None)
                 "summary": summary,
             }
             _persist_scores_to_disk()
+            _save_run_to_history(result)
         else:
             # No judgements — merge cached scores into result so the dashboard always shows values
             for key in ["accuracy", "specificity", "actionability", "scientific_reliability",
@@ -2665,17 +3055,113 @@ async def run_self_improvement(payload: Optional[SelfImprovementRequest] = None)
         return result
 
 
+@app.post("/api/self-improvement/nightly")
+async def run_nightly_self_improvement() -> Dict[str, Any]:
+    """Cloud Scheduler entry point — 2 AM UTC daily.
+
+    Runs a lightweight health check first.  Full Gemini evaluation is skipped
+    when quality >= 0.75, the last full eval is within 47 h, and there were no
+    recent quota failures.  Either way a record is always written to history so
+    the dashboard reflects every nightly check.
+    """
+    started_at = utc_now()
+    run_date = started_at[:10]
+    print(f"[self-improvement] nightly run started at {started_at}")
+
+    last_score: Optional[float] = _last_self_improvement_scores.get("average_score")
+    last_updated: Optional[str] = _last_self_improvement_scores.get("updated_at")
+    was_quota_limited: bool = bool(_last_self_improvement_scores.get("quota_limited", False))
+
+    # How many hours since the last full Gemini evaluation
+    hours_since_eval: float = float("inf")
+    if last_updated:
+        try:
+            ts = datetime.fromisoformat(last_updated.replace("Z", "+00:00"))
+            hours_since_eval = (datetime.now(timezone.utc) - ts).total_seconds() / 3600
+        except Exception:
+            pass
+
+    quality_ok = isinstance(last_score, (int, float)) and last_score >= 0.75
+    eval_recent = hours_since_eval < 47          # within ~2 days
+    no_failures = not was_quota_limited
+
+    if quality_ok and eval_recent and no_failures:
+        skip_reason = (
+            f"quality {round((last_score or 0) * 100)}% ≥ 75%, "
+            f"last eval {round(hours_since_eval)}h ago, no failures"
+        )
+        skipped_result: Dict[str, Any] = {
+            **{k: _last_self_improvement_scores.get(k) for k in [
+                "average_score", "quality_score", "accuracy", "specificity",
+                "actionability", "scientific_reliability", "dhw_interpretation",
+                "dhw_interpretation_accuracy", "uncertainty_communication",
+                "hallucination_avoidance",
+            ]},
+            "status": "skipped_healthy",
+            "date": run_date,
+            "last_checked": started_at,
+            "skip_reason": skip_reason,
+            "message": f"Healthy — evaluation skipped ({skip_reason})",
+            "summary": "System healthy — Gemini evaluation skipped to conserve quota.",
+            "prompt_updated": False,
+            "assessment_count": 0,
+            "issues": [],
+            "before_after": {"previous_score": last_score, "latest_score": last_score},
+            "source": "nightly_scheduler",
+            "started_at": started_at,
+            "completed_at": utc_now(),
+        }
+        _save_run_to_history(skipped_result)
+        print(f"[self-improvement] nightly skipped — {skip_reason}")
+        return skipped_result
+
+    # Full evaluation needed
+    run_reasons: List[str] = []
+    if not quality_ok:
+        run_reasons.append(f"quality {round((last_score or 0) * 100)}% < 75%")
+    if not eval_recent:
+        run_reasons.append(f"last eval {round(hours_since_eval)}h ago (> 47 h)")
+    if not no_failures:
+        run_reasons.append("quota errors in last run")
+    print(
+        f"[self-improvement] nightly full evaluation — reasons: "
+        f"{', '.join(run_reasons) or 'first run / no cached data'}"
+    )
+
+    full_result = await run_self_improvement(SelfImprovementRequest(source="nightly_scheduler"))
+    full_result["last_checked"] = started_at
+    print(
+        f"[self-improvement] nightly completed at {utc_now()} — "
+        f"score={full_result.get('average_score')} status={full_result.get('status')}"
+    )
+    return full_result
+
+
 @app.post("/self-improve")
 @app.post("/api/self-improve")
 async def self_improve_from_phoenix() -> Dict[str, Any]:
-    phoenix = PhoenixMCPClient(ARIZE_API_BASE_URL, project_name=ARIZE_PROJECT_NAME, space_id=ARIZE_SPACE_ID)
+    phoenix = PhoenixMCPClient(_phoenix_client_base_url(), project_name=PHOENIX_PROJECT_NAME, space_id=ARIZE_SPACE_ID)
     all_spans: List[Dict[str, Any]] = []
     low_quality_spans: List[Dict[str, Any]] = []
+    narration: List[str] = []
+
+    narration.append("Querying Phoenix traces via MCP...")
     try:
         all_spans = await phoenix.get_recent_spans(limit=50)
+        _log_mcp_call(
+            "get_recent_spans",
+            f"Self-improvement loop retrieved {len(all_spans)} traces from Phoenix MCP",
+            {"count": len(all_spans)},
+        )
+        narration.append(f"Found {len(all_spans)} traces in Phoenix MCP project '{ARIZE_PROJECT_NAME}'")
         low_quality_spans = phoenix.filter_low_quality(all_spans)
+        if low_quality_spans:
+            narration.append(f"Identified {len(low_quality_spans)} low-quality spans for analysis...")
+        else:
+            narration.append("All spans meet quality threshold — no improvements needed")
     except Exception as error:
         print(f"[self-improve] Phoenix lookup failed: {type(error).__name__}: {error}")
+        narration.append(f"Phoenix MCP query failed: {error}")
 
     total_analyzed = len(all_spans)
 
@@ -2686,6 +3172,7 @@ async def self_improve_from_phoenix() -> Dict[str, Any]:
             "traces_analyzed": 0,
             "improvements_made": 0,
             "phoenix_url": phoenix.phoenix_url or PHOENIX_UI_URL,
+            "narration": narration,
         }
 
     if not low_quality_spans:
@@ -2695,8 +3182,10 @@ async def self_improve_from_phoenix() -> Dict[str, Any]:
             "traces_analyzed": total_analyzed,
             "improvements_made": 0,
             "phoenix_url": phoenix.phoenix_url or PHOENIX_UI_URL,
+            "narration": narration,
         }
 
+    narration.append(f"Analyzing {len(low_quality_spans)} low-quality spans for failure patterns...")
     prompt = build_phoenix_improvement_prompt(low_quality_spans)
     suggestions: Dict[str, Any]
     try:
@@ -2706,9 +3195,11 @@ async def self_improve_from_phoenix() -> Dict[str, Any]:
             prompt_template_name="phoenix_self_improvement_v1",
         )
         suggestions = parse_json_response(suggestion_text)
+        narration.append("Gemini analyzed trace patterns and generated prompt improvement suggestions")
     except Exception as error:
         print(f"[self-improve] Gemini suggestion generation failed: {type(error).__name__}: {error}")
         suggestions = {}
+        narration.append(f"Gemini suggestion generation failed: {error}")
 
     improvement_record = {
         "timestamp": utc_now(),
@@ -2719,6 +3210,12 @@ async def self_improve_from_phoenix() -> Dict[str, Any]:
     }
     try:
         await phoenix.log_improvement(improvement_record)
+        _log_mcp_call(
+            "log_improvement",
+            f"Logged self-improvement record to Phoenix MCP ({len(low_quality_spans)} improvements)",
+            improvement_record,
+        )
+        narration.append("Improvement record logged back to Phoenix MCP dataset")
     except Exception as error:
         print(f"[self-improve] Phoenix improvement logging failed: {type(error).__name__}: {error}")
 
@@ -2732,13 +3229,14 @@ async def self_improve_from_phoenix() -> Dict[str, Any]:
         "risk_assessment_checks": suggestions.get("risk_assessment_checks") or [],
         "summary": suggestions.get("summary") or "",
         "phoenix_url": phoenix.phoenix_url or PHOENIX_UI_URL,
+        "narration": narration,
     }
 
 
 @app.post("/phoenix/traces")
 @app.post("/api/phoenix/traces")
 async def phoenix_traces(span_kind: str = "LLM") -> Dict[str, Any]:
-    phoenix = PhoenixMCPClient(ARIZE_API_BASE_URL, project_name=ARIZE_PROJECT_NAME, space_id=ARIZE_SPACE_ID)
+    phoenix = PhoenixMCPClient(_phoenix_client_base_url(), project_name=PHOENIX_PROJECT_NAME, space_id=ARIZE_SPACE_ID)
     try:
         spans = await phoenix.get_recent_spans(limit=50)
     except Exception as error:
@@ -2822,10 +3320,12 @@ async def arize_status() -> Dict[str, Any]:
 async def arize_traces(limit: int = 100) -> Any:
     effective_limit = min(int(limit), 200)
     try:
-        phoenix = PhoenixMCPClient(ARIZE_API_BASE_URL, project_name=ARIZE_PROJECT_NAME, space_id=ARIZE_SPACE_ID)
-        spans = await phoenix.get_recent_spans(limit=effective_limit)
+        phoenix = PhoenixMCPClient(_phoenix_client_base_url(), project_name=PHOENIX_PROJECT_NAME, space_id=ARIZE_SPACE_ID)
+        spans = await asyncio.wait_for(phoenix.get_recent_spans(limit=effective_limit), timeout=5.0)
         if isinstance(spans, list):
             return [clean_phoenix_trace(s) for s in spans]
+    except asyncio.TimeoutError:
+        print("[arize/traces] Phoenix get_recent_spans timed out after 5s")
     except Exception as phoenix_err:
         print(f"[arize/traces] Phoenix lookup failed: {phoenix_err}")
     return []
@@ -2839,7 +3339,7 @@ async def traces_reef_assessments(date: Optional[str] = None, limit: Optional[in
 
     # Try Phoenix for recent spans
     try:
-        phoenix = PhoenixMCPClient(ARIZE_API_BASE_URL, project_name=ARIZE_PROJECT_NAME, space_id=ARIZE_SPACE_ID)
+        phoenix = PhoenixMCPClient(_phoenix_client_base_url(), project_name=PHOENIX_PROJECT_NAME, space_id=ARIZE_SPACE_ID)
         spans = await phoenix.get_recent_spans(limit=effective_limit)
         if isinstance(spans, list) and spans:
             traces = [clean_phoenix_trace(s) for s in spans]
@@ -2928,10 +3428,13 @@ async def mcp_get_traces_summary() -> Dict[str, Any]:
 
 
 @app.get("/mcp/tools")
+@app.get("/api/mcp/tools")
 async def mcp_list_tools() -> Dict[str, Any]:
     """Phoenix MCP: list available introspection tools"""
     return {
         "tools": [
+            {"name": "query_phoenix_traces", "description": "Retrieve recent AI inference traces from Phoenix MCP", "source": "phoenix_mcp"},
+            {"name": "query_phoenix_quality_metrics", "description": "Get real-time AI quality metrics from Phoenix MCP", "source": "phoenix_mcp"},
             {"name": "get_recent_traces", "endpoint": "/mcp/traces/recent", "description": "Get recent AI inference traces"},
             {"name": "get_quality_summary", "endpoint": "/mcp/traces/summary", "description": "Get agent quality metrics"},
             {"name": "analyze_reef", "endpoint": "/analyze-reef", "description": "Analyze reef bleaching risk"},
@@ -2939,7 +3442,51 @@ async def mcp_list_tools() -> Dict[str, Any]:
         ],
         "phoenix_project": PHOENIX_PROJECT_NAME,
         "phoenix_endpoint": PHOENIX_ENDPOINT,
+        "gemini_function_tools": [d["name"] for d in _PHOENIX_MCP_TOOL_DECLARATIONS],
     }
+
+
+@app.get("/api/mcp/tool-calls")
+async def mcp_tool_calls(limit: int = 50) -> Dict[str, Any]:
+    """Return the log of recent Phoenix MCP tool calls made by the agent."""
+    effective_limit = max(1, min(int(limit), 200))
+    rows: List[Dict[str, Any]] = []
+    try:
+        with _mcp_db_lock:
+            con = sqlite3.connect(_MCP_DB_PATH)
+            db_rows = con.execute(
+                "SELECT timestamp, tool, summary, data_preview FROM mcp_tool_calls ORDER BY id DESC LIMIT ?",
+                (effective_limit,),
+            ).fetchall()
+            total = con.execute("SELECT COUNT(*) FROM mcp_tool_calls").fetchone()[0]
+            con.close()
+        for r in db_rows:
+            entry: Dict[str, Any] = {"timestamp": r[0], "tool": r[1], "summary": r[2]}
+            if r[3]:
+                entry["data_preview"] = r[3]
+            rows.append(entry)
+    except Exception:
+        # Fall back to in-memory list if DB unavailable
+        recent = _mcp_tool_call_log[-effective_limit:]
+        rows = list(reversed(recent))
+        total = len(_mcp_tool_call_log)
+    return {
+        "tool_calls": rows,
+        "total_logged": total,
+        "available_tools": [d["name"] for d in _PHOENIX_MCP_TOOL_DECLARATIONS],
+    }
+
+
+@app.post("/api/mcp/query")
+async def mcp_query_tool(request: Request) -> Dict[str, Any]:
+    """Directly invoke a Phoenix MCP tool by name."""
+    body = await request.json()
+    tool_name = body.get("tool") or body.get("tool_name", "")
+    args = body.get("args") or body.get("arguments") or {}
+    if not tool_name:
+        raise HTTPException(status_code=400, detail="'tool' field is required")
+    result = await _execute_phoenix_mcp_tool(tool_name, args)
+    return {"tool": tool_name, "result": result, "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
 # ---------------------------------------------------------------------------
@@ -3630,6 +4177,13 @@ async def live_reefs() -> List[Dict[str, Any]]:
     return base
 
 
+@app.get("/api/monitored-reefs")
+@app.get("/monitored-reefs")
+async def get_monitored_reefs() -> List[Dict[str, Any]]:
+    """Single source of truth for all currently monitored reefs (base + user-added)."""
+    return await live_reefs()
+
+
 @app.post("/api/reefs/monitor")
 @app.post("/reefs/monitor")
 async def monitor_reef(payload: MonitorStationRequest) -> Dict[str, Any]:
@@ -3686,6 +4240,7 @@ async def monitor_reef(payload: MonitorStationRequest) -> Dict[str, Any]:
 
     _custom_monitored_reefs = [r for r in _custom_monitored_reefs if r.get("id") != canon_id]
     _custom_monitored_reefs.append(reef)
+    _save_monitored_reef_to_db(reef)
 
     print(f"[monitor] added {reef['name']} (id={canon_id}, total={len(_custom_monitored_reefs)})")
     return {"success": True, "station": reef, "noaaData": "cached" if matched else "unavailable", "aiAnalysis": "pending"}
@@ -3698,6 +4253,8 @@ async def unmonitor_reef(reef_id: str) -> Dict[str, Any]:
     before = len(_custom_monitored_reefs)
     _custom_monitored_reefs = [r for r in _custom_monitored_reefs if r.get("id") != reef_id]
     removed = len(_custom_monitored_reefs) < before
+    if removed:
+        _delete_monitored_reef_from_db(reef_id)
     print(f"[monitor] removed id={reef_id} (removed={removed}, remaining={len(_custom_monitored_reefs)})")
     return {"removed": removed}
 
@@ -3717,29 +4274,60 @@ def _slugify_station(value: str) -> str:
     return slug.strip("-")
 
 
+def _polygon_centroid(ring: List[Any]) -> Optional[tuple]:
+    """Return (lat, lng) centroid of a GeoJSON exterior ring, or None if invalid."""
+    pairs = [(c[1], c[0]) for c in ring if isinstance(c, (list, tuple)) and len(c) >= 2
+             and _to_number(c[0]) is not None and _to_number(c[1]) is not None]
+    if not pairs:
+        return None
+    return (round(sum(p[0] for p in pairs) / len(pairs), 6),
+            round(sum(p[1] for p in pairs) / len(pairs), 6))
+
+
 def _parse_virtual_stations_geojson(data: Any) -> List[Dict[str, Any]]:
-    """Parse NOAA vs_polygons.json — returns only Point features (214 virtual stations).
+    """Parse NOAA vs_polygons.json — handles Point, Polygon, and MultiPolygon features.
     Properties already include live sst / ssta / dhw / alert from the daily NOAA update."""
     seen: set = set()
     stations: List[Dict[str, Any]] = []
     for feature in data.get("features") or []:
         geom = feature.get("geometry") or {}
-        if geom.get("type") != "Point":
-            continue
+        geom_type = geom.get("type")
         coords = geom.get("coordinates") or []
-        if len(coords) < 2:
-            continue
         props = feature.get("properties") or {}
         name = str(props.get("name") or "").strip()
         if not name:
             continue
-        lng_val, lat_val = _to_number(coords[0]), _to_number(coords[1])
+
+        lat_val: Optional[float] = None
+        lng_val: Optional[float] = None
+
+        if geom_type == "Point":
+            if len(coords) < 2:
+                continue
+            lng_val, lat_val = _to_number(coords[0]), _to_number(coords[1])
+        elif geom_type == "Polygon":
+            exterior = coords[0] if coords else []
+            result = _polygon_centroid(exterior)
+            if result:
+                lat_val, lng_val = result
+        elif geom_type == "MultiPolygon":
+            # Use centroid of the first polygon's exterior ring
+            first_poly = coords[0] if coords else []
+            exterior = first_poly[0] if first_poly else []
+            result = _polygon_centroid(exterior)
+            if result:
+                lat_val, lng_val = result
+        else:
+            continue
+
         if lat_val is None or lng_val is None:
             continue
-        key = f"{name}:{lat_val}:{lng_val}"
-        if key in seen:
+
+        # Deduplicate by station slug (handles same location in multiple geometry types)
+        station_id = f"station-{_slugify_station(name)}"
+        if station_id in seen:
             continue
-        seen.add(key)
+        seen.add(station_id)
 
         sst = _round_number(_to_number(props.get("sst")))
         anomaly = _round_number(_to_number(props.get("ssta")))
@@ -3748,7 +4336,6 @@ def _parse_virtual_stations_geojson(data: Any) -> List[Dict[str, Any]]:
         risk = _calculate_risk(dhw, alert_num)
         alert_label = _get_bleaching_alert_level(alert_num, dhw)
 
-        station_id = f"station-{_slugify_station(name)}"
         stations.append({
             "id": station_id,
             "name": name,
@@ -4298,10 +4885,20 @@ async def _run_alert_check() -> Dict[str, Any]:
     skipped_threshold = 0
     errors: List[str] = []
 
+    # Only alert on reefs the user has explicitly registered for active monitoring.
+    # If no reefs are registered, skip entirely — never send emails for zero-selection state.
+    if not _custom_monitored_reefs:
+        print("[alert-scheduler] no user-registered reefs — skipping alert check")
+        return {
+            "reefs_checked": 0, "alerts_sent": 0,
+            "message": "No active monitored reefs registered. Add reefs to enable alerts.",
+            "checked_at": utc_now(),
+        }
+
     try:
-        reefs = await live_reefs()
+        reefs = list(_custom_monitored_reefs)  # Only user-registered reefs, not all base reefs
     except Exception as exc:
-        msg = f"Failed to fetch reef data: {type(exc).__name__}: {exc}"
+        msg = f"Failed to access monitored reefs: {type(exc).__name__}: {exc}"
         print(f"[alert-scheduler] {msg}")
         return {"error": msg, "reefs_checked": 0, "checked_at": utc_now()}
 
@@ -4358,6 +4955,84 @@ async def alert_status() -> Dict[str, Any]:
             reef_id: {"sent_at": sent_at, "in_cooldown": _is_in_cooldown(reef_id)}
             for reef_id, sent_at in _alert_last_sent.items()
         },
+    }
+
+
+# ---------------------------------------------------------------------------
+# ADK Agent endpoint
+# ---------------------------------------------------------------------------
+
+class ADKAgentRequest(BaseModel):
+    query: str
+    session_id: Optional[str] = None
+    user_id: str = "reefwatch-user"
+
+
+@app.post("/api/adk-agent")
+async def adk_agent_query(request: ADKAgentRequest) -> Dict[str, Any]:
+    """Run the ReefWatch ADK agent for a given natural-language query.
+
+    Requires ``google-adk`` to be installed (it is listed in requirements.txt).
+    The agent uses Gemini 2.5 Flash with three tools: reef risk analysis,
+    Phoenix trace retrieval, and quality metrics.
+    """
+    try:
+        from google.adk.runners import Runner
+        from google.adk.sessions import InMemorySessionService
+        from google.genai.types import Content, Part
+        from agent import reef_agent  # noqa: PLC0415 — lazy import avoids startup cost
+    except ImportError as import_err:
+        raise HTTPException(
+            status_code=503,
+            detail=f"google-adk is not installed or agent.py is missing: {import_err}",
+        )
+
+    session_service = InMemorySessionService()
+    runner = Runner(
+        agent=reef_agent,
+        app_name="reefwatch-ai",
+        session_service=session_service,
+    )
+
+    session_id = request.session_id or f"adk-{int(time.time() * 1000)}"
+    user_id = request.user_id
+
+    await session_service.create_session(
+        app_name="reefwatch-ai",
+        user_id=user_id,
+        session_id=session_id,
+    )
+
+    message = Content(role="user", parts=[Part(text=request.query)])
+
+    start = time.perf_counter()
+    response_text = ""
+    tool_calls_made: List[str] = []
+
+    try:
+        async for event in runner.run_async(
+            user_id=user_id,
+            session_id=session_id,
+            new_message=message,
+        ):
+            # Collect tool call names for observability
+            if hasattr(event, "tool_call") and event.tool_call:
+                tool_calls_made.append(getattr(event.tool_call, "name", "unknown"))
+            # Capture final text response
+            if hasattr(event, "is_final_response") and event.is_final_response():
+                if event.content and event.content.parts:
+                    response_text = event.content.parts[0].text or ""
+                break
+    except Exception as run_err:
+        raise HTTPException(status_code=502, detail=f"ADK agent run failed: {run_err}")
+
+    return {
+        "response": response_text,
+        "session_id": session_id,
+        "agent": "reefwatch_agent",
+        "model": "gemini-2.5-flash",
+        "latency_ms": round(elapsed_ms(start), 2),
+        "tools_called": tool_calls_made,
     }
 
 

@@ -165,6 +165,8 @@ export interface ArizeStatus {
     total_tokens: number;
     last_trace_time: string | null;
     last_error: string | null;
+    /** True when the backend is serving seeded baseline data (no real traces this session) */
+    _is_baseline?: boolean;
   } | null;
   message: string;
 }
@@ -210,9 +212,15 @@ export interface TestAlertResponse {
 }
 
 export interface SelfImprovementRun {
-  status?: 'completed' | 'partial' | 'insufficient_data' | 'timeout' | 'error' | 'no_traces' | string;
+  status?: 'completed' | 'improved' | 'partial' | 'insufficient_data' | 'timeout' | 'error' | 'no_traces' | 'skipped_healthy' | string;
   cached_from?: string | null;
   cached?: boolean;
+  /** ISO timestamp of when this run (or health check) completed. */
+  last_checked?: string | null;
+  /** Human-readable reason why the full Gemini eval was skipped. */
+  skip_reason?: string | null;
+  /** "manual" | "nightly_scheduler" | "fresh_live_reef_analysis" etc. */
+  source?: string | null;
   date: string | null;
   assessment_count: number;
   average_score: number | null;
@@ -328,6 +336,16 @@ export async function fetchLiveReefs(): Promise<LiveReef[]> {
   return response.json();
 }
 
+export async function fetchMonitoredReefs(): Promise<LiveReef[]> {
+  const response = await fetch(`${REEF_API_BASE_URL}/api/monitored-reefs`);
+
+  if (!response.ok) {
+    throw new Error(`Monitored reefs request failed with ${response.status}`);
+  }
+
+  return response.json();
+}
+
 export async function fetchReefStations(): Promise<ReefStation[]> {
   const response = await fetch(`${REEF_API_BASE_URL}/api/reefs/stations`, {
     signal: AbortSignal.timeout(20000),
@@ -378,6 +396,20 @@ export async function fetchArizeTraces(limit = 100): Promise<ArizeTrace[]> {
   }
 
   return response.json();
+}
+
+export interface McpToolCall {
+  timestamp: string;
+  tool: string;
+  summary: string;
+  data_preview?: string;
+}
+
+export async function fetchMcpToolCalls(limit = 20): Promise<McpToolCall[]> {
+  const response = await fetch(`${REEF_API_BASE_URL}/api/mcp/tool-calls?limit=${limit}`);
+  if (!response.ok) return [];
+  const data = await response.json();
+  return Array.isArray(data.tool_calls) ? data.tool_calls : [];
 }
 
 export async function fetchAgentActivity(): Promise<AgentActivityEvent[]> {
@@ -554,7 +586,7 @@ export async function runSelfEvaluationNow(): Promise<SelfImprovementRun> {
 }
 
 export async function addStationToActiveMonitoring(payload: {
-  station_id: string;
+  station_id?: string;
   name: string;
   lat: number;
   lng: number;

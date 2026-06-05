@@ -194,7 +194,6 @@ export function ConservationReports() {
 
   useEffect(() => {
     let isMounted = true;
-
     fetchLiveReefs()
       .then((liveReefs) => {
         if (!isMounted) return;
@@ -202,17 +201,10 @@ export function ConservationReports() {
         setSelectedReefId(liveReefs[0]?.id || '');
       })
       .catch(() => {
-        if (isMounted) {
-          setError('Live reef data is unavailable from the deployed ReefWatch backend.');
-        }
+        if (isMounted) setError('Live reef data is unavailable from the deployed ReefWatch backend.');
       })
-      .finally(() => {
-        if (isMounted) setIsLoadingReefs(false);
-      });
-
-    return () => {
-      isMounted = false;
-    };
+      .finally(() => { if (isMounted) setIsLoadingReefs(false); });
+    return () => { isMounted = false; };
   }, []);
 
   const selectedReef = useMemo(

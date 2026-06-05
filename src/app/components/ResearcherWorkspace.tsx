@@ -17,6 +17,26 @@ interface ChatEntry {
 
 const GREETING = "Hello, I'm your ReefWatch AI assistant. I use only your actively monitored reefs for analysis, alerts, reports, and self-improvement. What would you like to analyze today?";
 
+const CHAT_STORAGE_KEY = 'reefwatch_researcher_messages';
+
+function loadCachedMessages(): ChatEntry[] {
+  try {
+    const raw = localStorage.getItem(CHAT_STORAGE_KEY);
+    if (!raw) return [];
+    return JSON.parse(raw);
+  } catch {
+    return [];
+  }
+}
+
+function saveCachedMessages(messages: ChatEntry[]) {
+  try {
+    // Keep last 50 messages to avoid unbounded growth
+    const toSave = messages.slice(-50);
+    localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(toSave));
+  } catch {}
+}
+
 const statusStyles = {
   safe: 'text-coral-safe bg-coral-safe/10 border-coral-safe/35',
   warning: 'text-coral-warning bg-coral-warning/10 border-coral-warning/35',
@@ -75,49 +95,39 @@ function renderMessageContent(content: string) {
   );
 }
 
-function readLocalMonitoredCount(): number {
-  try {
-    const ids = JSON.parse(localStorage.getItem('reefwatch_monitored_reef_ids') || '[]');
-    return Array.isArray(ids) ? ids.length : 0;
-  } catch { return 0; }
-}
 
 export function ResearcherWorkspace() {
-  const { reefs, error: reefError } = useReefData();
-  const [localMonitoredCount, setLocalMonitoredCount] = useState(readLocalMonitoredCount);
-  const [messages, setMessages] = useState<ChatEntry[]>([
-    {
+  const { activeReefs, error: reefError } = useReefData();
+  const [messages, setMessages] = useState<ChatEntry[]>(() => {
+    const cached = loadCachedMessages();
+    if (cached.length > 0) return cached;
+    return [{
       id: 'greeting',
       role: 'assistant',
       content: GREETING,
       suggestions: ['Analyze Most At-Risk Reef', 'Compare All Regions', 'Generate Weekly Summary'],
-    },
-  ]);
+    }];
+  });
   const [input, setInput] = useState('');
   const [agentStatus, setAgentStatus] = useState<'ready' | 'thinking' | 'fetching data'>('ready');
   const chatEndRef = useRef<HTMLDivElement | null>(null);
 
+
   useEffect(() => {
-    const sync = () => setLocalMonitoredCount(readLocalMonitoredCount());
-    window.addEventListener('storage', sync);
-    window.addEventListener('reefwatch:monitoring-updated', sync);
-    return () => {
-      window.removeEventListener('storage', sync);
-      window.removeEventListener('reefwatch:monitoring-updated', sync);
-    };
-  }, []);
+    saveCachedMessages(messages);
+  }, [messages]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, agentStatus]);
 
   const activeAlerts = useMemo(
-    () => reefs.filter((reef) => reef.status === 'critical' || reef.status === 'warning'),
-    [reefs]
+    () => activeReefs.filter((reef) => reef.status === 'critical' || reef.status === 'warning'),
+    [activeReefs]
   );
   const mostAtRisk = useMemo(
-    () => [...reefs].sort((a, b) => b.riskScore - a.riskScore)[0],
-    [reefs]
+    () => [...activeReefs].sort((a, b) => b.riskScore - a.riskScore)[0],
+    [activeReefs]
   );
 
   async function sendMessage(text = input) {
@@ -137,25 +147,61 @@ export function ResearcherWorkspace() {
 
     try {
       setAgentStatus('fetching data');
-      const response = await sendResearchChat({
-        message: String(trimmed),
-        conversation_history: Array.isArray(nextMessages) ? nextMessages.map(messageToHistory) : [],
-        reef_context: {
-          monitored_reefs: reefs,
-          active_alerts: activeAlerts,
-          most_at_risk: mostAtRisk ?? null,
-        },
-      });
+
+      // Try the ADK agent endpoint first; fall back to the original chat endpoint if it fails.
+      let answer = '';
+      let dataUsed: string[] = [];
+      let confidence = 0;
+      let suggestions: string[] = [];
+      let reasoningSteps: string[] = [];
+
+      let adkSucceeded = false;
+      try {
+        const adkRes = await fetch(`${REEF_API_BASE_URL}/api/adk-agent`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query: trimmed }),
+          signal: AbortSignal.timeout(50000),
+        });
+        if (adkRes.ok) {
+          const adkData = await adkRes.json();
+          if (adkData.response) {
+            answer = adkData.response;
+            dataUsed = Array.isArray(adkData.tools_called) ? adkData.tools_called : [];
+            adkSucceeded = true;
+          }
+        }
+      } catch {
+        // fall through to original endpoint
+      }
+
+      if (!adkSucceeded) {
+        const fallback = await sendResearchChat({
+          message: String(trimmed),
+          conversation_history: Array.isArray(nextMessages) ? nextMessages.map(messageToHistory) : [],
+          reef_context: {
+            monitored_reefs: activeReefs,
+            active_alerts: activeAlerts,
+            most_at_risk: mostAtRisk ?? null,
+          },
+        });
+        answer = fallback.answer;
+        dataUsed = fallback.data_used || [];
+        confidence = fallback.confidence;
+        suggestions = fallback.follow_up_suggestions || [];
+        reasoningSteps = fallback.reasoning_steps || [];
+      }
+
       setMessages((current) => [
         ...current.filter((message) => !isTransientErrorMessage(message)),
         {
           id: `assistant-${Date.now()}`,
           role: 'assistant',
-          content: response.answer,
-          dataUsed: response.data_used || [],
-          confidence: response.confidence,
-          suggestions: response.follow_up_suggestions || [],
-          reasoningSteps: response.reasoning_steps || [],
+          content: answer,
+          dataUsed,
+          confidence,
+          suggestions,
+          reasoningSteps,
         },
       ]);
     } catch (error) {
@@ -236,15 +282,15 @@ export function ResearcherWorkspace() {
             </div>
             <div className="grid grid-cols-3 gap-3">
               <div className="rounded-xl border border-cyan-glow/10 bg-ocean-medium/30 p-3">
-                <p className="text-2xl text-white">{localMonitoredCount || reefs.length || '...'}</p>
+                <p className="text-2xl text-white">{activeReefs.length}</p>
                 <p className="text-xs text-gray-muted">Monitored</p>
               </div>
               <div className="rounded-xl border border-coral-critical/18 bg-coral-critical/7 p-3">
-                <p className="text-2xl text-coral-critical">{reefs.filter((reef) => reef.status === 'critical').length}</p>
+                <p className="text-2xl text-coral-critical">{activeReefs.filter((reef) => reef.status === 'critical').length}</p>
                 <p className="text-xs text-gray-muted">Critical</p>
               </div>
               <div className="rounded-xl border border-coral-warning/18 bg-coral-warning/7 p-3">
-                <p className="text-2xl text-coral-warning">{reefs.filter((reef) => reef.status === 'warning').length}</p>
+                <p className="text-2xl text-coral-warning">{activeReefs.filter((reef) => reef.status === 'warning').length}</p>
                 <p className="text-xs text-gray-muted">Warning</p>
               </div>
             </div>
@@ -310,13 +356,14 @@ export function ResearcherWorkspace() {
                 <h3 className="text-xl text-white">ReefWatch AI Assistant</h3>
                 <p className="text-sm text-gray-muted">Live NOAA context · Gemini reasoning · Phoenix trace-ready</p>
               </div>
+              <span className="ml-auto shrink-0 rounded-lg border border-cyan-glow/20 bg-cyan-glow/8 px-2.5 py-1 text-[11px] text-cyan-glow">
+                Powered by Google Cloud ADK
+              </span>
             </div>
           </div>
 
           <div className="flex-1 space-y-8 overflow-auto p-6">
-            {messages.map((message) => {
-              console.log('reasoning steps:', message.reasoningSteps);
-              return (
+            {messages.map((message) => (
               <div key={message.id} className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                 <div className={`max-w-[82%] border px-5 py-4 shadow-[0_16px_36px_rgba(2,11,20,0.2)] ${
                   message.role === 'user'
@@ -379,8 +426,7 @@ export function ResearcherWorkspace() {
                   )}
                 </div>
               </div>
-              );
-            })}
+            ))}
 
             {agentStatus !== 'ready' && (
               <div className="flex justify-start">

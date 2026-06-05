@@ -37,12 +37,6 @@ export default function App() {
   const [activeView, setActiveView] = useState('dashboard');
   const [selectedReef, setSelectedReef] = useState<ReefData | null>(null);
   const [mapFocusTarget, setMapFocusTarget] = useState<SearchNavigationTarget | null>(null);
-  const [monitoredReefCount, setMonitoredReefCount] = useState(() => {
-    try {
-      const ids = JSON.parse(localStorage.getItem('reefwatch_monitored_reef_ids') || '[]');
-      return Array.isArray(ids) ? ids.length : 0;
-    } catch { return 0; }
-  });
 
   useEffect(() => {
     checkBackendHealth();
@@ -91,7 +85,7 @@ export default function App() {
 
         <div className="flex-1 overflow-hidden">
           {activeView === 'dashboard' && (
-            <DashboardOverview onNavigate={handleNavigate} monitoredReefCount={monitoredReefCount} />
+            <DashboardOverview onNavigate={handleNavigate} />
           )}
 
           {activeView === 'map' && (
@@ -100,7 +94,6 @@ export default function App() {
                 <LiveReefGoogleMap
                   onReefSelect={setSelectedReef}
                   focusTarget={mapFocusTarget}
-                  onMonitoredCountChange={setMonitoredReefCount}
                 />
               </div>
             </div>

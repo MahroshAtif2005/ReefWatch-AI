@@ -174,35 +174,17 @@ function TrendChart({
   );
 }
 
-function readMonitoredCount(): number {
-  try {
-    const ids = JSON.parse(localStorage.getItem('reefwatch_monitored_reef_ids') || '[]');
-    return Array.isArray(ids) ? ids.length : 0;
-  } catch { return 0; }
-}
-
 export function AnalyticsDashboard() {
-  const { reefs } = useReefData();
+  const { activeReefs } = useReefData();
   const [trends, setTrends] = useState<HistoricalTrendsResponse | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [monitoredCount, setMonitoredCount] = useState(readMonitoredCount);
 
   const reefCounts = useMemo(() => ({
-    critical: reefs.filter((r) => r.status === 'critical').length,
-    warning: reefs.filter((r) => r.status === 'warning').length,
-    healthy: reefs.filter((r) => r.status === 'safe').length,
-  }), [reefs]);
-
-  useEffect(() => {
-    const sync = () => setMonitoredCount(readMonitoredCount());
-    window.addEventListener('storage', sync);
-    window.addEventListener('reefwatch:monitoring-updated', sync);
-    return () => {
-      window.removeEventListener('storage', sync);
-      window.removeEventListener('reefwatch:monitoring-updated', sync);
-    };
-  }, []);
+    critical: activeReefs.filter((r) => r.status === 'critical').length,
+    warning: activeReefs.filter((r) => r.status === 'warning').length,
+    healthy: activeReefs.filter((r) => r.status === 'safe').length,
+  }), [activeReefs]);
 
   useEffect(() => {
     let isMounted = true;
@@ -320,7 +302,7 @@ export function AnalyticsDashboard() {
       <div>
         <h3 className="mb-6 text-xl text-white">Current Conditions</h3>
         <div className="grid grid-cols-1 gap-6 md:grid-cols-2 xl:grid-cols-4">
-          <StatCard icon={<Activity className="h-5 w-5 text-cyan-glow" />} label="Monitoring" value={monitoredCount || reefs.length || trends.totalMonitoredReefs} helper="Reefs you're monitoring" />
+          <StatCard icon={<Activity className="h-5 w-5 text-cyan-glow" />} label="Monitoring" value={activeReefs.length} helper="Reefs you're monitoring" />
           <StatCard icon={<AlertCircle className="h-5 w-5 text-coral-critical" />} label="Critical" value={reefCounts.critical} helper="High DHW or alert level" tone="critical" />
           <StatCard icon={<TrendingUp className="h-5 w-5 text-coral-warning" />} label="Warning" value={reefCounts.warning} helper="Elevated thermal stress" tone="warning" />
           <StatCard icon={<Droplet className="h-5 w-5 text-coral-safe" />} label="Healthy" value={reefCounts.healthy} helper="Safe or normal status" tone="safe" />

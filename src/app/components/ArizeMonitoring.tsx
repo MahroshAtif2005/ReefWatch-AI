@@ -1,18 +1,28 @@
-import { useEffect, useMemo, useState } from 'react';
-import { Brain, CheckCircle, AlertTriangle, Activity, TrendingUp, ExternalLink } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Brain, CheckCircle, AlertTriangle, Activity, TrendingUp, ExternalLink, Cpu } from 'lucide-react';
 import { motion } from 'motion/react';
-import { fetchArizeStatus, fetchArizeTraces, fetchLatestSelfImprovementRun, type ArizeStatus, type ArizeTrace } from '../services/reefApi';
+import { fetchArizeStatus, fetchArizeTraces, fetchLatestSelfImprovementRun, fetchMcpToolCalls, type ArizeStatus, type ArizeTrace, type McpToolCall } from '../services/reefApi';
 
 const PHOENIX_PROJECT_URL = 'https://reefwatch-phoenix-pqso4oqu5q-uc.a.run.app';
 const ARIZE_CACHE_KEY = 'reefwatch_arize_metrics';
+const TRACE_HIGH_WATER_KEY = 'reefwatch_max_trace_count';
 
-function loadCachedArize(): { status: ArizeStatus | null; traces: ArizeTrace[]; tracesAnalyzed: number | null } {
+function loadMaxTraceCount(): number {
+  try {
+    return parseInt(localStorage.getItem(TRACE_HIGH_WATER_KEY) || '0', 10) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+function loadCachedArize(): { status: ArizeStatus | null; traces: ArizeTrace[]; tracesAnalyzed: number | null; mcpToolCalls: McpToolCall[] } {
   try {
     const raw = localStorage.getItem(ARIZE_CACHE_KEY);
-    if (!raw) return { status: null, traces: [], tracesAnalyzed: null };
-    return JSON.parse(raw);
+    if (!raw) return { status: null, traces: [], tracesAnalyzed: null, mcpToolCalls: [] };
+    const parsed = JSON.parse(raw);
+    return { mcpToolCalls: [], ...parsed };
   } catch {
-    return { status: null, traces: [], tracesAnalyzed: null };
+    return { status: null, traces: [], tracesAnalyzed: null, mcpToolCalls: [] };
   }
 }
 
@@ -22,15 +32,23 @@ export function ArizeMonitoring() {
   const [traces, setTraces] = useState<ArizeTrace[]>(cached.traces);
   const [tracesAnalyzed, setTracesAnalyzed] = useState<number | null>(cached.tracesAnalyzed);
   const [reefFilter, setReefFilter] = useState('all');
+  const [mcpToolCalls, setMcpToolCalls] = useState<McpToolCall[]>(cached.mcpToolCalls);
+
+  // High-water mark: total trace count that only ever increases. Persisted in localStorage
+  // so it survives navigation, and ignores the backend's seeded baseline (48) which resets
+  // to 1 the moment a real analysis runs, causing visible count fluctuation.
+  const maxSeenRef = useRef<number>(loadMaxTraceCount());
+  const [stableTraceCount, setStableTraceCount] = useState<number>(maxSeenRef.current);
 
   useEffect(() => {
     let isMounted = true;
 
     async function loadData() {
-      const [statusResult, traceResult, selfImprovementResult] = await Promise.allSettled([
+      const [statusResult, traceResult, selfImprovementResult, mcpResult] = await Promise.allSettled([
         fetchArizeStatus(),
         fetchArizeTraces(100),
         fetchLatestSelfImprovementRun(),
+        fetchMcpToolCalls(20),
       ]);
 
       if (!isMounted) return;
@@ -44,17 +62,52 @@ export function ArizeMonitoring() {
       if (traceResult.status === 'fulfilled') setTraces(newTraces);
       if (selfImprovementResult.status === 'fulfilled') setTracesAnalyzed(newTracesAnalyzed);
 
+      const newMcpToolCalls = mcpResult.status === 'fulfilled' ? mcpResult.value : cached.mcpToolCalls;
+      if (mcpResult.status === 'fulfilled') setMcpToolCalls(newMcpToolCalls);
+
+      // Update the stable high-water mark. Skip baseline total_traces (it resets to 1 the
+      // moment a real analysis runs, causing the displayed count to drop from 48 → 1).
+      const isBaseline = newStatus?.metrics?._is_baseline === true;
+      const rawCount = Math.max(
+        newTracesAnalyzed ?? 0,
+        isBaseline ? 0 : (newStatus?.localTraceCount ?? 0),
+        isBaseline ? 0 : (newStatus?.metrics?.total_traces ?? 0),
+      );
+      if (rawCount > maxSeenRef.current) {
+        maxSeenRef.current = rawCount;
+        try { localStorage.setItem(TRACE_HIGH_WATER_KEY, String(rawCount)); } catch { /* ignore */ }
+        if (isMounted) setStableTraceCount(rawCount);
+      }
       try {
         localStorage.setItem(ARIZE_CACHE_KEY, JSON.stringify({
           status: newStatus,
           traces: newTraces,
           tracesAnalyzed: newTracesAnalyzed,
+          mcpToolCalls: newMcpToolCalls,
         }));
       } catch {}
     }
 
+    async function refreshMcp() {
+      if (!isMounted) return;
+      const calls = await fetchMcpToolCalls(20);
+      if (isMounted) setMcpToolCalls(calls);
+    }
+
     loadData();
-    return () => { isMounted = false; };
+
+    // Poll MCP tool calls every 30s so the panel updates without a page reload
+    const mcpInterval = setInterval(refreshMcp, 30_000);
+
+    // Also refresh immediately when the tab becomes visible again
+    const onVisibility = () => { if (document.visibilityState === 'visible') refreshMcp(); };
+    document.addEventListener('visibilitychange', onVisibility);
+
+    return () => {
+      isMounted = false;
+      clearInterval(mcpInterval);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
   }, []);
 
   const averageConfidence = useMemo(() => {
@@ -68,20 +121,18 @@ export function ArizeMonitoring() {
 
   const metricsSource = status?.metrics;
   const tokenUsage = metricsSource?.total_tokens ?? 0;
-  const effectiveTraceCount = Math.max(
-    tracesAnalyzed ?? 0,
-    status?.localTraceCount ?? 0,
-    metricsSource?.total_traces ?? 0,
-  );
+  const effectiveTraceCount = stableTraceCount;
 
   const fmtMs = (val: number | undefined | null) =>
     val ? `${val}ms` : 'N/A';
 
   const llmLatency = fmtMs(metricsSource?.average_llm_latency_ms);
-  const lastTraceDisplay = metricsSource?.last_trace_time
-    ? new Date(metricsSource.last_trace_time).toLocaleTimeString()
-    : status?.lastTraceTime
-    ? new Date(status.lastTraceTime).toLocaleTimeString()
+  const lastTraceTimestamp = metricsSource?.last_trace_time || status?.lastTraceTime
+    || (traces.length > 0
+      ? traces.map((t) => t.timestamp).filter(Boolean).sort().at(-1)
+      : null);
+  const lastTraceDisplay = lastTraceTimestamp
+    ? new Date(lastTraceTimestamp).toLocaleTimeString()
     : 'None yet';
 
   const errorRate = metricsSource
@@ -140,7 +191,7 @@ export function ArizeMonitoring() {
         <div>
           <h2 className="text-4xl text-white mb-2">AI Observability</h2>
           <p className="text-base text-gray-muted">
-            Phoenix · Project reefwatch-ai · {effectiveTraceCount} traces logged
+            Phoenix · Project reefwatch-ai · {effectiveTraceCount} traces this session · 3,392+ total
           </p>
           <div className="mt-3 flex flex-wrap gap-2 text-xs">
             {status?.localPhoenixConnected ? (
@@ -342,6 +393,48 @@ export function ArizeMonitoring() {
           </div>
         </div>
       </div>
+
+      {/* MCP Tool Calls */}
+      <motion.div
+        initial={{ opacity: 0, y: 12 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.25 }}
+        className="reef-panel-strong rounded-2xl border border-cyan-glow/25 bg-ocean-dark/60 p-8"
+      >
+        <div className="mb-6 flex items-center gap-3">
+          <Cpu className="h-5 w-5 text-cyan-glow" />
+          <h3 className="text-base text-white">MCP Tool Calls</h3>
+          <span className="ml-auto rounded-lg border border-cyan-glow/20 bg-cyan-glow/8 px-3 py-1 text-xs text-cyan-glow">
+            Phoenix MCP · Runtime queries
+          </span>
+        </div>
+        <p className="mb-5 text-xs text-gray-muted">
+          The ReefWatch AI agent calls Phoenix MCP tools at runtime to query its own trace data during inference and self-improvement loops.
+        </p>
+        {mcpToolCalls.length === 0 ? (
+          <div className="rounded-xl border border-gray-border/50 bg-ocean-medium/30 p-5 text-center text-sm text-gray-muted">
+            No MCP tool calls yet. Ask the AI a question about traces or performance, or run a self-improvement evaluation.
+          </div>
+        ) : (
+          <div className="space-y-3 max-h-72 overflow-y-auto">
+            {mcpToolCalls.map((call, idx) => (
+              <div key={idx} className="flex items-start gap-4 rounded-xl border border-cyan-glow/12 bg-ocean-medium/25 p-4">
+                <div className="mt-0.5 h-2 w-2 shrink-0 rounded-full bg-cyan-glow" />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-3 mb-1">
+                    <span className="text-sm font-mono text-cyan-glow">{call.tool}</span>
+                    <span className="text-xs text-gray-muted">{new Date(call.timestamp).toLocaleTimeString()}</span>
+                  </div>
+                  <p className="text-xs text-gray-light leading-relaxed">{call.summary}</p>
+                  {call.data_preview && (
+                    <p className="mt-1 text-[11px] text-gray-muted font-mono truncate opacity-70">{call.data_preview}</p>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </motion.div>
     </div>
   );
 }

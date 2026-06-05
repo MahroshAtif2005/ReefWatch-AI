@@ -4,7 +4,7 @@ import { motion } from 'motion/react';
 import { AlertTriangle, CheckCircle2, Clock, Database, Droplet, Loader2, MapPin, Plus, Radio, Search, X } from 'lucide-react';
 import {
   addStationToActiveMonitoring,
-  fetchLiveReefs,
+  fetchMonitoredReefs,
   fetchReefStationReadings,
   fetchReefStations,
   normalizeBleachingAlertLevel,
@@ -13,6 +13,7 @@ import {
   type ReefStation,
   type ReefStationReading,
 } from '../services/reefApi';
+import { getActiveReefIds, isStorageAvailable, saveActiveReefIds } from '../utils/storage';
 import type { SearchNavigationTarget } from './Header';
 
 interface LiveReefGoogleMapProps {
@@ -32,7 +33,6 @@ interface LiveReefGoogleMapProps {
     error?: string;
   }) => void;
   focusTarget?: SearchNavigationTarget | null;
-  onMonitoredCountChange?: (count: number) => void;
 }
 
 const oceanMapStyles = [
@@ -225,18 +225,6 @@ function ApiKeyFallback() {
 }
 
 const MAX_ACTIVE_REEFS = 20;
-const MONITORED_IDS_STORAGE_KEY = 'reefwatch_monitored_reef_ids';
-
-const CURATED_TERMS = [
-  'galapagos',
-  'great barrier',
-  'florida keys',
-  'hawaii',
-  'maldives',
-  'red sea',
-  'raja ampat',
-  'caribbean',
-];
 
 type TimeRangeMode = 'past-week' | 'live' | 'forecast';
 
@@ -764,19 +752,10 @@ function MapFocusController({ target }: { target?: SearchNavigationTarget | null
   return null;
 }
 
-export function LiveReefGoogleMap({ onReefSelect: _onReefSelect, focusTarget, onMonitoredCountChange }: LiveReefGoogleMapProps) {
+export function LiveReefGoogleMap({ onReefSelect: _onReefSelect, focusTarget }: LiveReefGoogleMapProps) {
   const apiKey = import.meta.env.VITE_GOOGLE_MAPS_API_KEY;
   const [allReefs, setAllReefs] = useState<LiveReef[]>([]);
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => {
-    try {
-      const stored = localStorage.getItem(MONITORED_IDS_STORAGE_KEY);
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        if (Array.isArray(parsed) && parsed.length > 0) return new Set<string>(parsed);
-      }
-    } catch {}
-    return new Set<string>();
-  });
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set(getActiveReefIds()));
   const [isAddPanelOpen, setIsAddPanelOpen] = useState(false);
   const [stations, setStations] = useState<Array<ReefStation | ReefStationReading>>([]);
   const [selectedReef, setSelectedReef] = useState<LiveReef | null>(null);
@@ -790,12 +769,12 @@ export function LiveReefGoogleMap({ onReefSelect: _onReefSelect, focusTarget, on
   const [isAddingMonitoring, setIsAddingMonitoring] = useState(false);
   const [timeRange, setTimeRange] = useState<TimeRangeMode>('live');
 
-  // Persist monitored reef selection to localStorage whenever it changes
+  // Persist active reef IDs and broadcast to context. Carry the IDs in the event detail so
+  // the context doesn't need to re-read localStorage (which fails in Safari private mode).
   useEffect(() => {
-    try {
-      localStorage.setItem(MONITORED_IDS_STORAGE_KEY, JSON.stringify([...selectedIds]));
-      window.dispatchEvent(new CustomEvent('reefwatch:monitoring-updated'));
-    } catch {}
+    const ids = [...selectedIds];
+    saveActiveReefIds(ids); // noop if storage unavailable — selection lives in React state
+    window.dispatchEvent(new CustomEvent('reefwatch:monitoring-updated', { detail: { ids } }));
   }, [selectedIds]);
 
   useEffect(() => {
@@ -803,29 +782,20 @@ export function LiveReefGoogleMap({ onReefSelect: _onReefSelect, focusTarget, on
 
     async function loadReefs() {
       try {
-        const liveReefs = await fetchLiveReefs();
+        const liveReefs = await fetchMonitoredReefs();
 
         if (isMounted) {
           setAllReefs(liveReefs);
 
-          // Only apply curated default selection if user has no saved preferences
-          const hasStoredSelection = (() => {
-            try {
-              const stored = localStorage.getItem(MONITORED_IDS_STORAGE_KEY);
-              return stored ? JSON.parse(stored).length > 0 : false;
-            } catch { return false; }
-          })();
-
-          if (!hasStoredSelection) {
-            const initIds = new Set<string>();
-            for (const term of CURATED_TERMS) {
-              const match = liveReefs.find((r) =>
-                `${r.name} ${r.region} ${r.country}`.toLowerCase().includes(term),
-              );
-              if (match) initIds.add(match.id);
-            }
-            if (initIds.size < 3) liveReefs.slice(0, 8).forEach((r) => initIds.add(r.id));
-            setSelectedIds(initIds);
+          // Sync selectedIds from localStorage only when storage is available.
+          // Skipping this in private mode prevents wiping in-memory selections
+          // that couldn't be persisted due to storage quota being zero (Safari private).
+          if (isStorageAvailable()) {
+            const savedIds = new Set(getActiveReefIds());
+            setSelectedIds((prev) => {
+              if (prev.size === savedIds.size && [...savedIds].every((id) => prev.has(id))) return prev;
+              return savedIds;
+            });
           }
 
           setReefError(null);
@@ -903,10 +873,6 @@ export function LiveReefGoogleMap({ onReefSelect: _onReefSelect, focusTarget, on
     [mapReefs, selectedIds],
   );
 
-  useEffect(() => {
-    onMonitoredCountChange?.(selectedIds.size);
-  }, [onMonitoredCountChange, selectedIds.size]);
-
   const displayedReefs = useMemo(
     () => monitoredReefs,
     [monitoredReefs],
@@ -980,14 +946,11 @@ export function LiveReefGoogleMap({ onReefSelect: _onReefSelect, focusTarget, on
     const willRemove = selectedIds.has(reef.id);
     setSelectedIds((prev) => {
       const next = new Set(prev);
-      if (next.has(reef.id)) {
-        next.delete(reef.id);
-      } else {
-        next.add(reef.id);
-      }
+      if (willRemove) next.delete(reef.id);
+      else next.add(reef.id);
       return next;
     });
-    // Clean up custom-monitored stations from backend + local reef list when de-monitored
+    // Custom stations added via "Monitor Reef" need to be removed from the backend too
     if (willRemove && reef.isCustomMonitored) {
       setAllReefs((current) => current.filter((r) => r.id !== reef.id));
       removeFromActiveMonitoring(reef.id).catch(() => {/* non-fatal */});

@@ -7,7 +7,6 @@ import { SelfImprovementCard } from './SelfImprovementCard';
 
 interface DashboardOverviewProps {
   onNavigate: (view: string, reef?: any) => void;
-  monitoredReefCount: number;
 }
 
 const recentInsights = [
@@ -46,46 +45,29 @@ const toNavigationReef = (reef: LiveReef) => ({
   error: reef.error,
 });
 
-export function DashboardOverview({ onNavigate, monitoredReefCount }: DashboardOverviewProps) {
-  const { reefs, isLoading: isLoadingReefs, error: reefError, refetch } = useReefData();
+export function DashboardOverview({ onNavigate }: DashboardOverviewProps) {
+  const { allReefs, activeReefs, activeReefIds, storageAvailable, totalStationCount, isLoading: isLoadingReefs, error: reefError, refetch } = useReefData();
 
-  const readLocalMonitoredCount = () => {
-    try {
-      const ids = JSON.parse(localStorage.getItem('reefwatch_monitored_reef_ids') || '[]');
-      return Array.isArray(ids) ? ids.length : 0;
-    } catch { return 0; }
-  };
-
-  const [localMonitoredCount, setLocalMonitoredCount] = useState(readLocalMonitoredCount);
-
-  useEffect(() => {
-    const sync = () => setLocalMonitoredCount(readLocalMonitoredCount());
-    window.addEventListener('storage', sync);
-    window.addEventListener('reefwatch:monitoring-updated', sync);
-    return () => {
-      window.removeEventListener('storage', sync);
-      window.removeEventListener('reefwatch:monitoring-updated', sync);
-    };
-  }, []);
-
+  // Top stat cards reflect active monitored reefs only (personal monitoring summary)
   const reefStats = useMemo(() => ({
-    total: reefs.length,
-    critical: reefs.filter((reef) => reef.status === 'critical').length,
-    warning: reefs.filter((reef) => reef.status === 'warning').length,
-    healthy: reefs.filter((reef) => reef.status === 'safe').length,
-  }), [reefs]);
+    total: activeReefs.length,
+    critical: activeReefs.filter((reef) => reef.status === 'critical').length,
+    warning: activeReefs.filter((reef) => reef.status === 'warning').length,
+    healthy: activeReefs.filter((reef) => reef.status === 'safe').length,
+  }), [activeReefs]);
 
+  // Critical alerts pull from global NOAA data so researchers see real risk even before selecting reefs
   const alertReefs = useMemo(() => {
-    return [...reefs]
+    return [...allReefs]
       .filter((reef) => reef.status === 'critical' || reef.status === 'warning' || reef.riskScore >= 40)
       .sort((a, b) => b.riskScore - a.riskScore)
       .slice(0, 3);
-  }, [reefs]);
+  }, [allReefs]);
 
-  const statValue = (value: number) => isLoadingReefs && reefs.length === 0 ? '...' : value;
-  const activeMonitoringCount = localMonitoredCount > 0
-    ? localMonitoredCount
-    : reefs.length > 0 ? reefs.length : monitoredReefCount;
+  // activeReefIds is loaded synchronously from localStorage — always available without waiting for the backend
+  const activeMonitoringCount = activeReefIds.length;
+  // Critical/Warning/Healthy require allReefs to be loaded; show 0 while loading (they're empty by definition)
+  const statValue = (value: number) => value;
 
   return (
     <div className="h-full overflow-auto">
@@ -96,7 +78,7 @@ export function DashboardOverview({ onNavigate, monitoredReefCount }: DashboardO
           animate={{ opacity: 1, y: 0 }}
         >
           <h1 className="text-4xl text-white mb-3">Global Reef Status</h1>
-          <p className="text-gray-muted mb-12">210 NOAA reef stations monitored globally · {activeMonitoringCount} under deep AI analysis</p>
+          <p className="text-gray-muted mb-12">{totalStationCount > 0 ? totalStationCount : '...'} NOAA reef stations monitored globally · {activeMonitoringCount} under deep AI analysis</p>
 
           <div className="grid grid-cols-4 gap-6">
             <motion.div
@@ -163,6 +145,48 @@ export function DashboardOverview({ onNavigate, monitoredReefCount }: DashboardO
                 Retry
               </button>
             </div>
+          )}
+
+          {/* Note 1: no active reefs selected yet */}
+          {activeReefIds.length === 0 && (
+            <motion.div
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.05 }}
+              className="mt-6 flex items-start gap-4 rounded-2xl border border-cyan-glow/25 bg-cyan-glow/5 p-5"
+            >
+              <MapPin className="mt-0.5 h-5 w-5 shrink-0 text-cyan-glow" />
+              <div className="flex-1 min-w-0">
+                <p className="text-sm text-white mb-1">No active reefs selected yet</p>
+                <p className="text-sm text-gray-light leading-relaxed">
+                  Go to the Live Reef Map, choose the reef stations you want to monitor, and click <span className="text-white">Start Monitoring</span> to begin deep AI analysis and alerts.
+                </p>
+              </div>
+              <button
+                onClick={() => onNavigate('map')}
+                className="shrink-0 rounded-xl border border-cyan-glow/35 bg-cyan-glow/10 px-4 py-2 text-xs text-cyan-glow transition hover:bg-cyan-glow/20 hover:border-cyan-glow/55"
+              >
+                Go to Map
+              </button>
+            </motion.div>
+          )}
+
+          {/* Note 2: private/incognito browsing — localStorage unavailable */}
+          {!storageAvailable && (
+            <motion.div
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.07 }}
+              className="mt-4 flex items-start gap-4 rounded-2xl border border-coral-warning/30 bg-coral-warning/6 p-5"
+            >
+              <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-coral-warning" />
+              <div>
+                <p className="text-sm text-white mb-1">Private browsing detected</p>
+                <p className="text-sm text-gray-light leading-relaxed">
+                  Active reef selections will work during this session but won't be saved after you close the browser window.
+                </p>
+              </div>
+            </motion.div>
           )}
         </motion.div>
 
@@ -256,17 +280,17 @@ export function DashboardOverview({ onNavigate, monitoredReefCount }: DashboardO
             </button>
           </div>
 
-          {reefs.length === 0 ? (
+          {activeReefs.length === 0 ? (
             <div className="reef-panel-strong rounded-2xl border border-cyan-glow/25 bg-ocean-medium/60 p-8 text-sm leading-relaxed text-gray-light">
               <div className="mb-3 flex items-center gap-3 text-white">
                 <Radio className="h-5 w-5 text-cyan-glow" />
                 No reefs are actively monitored yet
               </div>
-              Open the global NOAA map, select a reef location, and use Monitor Reef to start AI analysis, alerts, briefs, and self-improvement for that reef.
+              Open the global NOAA map, select a reef location, and click Start Monitoring to enable AI analysis, alerts, and briefs for that reef.
             </div>
           ) : (
             <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-              {reefs.slice(0, 6).map((reef) => (
+              {activeReefs.map((reef) => (
                 <button
                   key={reef.id}
                   onClick={() => onNavigate('map', toNavigationReef(reef))}

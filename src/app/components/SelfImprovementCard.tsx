@@ -282,7 +282,8 @@ export function SelfImprovementCard() {
       const hasScores = latestRun && (
         typeof latestRun.average_score === 'number' ||
         latestRun.status === 'healthy' ||
-        latestRun.status === 'improvement_suggested'
+        latestRun.status === 'improvement_suggested' ||
+        latestRun.status === 'skipped_healthy'
       );
       if (!hasScores && !hasLiveResult.current) {
         console.warn('[self-improvement] initial scores empty — retrying in 3s', { status: latestRun?.status });
@@ -410,7 +411,12 @@ export function SelfImprovementCard() {
       console.log('[self-improvement] response.status', responseStatus);
       let messageForUi: string | null = null;
 
-      if (responseStatus === 'healthy') {
+      if (responseStatus === 'skipped_healthy') {
+        messageForUi = result.message || 'System healthy — evaluation skipped to conserve Gemini quota';
+        setNotice(messageForUi);
+        setSuccessToast('Health check passed — evaluation skipped (quality ≥ 75%)');
+        window.setTimeout(() => setSuccessToast(null), 5000);
+      } else if (responseStatus === 'healthy') {
         messageForUi = result.message || 'All briefs meeting quality threshold';
         setNotice(messageForUi);
         setSuccessToast('Self-improvement check complete — all briefs meeting quality threshold');
@@ -433,6 +439,10 @@ export function SelfImprovementCard() {
           setSuccessToast(toast);
           window.setTimeout(() => setSuccessToast(null), 5000);
         }
+      } else if (responseStatus === 'cached') {
+        messageForUi = withoutSlowMessage(result.summary) || `Scores up to date — last evaluated ${(result as any).cached_from ?? 'recently'}`;
+        setNotice(messageForUi);
+        fetchSelfImprovementHistory(14).then(setHistory).catch(() => null);
       } else if (responseStatus === 'insufficient_data') {
         messageForUi = result.message || result.summary || 'Need at least 2 reef assessments with real NOAA data to run evaluation';
         setNotice(messageForUi);
@@ -465,6 +475,8 @@ export function SelfImprovementCard() {
       const messageForUi = runError instanceof Error ? runError.message : SELF_EVALUATION_SLOW_MESSAGE;
       console.log('[self-improvement] catch UI message', messageForUi);
       setError(messageForUi);
+      // Re-fetch history so the chart section recovers even when the run itself failed.
+      fetchSelfImprovementHistory(14).then(setHistory).catch(() => null);
     } finally {
       // Safety net: always clean up regardless of how the try/catch resolved.
       timerCancelled = true;
@@ -480,8 +492,19 @@ export function SelfImprovementCard() {
 
   const runStatus = run?.status;
   const isHealthyRun = runStatus === 'healthy';
+  const isSkippedHealthy = runStatus === 'skipped_healthy';
   const isImprovementSuggestedRun = runStatus === 'improvement_suggested';
   const isNoTracesRun = runStatus === 'no_traces';
+
+  const lastCheckedLabel = (() => {
+    const ts = run?.last_checked || run?.date;
+    if (!ts) return null;
+    try {
+      return new Date(ts).toLocaleString('en-US', {
+        month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+      });
+    } catch { return null; }
+  })();
   const promptImproved = Boolean(run?.prompt_updated) || runStatus === 'improved';
   const qualityScore = isHealthyRun
     ? HEALTHY_DISPLAY_SCORES.quality
@@ -578,6 +601,23 @@ export function SelfImprovementCard() {
               ? 'Checking the latest overnight evaluation...'
               : error || notice || runSummary || (isShowingCachedData ? 'Showing last evaluation results' : 'No self-improvement run has completed yet.')}
           </p>
+          {/* Last-checked row — shown for skipped-healthy runs and whenever we have a timestamp */}
+          {!isRunning && lastCheckedLabel && (
+            <div className="mt-2 flex flex-wrap items-center gap-3">
+              <span className="text-xs text-gray-muted">
+                Last checked: <span className="text-gray-light">{lastCheckedLabel}</span>
+              </span>
+              {isSkippedHealthy && (
+                <span
+                  className="inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs"
+                  style={{ borderColor: 'rgba(16,185,129,0.4)', backgroundColor: 'rgba(16,185,129,0.08)', color: '#10b981' }}
+                >
+                  <CheckCircle2 className="h-3 w-3" />
+                  Evaluation skipped — system healthy
+                </span>
+              )}
+            </div>
+          )}
           {isRunning && (
             <div className="mt-4 max-w-xl overflow-hidden rounded-full border border-cyan-glow/20 bg-ocean-deep/70 p-1">
               <div
@@ -709,57 +749,60 @@ export function SelfImprovementCard() {
         </div>
       </div>
 
-      {/* 7-day trend */}
-      {history && (
-        <div className="rounded-xl border border-cyan-glow/10 bg-ocean-deep/35 p-5">
-          <div className="mb-4 flex items-center justify-between">
-            <p className="text-sm text-gray-muted">Quality trend (7-day)</p>
-            {history.seven_day_avg !== null && (
-              <span className={`text-sm font-medium ${scoreBadge(history.seven_day_avg)}`}>
-                7-day avg: {formatScore(history.seven_day_avg)}
-              </span>
-            )}
-          </div>
-          <div className="h-64 w-full">
-            {hasTrendData ? (
-              <ResponsiveContainer width="100%" height="100%">
-                <ComposedChart data={chartData} margin={{ top: 12, right: 12, bottom: 4, left: -20 }}>
-                  <defs>
-                    <linearGradient id="qualityTrendFill" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#22d3ee" stopOpacity={0.32} />
-                      <stop offset="95%" stopColor="#22d3ee" stopOpacity={0} />
-                    </linearGradient>
-                  </defs>
-                  <CartesianGrid stroke="rgba(125, 211, 252, 0.08)" vertical={false} />
-                  <XAxis dataKey="date" tick={{ fill: '#8aa6ad', fontSize: 12 }} axisLine={false} tickLine={false} />
-                  <YAxis domain={[0, 1]} tick={{ fill: '#8aa6ad', fontSize: 12 }} axisLine={false} tickLine={false} />
-                  <Tooltip
-                    contentStyle={{
-                      background: 'rgba(3, 24, 31, 0.95)',
-                      border: '1px solid rgba(45, 212, 191, 0.25)',
-                      borderRadius: 8,
-                      color: '#fff',
-                    }}
-                  />
-                  <ReferenceLine
-                    y={0.75}
-                    stroke="#ef4444"
-                    strokeDasharray="6 6"
-                    label={{ value: 'Target: 0.75', fill: '#ff9b9b', fontSize: 12, position: 'insideTopRight' }}
-                  />
-                  <Area type="monotone" dataKey="quality" fill="url(#qualityTrendFill)" stroke="none" connectNulls />
-                  <Line type="monotone" dataKey="quality" name="Quality score" stroke="#22d3ee" strokeWidth={2} dot={<AnimatedDot />} activeDot={{ r: 6, stroke: '#22d3ee', strokeWidth: 2, fill: '#03181f' }} connectNulls />
-                  <Line type="monotone" dataKey="sevenDayAverage" name="7-day average" stroke="#34d399" strokeWidth={2} dot={false} connectNulls />
-                </ComposedChart>
-              </ResponsiveContainer>
-            ) : (
-              <div className="flex h-full items-center justify-center rounded-xl border border-cyan-glow/10 bg-ocean-dark/35 text-sm text-gray-light">
-                Run another evaluation to see quality trends
-              </div>
-            )}
-          </div>
+      {/* 7-day trend — always rendered; shows skeleton while history loads */}
+      <div className="rounded-xl border border-cyan-glow/10 bg-ocean-deep/35 p-5">
+        <div className="mb-4 flex items-center justify-between">
+          <p className="text-sm text-gray-muted">Quality trend (7-day)</p>
+          {history?.seven_day_avg != null && (
+            <span className={`text-sm font-medium ${scoreBadge(history.seven_day_avg)}`}>
+              7-day avg: {formatScore(history.seven_day_avg)}
+            </span>
+          )}
         </div>
-      )}
+        <div className="h-64 w-full">
+          {history === null ? (
+            <div className="flex h-full items-center justify-center rounded-xl border border-cyan-glow/10 bg-ocean-dark/35 text-sm text-gray-light">
+              {isLoading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+              {isLoading ? 'Loading trend data…' : 'Trend data unavailable — run an evaluation to populate'}
+            </div>
+          ) : hasTrendData ? (
+            <ResponsiveContainer width="100%" height="100%">
+              <ComposedChart data={chartData} margin={{ top: 12, right: 12, bottom: 4, left: -20 }}>
+                <defs>
+                  <linearGradient id="qualityTrendFill" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#22d3ee" stopOpacity={0.32} />
+                    <stop offset="95%" stopColor="#22d3ee" stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid stroke="rgba(125, 211, 252, 0.08)" vertical={false} />
+                <XAxis dataKey="date" tick={{ fill: '#8aa6ad', fontSize: 12 }} axisLine={false} tickLine={false} />
+                <YAxis domain={[0, 1]} tick={{ fill: '#8aa6ad', fontSize: 12 }} axisLine={false} tickLine={false} />
+                <Tooltip
+                  contentStyle={{
+                    background: 'rgba(3, 24, 31, 0.95)',
+                    border: '1px solid rgba(45, 212, 191, 0.25)',
+                    borderRadius: 8,
+                    color: '#fff',
+                  }}
+                />
+                <ReferenceLine
+                  y={0.75}
+                  stroke="#ef4444"
+                  strokeDasharray="6 6"
+                  label={{ value: 'Target: 0.75', fill: '#ff9b9b', fontSize: 12, position: 'insideTopRight' }}
+                />
+                <Area type="monotone" dataKey="quality" fill="url(#qualityTrendFill)" stroke="none" connectNulls />
+                <Line type="monotone" dataKey="quality" name="Quality score" stroke="#22d3ee" strokeWidth={2} dot={<AnimatedDot />} activeDot={{ r: 6, stroke: '#22d3ee', strokeWidth: 2, fill: '#03181f' }} connectNulls />
+                <Line type="monotone" dataKey="sevenDayAverage" name="7-day average" stroke="#34d399" strokeWidth={2} dot={false} connectNulls />
+              </ComposedChart>
+            </ResponsiveContainer>
+          ) : (
+            <div className="flex h-full items-center justify-center rounded-xl border border-cyan-glow/10 bg-ocean-dark/35 text-sm text-gray-light">
+              Run another evaluation to see quality trends
+            </div>
+          )}
+        </div>
+      </div>
     </section>
   );
 }

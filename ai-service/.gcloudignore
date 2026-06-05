@@ -1,14 +1,13 @@
 .gcloudignore
 .git
-.gitignore
-node_modules/
-__pycache__/
+__pycache__
 *.pyc
 *.pyo
+*.egg-info
 .env
-.env.*
-dist/
-build/
-.next/
-*.log
-.DS_Store
+.venv
+venv
+exec -l
+*.db
+*.db-shm
+*.db-wal
