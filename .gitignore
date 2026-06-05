@@ -28,3 +28,4 @@ server/node_modules
 ai-service/.venv
 
 .claude
+.firebase/*.cache
