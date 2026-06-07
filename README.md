@@ -89,7 +89,9 @@ graph TD
 | Observability | Arize Phoenix + OpenInference | Trace logging, LLM-as-a-Judge evals, MCP runtime introspection |
 | Data | NOAA Coral Reef Watch | Live SST, DHW, bleaching alert levels for 221 stations |
 | Infrastructure | Google Cloud Run + Firebase | 24/7 deployment, min-instances=1, cold start protection |
-| Database | SQLite | Station cache, historical readings, event log |
+| Database | SQLite | Station cache, historical readings, event log. Chosen deliberately 
+for zero-dependency portability; architected to swap to Cloud SQL for 
+multi-instance scale without data layer changes.|
 | Agent Framework | Google Cloud ADK (google-adk) | Official ADK Agent class, registered in Google Cloud Agent Platform Registry |
 ## How The Agent Works
 
@@ -336,6 +338,33 @@ http://localhost:5173
 - **Frontend:** Firebase Hosting — https://project-9b3e2672-8819-4fa5-afe.web.app
 - **AI Service:** Google Cloud Run — us-central1, min-instances=1
 - **Observability:** Arize Phoenix Cloud — project reefwatch-ai
+
+---
+
+## Why Arize Phoenix Is Core, Not a Checkbox
+
+Most agents use observability passively — emit traces, read them in a dashboard later.
+
+ReefWatch AI uses Phoenix differently.
+
+The agent calls query_phoenix_traces and query_phoenix_quality_metrics 
+at runtime, mid-inference. It reads its own operational history and uses 
+that data to inform its current reasoning. This is bidirectional:
+
+Agent → Phoenix (traces logged)
+Phoenix → Agent (traces queried as tool calls at runtime)
+
+Without Phoenix, ReefWatch AI could generate reef assessments but would 
+have no reliable way to know if those assessments were good, detect when 
+they degraded, or improve them autonomously. Phoenix is not the monitoring 
+layer. Phoenix is part of the decision-making layer.
+
+Every MCP tool call is logged with timestamp, tool name, and retrieved data — 
+visible in the Arize dashboard. Every self-improvement decision has a 
+full audit trail. Every quality score is tracked over time.
+
+This is what production-grade autonomous AI observability looks like 
+when it's built in from the start, not bolted on at the end.
 
 ---
 
