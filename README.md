@@ -93,6 +93,7 @@ graph TD
 for zero-dependency portability; architected to swap to Cloud SQL for 
 multi-instance scale without data layer changes.|
 | Agent Framework | Google Cloud ADK (google-adk) | Official ADK Agent class, registered in Google Cloud Agent Platform Registry |
+
 ## How The Agent Works
 
 ReefWatch AI operates as a true multi-step autonomous agent:
@@ -229,6 +230,7 @@ This ensures every change the system makes to itself is fully traceable.
 | **MCP Integration** | Phoenix MCP wired as callable Gemini function tools. Agent queries its own traces at runtime. Every call logged with retrieved data |
 | **Self-Improvement Loop** | LLM-as-a-Judge evaluates output quality nightly, rewrites prompts automatically when scores drop. Scores visible on dashboard |
 | **Real-World Impact** | Live NOAA data, real email alerts firing for critical reefs, conservation briefs downloadable as PDF |
+| **Google Cloud Agent Builder / ADK** | Built using Google Cloud Agent Development Kit (ADK) and deployed on Google Cloud. The ReefWatch agent is registered in Agent Platform Registry, uses Gemini 2.5 Flash for reasoning, and integrates Phoenix MCP tools for runtime self-observability, evaluation, and autonomous improvement. |
 
 ---
 
