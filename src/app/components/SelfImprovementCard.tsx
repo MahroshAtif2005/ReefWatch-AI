@@ -10,14 +10,16 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { AlertTriangle, BrainCircuit, CheckCircle2, Loader2, Play, RefreshCw, Sparkles, TrendingUp } from 'lucide-react';
+import { AlertTriangle, BrainCircuit, CheckCircle2, Database, FlaskConical, Loader2, Play, RefreshCw, Sparkles, TrendingUp } from 'lucide-react';
 import {
   fetchLatestSelfImprovementRun,
   fetchSelfImprovementHistory,
+  fetchSelfImprovementV2Status,
   runSelfEvaluationNow,
   SELF_EVALUATION_SLOW_MESSAGE,
   type SelfImprovementHistory,
   type SelfImprovementRun,
+  type SelfImprovementV2Status,
 } from '../services/reefApi';
 
 const normalizeScore = (score: number | null): number | null =>
@@ -30,23 +32,6 @@ const formatPercent = (score: number | null) => {
   return `${score > 1 ? Math.round(score) : Math.round(score * 100)}%`;
 };
 
-const HEALTHY_DISPLAY_SCORES = {
-  quality: 0.94,
-  accuracy: 0.91,
-  specificity: 0.88,
-  actionability: 0.92,
-  scientificReliability: 0.91,
-  dhwInterpretation: 0.89,
-  uncertaintyCommunication: 0.86,
-  hallucinationAvoidance: 0.95,
-};
-
-const IMPROVEMENT_SUGGESTED_FALLBACK_SCORES = {
-  quality: 0.68,
-  accuracy: 0.64,
-  specificity: 0.61,
-  actionability: 0.66,
-};
 
 function readRunScore(run: SelfImprovementRun | null, keys: string[]) {
   if (!run) return null;
@@ -254,6 +239,7 @@ export function SelfImprovementCard() {
   const [run, setRun] = useState<SelfImprovementRun | null>(() => loadStoredRun());
   const [isShowingCachedData, setIsShowingCachedData] = useState(() => !!loadStoredRun());
   const [history, setHistory] = useState<SelfImprovementHistory | null>(null);
+  const [v2Status, setV2Status] = useState<SelfImprovementV2Status | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isRunning, setIsRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -275,10 +261,12 @@ export function SelfImprovementCard() {
         console.warn('[self-improvement] fetch history failed:', (err as Error)?.message ?? err);
         return null;
       }),
+      fetchSelfImprovementV2Status().catch(() => null),
     ]);
 
-    doFetch().then(([latestRun, hist]) => {
+    doFetch().then(([latestRun, hist, v2]) => {
       if (!isMounted) return;
+      if (v2) setV2Status(v2);
       const hasScores = latestRun && (
         typeof latestRun.average_score === 'number' ||
         latestRun.status === 'healthy' ||
@@ -290,7 +278,7 @@ export function SelfImprovementCard() {
         retryScheduled = true;
         setTimeout(() => {
           if (!isMounted) return;
-          doFetch().then(([retryRun, retryHist]) => {
+          doFetch().then(([retryRun, retryHist, retryV2]) => {
             if (!isMounted) return;
             const retryHasScores = retryRun && (
               typeof retryRun.average_score === 'number' ||
@@ -302,6 +290,7 @@ export function SelfImprovementCard() {
               if (typeof retryRun!.average_score === 'number') saveRunToStorage(retryRun!);
               setIsShowingCachedData(false);
             }
+            if (retryV2) setV2Status(retryV2);
             setHistory(retryHist);
             setError(null);
             setNotice(null);
@@ -490,11 +479,14 @@ export function SelfImprovementCard() {
     }
   };
 
-  const runStatus = run?.status;
-  const isHealthyRun = runStatus === 'healthy';
-  const isSkippedHealthy = runStatus === 'skipped_healthy';
-  const isImprovementSuggestedRun = runStatus === 'improvement_suggested';
-  const isNoTracesRun = runStatus === 'no_traces';
+  // Use system_status (from _compute_system_state) as the authoritative state signal.
+  // Fall back to raw status for backwards-compat with older API responses.
+  const systemStatus = run?.system_status || run?.status;
+  const rewriteStatus = run?.prompt_rewrite_status ?? 'none';
+  const isSkippedHealthy = systemStatus === 'skipped_healthy' || run?.status === 'skipped_healthy';
+  const isHealthyRun = systemStatus === 'healthy' || systemStatus === 'improved' || systemStatus === 'skipped_healthy' || run?.status === 'healthy';
+  const isRewriteDidNotImprove = systemStatus === 'degraded' && rewriteStatus === 'did_not_improve';
+  const isDegraded = systemStatus === 'degraded';
 
   const lastCheckedLabel = (() => {
     const ts = run?.last_checked || run?.date;
@@ -505,35 +497,50 @@ export function SelfImprovementCard() {
       });
     } catch { return null; }
   })();
-  const promptImproved = Boolean(run?.prompt_updated) || runStatus === 'improved';
-  const qualityScore = isHealthyRun
-    ? HEALTHY_DISPLAY_SCORES.quality
-    : readRunScore(run, ['quality_score', 'average_score'])
-      ?? (isImprovementSuggestedRun ? IMPROVEMENT_SUGGESTED_FALLBACK_SCORES.quality : null);
-  const accuracyScore = isHealthyRun
-    ? HEALTHY_DISPLAY_SCORES.accuracy
-    : readRunScore(run, ['accuracy'])
-      ?? (isImprovementSuggestedRun ? IMPROVEMENT_SUGGESTED_FALLBACK_SCORES.accuracy : null);
-  const specificityScore = isHealthyRun
-    ? HEALTHY_DISPLAY_SCORES.specificity
-    : readRunScore(run, ['specificity'])
-      ?? (isImprovementSuggestedRun ? IMPROVEMENT_SUGGESTED_FALLBACK_SCORES.specificity : null);
-  const actionabilityScore = isHealthyRun
-    ? HEALTHY_DISPLAY_SCORES.actionability
-    : readRunScore(run, ['actionability'])
-      ?? (isImprovementSuggestedRun ? IMPROVEMENT_SUGGESTED_FALLBACK_SCORES.actionability : null);
-  const runSummary = isHealthyRun
-    ? run?.message || 'All briefs meeting quality threshold'
-    : run?.research_narrative || run?.summary;
-  const hasPreviousScore = typeof run?.before_after?.previous_score === 'number';
-  const hasBeforeAfter =
-    typeof run?.before_after?.previous_score === 'number' &&
-    typeof run?.before_after?.latest_score === 'number';
+
   const previousScore = run?.before_after?.previous_score ?? null;
   const latestScore = run?.before_after?.latest_score ?? null;
-  const improvementPct = typeof previousScore === 'number' && previousScore > 0 && typeof latestScore === 'number'
-    ? Math.round(((latestScore - previousScore) / previousScore) * 100)
-    : null;
+  const scoreActuallyDecreased = isRewriteDidNotImprove || isDegraded ||
+    (typeof previousScore === 'number' && typeof latestScore === 'number' && latestScore < previousScore);
+
+  // Scores: prefer latest_verified_metrics (always from a full eval, never from a skip record).
+  // This ensures skipped_healthy runs display the real last verified scores, not dashes.
+  const vm = run?.latest_verified_metrics;
+  const qualityScore = vm?.average_score
+    ?? readRunScore(run, ['quality_score', 'average_score'])
+    ?? null;
+  const accuracyScore = vm?.accuracy
+    ?? readRunScore(run, ['accuracy'])
+    ?? null;
+  const specificityScore = vm?.specificity
+    ?? readRunScore(run, ['specificity'])
+    ?? null;
+  const actionabilityScore = vm?.actionability
+    ?? readRunScore(run, ['actionability'])
+    ?? null;
+
+  // Narrative text: prefer current_state_summary (computed by backend) over legacy fields.
+  const runSummary = run?.current_state_summary
+    || (isHealthyRun ? (run?.message || 'All briefs meeting quality threshold') : null)
+    || run?.research_narrative
+    || run?.summary;
+
+  // Experiment-aware pipeline narrative — overrides runSummary when an experiment has a definitive result.
+  // This prevents "System prompt rewritten" from appearing when the candidate was rejected.
+  const experimentNarrative = (() => {
+    const exp = v2Status?.latest_experiment;
+    if (!exp || exp.promoted === null) return null;
+    if (exp.promoted) {
+      return `Candidate prompt outperformed production and was promoted to ${v2Status!.prompt_version}.`;
+    }
+    return `Candidate prompt rejected after benchmark evaluation. Production prompt ${v2Status!.prompt_version} retained.`;
+  })();
+
+  // Whether a completed experiment result exists (promoted or rejected).
+  const hasExperimentResult = v2Status?.latest_experiment?.promoted !== null && v2Status?.latest_experiment !== null;
+
+  const hasPreviousScore = typeof previousScore === 'number';
+  const hasBeforeAfter = typeof previousScore === 'number' && typeof latestScore === 'number';
   const historyPoints = history?.history ?? [];
   const shouldAppendManualRun =
     (run?.status === 'completed' || run?.status === 'improved') &&
@@ -560,13 +567,12 @@ export function SelfImprovementCard() {
       ]
     : historyPoints;
   const chartData = buildChartData(trendPoints);
-  const trendRunCount = chartData.length;
   const hasTrendData = chartData.length >= 1;
   const dimensionScores = [
-    ['Scientific Reliability', isHealthyRun ? HEALTHY_DISPLAY_SCORES.scientificReliability : (run?.scientific_reliability ?? null)],
-    ['DHW Interpretation', isHealthyRun ? HEALTHY_DISPLAY_SCORES.dhwInterpretation : (run?.dhw_interpretation ?? run?.dhw_interpretation_accuracy ?? null)],
-    ['Uncertainty Communication', isHealthyRun ? HEALTHY_DISPLAY_SCORES.uncertaintyCommunication : (run?.uncertainty_communication ?? null)],
-    ['Hallucination Avoidance', isHealthyRun ? HEALTHY_DISPLAY_SCORES.hallucinationAvoidance : (run?.hallucination_avoidance ?? null)],
+    ['Scientific Reliability', vm?.scientific_reliability ?? run?.scientific_reliability ?? null],
+    ['DHW Interpretation', vm?.dhw_interpretation ?? run?.dhw_interpretation ?? run?.dhw_interpretation_accuracy ?? null],
+    ['Uncertainty Communication', vm?.uncertainty_communication ?? run?.uncertainty_communication ?? null],
+    ['Hallucination Avoidance', vm?.hallucination_avoidance ?? run?.hallucination_avoidance ?? null],
   ] as [string, number | null][];
 
   return (
@@ -596,10 +602,10 @@ export function SelfImprovementCard() {
           </div>
           <p className="max-w-3xl text-sm leading-6 text-gray-light">
             {isRunning
-              ? 'Gemini is evaluating 2 reef assessments...'
+              ? 'Gemini is evaluating reef assessments...'
               : isLoading
-              ? 'Checking the latest overnight evaluation...'
-              : error || notice || runSummary || (isShowingCachedData ? 'Showing last evaluation results' : 'No self-improvement run has completed yet.')}
+              ? 'Checking the latest evaluation...'
+              : error || notice || experimentNarrative || runSummary || (isShowingCachedData ? 'Showing last evaluation results' : 'Run Self-Evaluation Now to generate the first quality report.')}
           </p>
           {/* Last-checked row — shown for skipped-healthy runs and whenever we have a timestamp */}
           {!isRunning && lastCheckedLabel && (
@@ -640,17 +646,226 @@ export function SelfImprovementCard() {
               ? `Next evaluation in ${Math.ceil(cooldownMs / 60000)}m`
               : 'Run Self-Evaluation Now'}
           </button>
+          {/* Status badge — driven by system_status + prompt_rewrite_status from backend */}
           <div
             className="inline-flex items-center justify-center gap-2 rounded-xl border px-4 py-2 text-sm"
-            style={promptImproved || isHealthyRun
-              ? { borderColor: '#10b981', backgroundColor: 'rgba(16,185,129,0.12)', color: '#10b981' }
-              : { borderColor: 'rgba(34,197,94,0.3)', backgroundColor: 'rgba(34,197,94,0.1)', color: 'rgb(34,197,94)' }}
+            style={
+              hasExperimentResult && v2Status!.latest_experiment!.promoted
+                ? { borderColor: '#10b981', backgroundColor: 'rgba(16,185,129,0.12)', color: '#10b981' }
+                : hasExperimentResult && !v2Status!.latest_experiment!.promoted
+                ? { borderColor: 'rgba(234,179,8,0.4)', backgroundColor: 'rgba(234,179,8,0.1)', color: 'rgb(234,179,8)' }
+                : rewriteStatus === 'confirmed_improved'
+                ? { borderColor: '#10b981', backgroundColor: 'rgba(16,185,129,0.12)', color: '#10b981' }
+                : rewriteStatus === 'rewritten_pending'
+                ? { borderColor: 'rgba(234,179,8,0.4)', backgroundColor: 'rgba(234,179,8,0.1)', color: 'rgb(234,179,8)' }
+                : rewriteStatus === 'did_not_improve' || isDegraded
+                ? { borderColor: 'rgba(239,68,68,0.4)', backgroundColor: 'rgba(239,68,68,0.08)', color: 'rgb(239,68,68)' }
+                : { borderColor: 'rgba(34,197,94,0.3)', backgroundColor: 'rgba(34,197,94,0.1)', color: 'rgb(34,197,94)' }
+            }
           >
-            {promptImproved ? <Sparkles className="h-4 w-4" /> : <CheckCircle2 className="h-4 w-4" />}
-            {promptImproved ? 'Prompt improved ✨' : 'Prompt stable'}
+            {hasExperimentResult && v2Status!.latest_experiment!.promoted ? (
+              <Sparkles className="h-4 w-4" />
+            ) : hasExperimentResult && !v2Status!.latest_experiment!.promoted ? (
+              <AlertTriangle className="h-4 w-4" />
+            ) : rewriteStatus === 'confirmed_improved' ? (
+              <Sparkles className="h-4 w-4" />
+            ) : rewriteStatus === 'rewritten_pending' || rewriteStatus === 'did_not_improve' || isDegraded ? (
+              <AlertTriangle className="h-4 w-4" />
+            ) : (
+              <CheckCircle2 className="h-4 w-4" />
+            )}
+            {hasExperimentResult && v2Status!.latest_experiment!.promoted
+              ? 'Candidate promoted'
+              : hasExperimentResult && !v2Status!.latest_experiment!.promoted
+              ? 'Candidate rejected'
+              : rewriteStatus === 'confirmed_improved'
+              ? 'Prompt improved'
+              : rewriteStatus === 'rewritten_pending'
+              ? 'Prompt rewritten'
+              : rewriteStatus === 'did_not_improve'
+              ? 'Needs attention'
+              : isDegraded
+              ? 'Needs attention'
+              : isSkippedHealthy
+              ? 'System healthy'
+              : 'Prompt stable'}
           </div>
         </div>
       </div>
+
+      {/* Production system metrics — prompt version, benchmark dataset, experiment results */}
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        {/* Prompt version */}
+        <div className="flex flex-col gap-1 rounded-xl border border-cyan-glow/15 bg-ocean-deep/40 px-4 py-3">
+          <div className="flex items-center gap-2 text-xs text-gray-muted">
+            <Sparkles className="h-3.5 w-3.5 text-cyan-glow/70" />
+            Production Prompt
+          </div>
+          <p className="text-xl font-semibold text-white">
+            {v2Status?.prompt_version ?? 'v1'}
+          </p>
+          {v2Status?.prompt_improvement_delta != null && v2Status.prompt_improvement_delta > 0 && (
+            <p className="text-xs text-coral-safe">
+              +{(v2Status.prompt_improvement_delta * 100).toFixed(1)}% vs previous
+            </p>
+          )}
+          {v2Status?.prompt_deployed_at && (
+            <p className="text-xs text-gray-muted">
+              {(() => { try { return new Date(v2Status.prompt_deployed_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }); } catch { return ''; } })()}
+            </p>
+          )}
+        </div>
+
+        {/* Benchmark dataset size */}
+        <div className="flex flex-col gap-1 rounded-xl border border-cyan-glow/15 bg-ocean-deep/40 px-4 py-3">
+          <div className="flex items-center gap-2 text-xs text-gray-muted">
+            <Database className="h-3.5 w-3.5 text-cyan-glow/70" />
+            Benchmark Dataset
+          </div>
+          {v2Status?.benchmark_dataset_size === 0 ? (
+            <p className="text-xs leading-4 text-gray-muted">
+              Built from real production traces. None collected yet.
+            </p>
+          ) : (
+            <>
+              <p className="text-xl font-semibold text-white">
+                {v2Status?.benchmark_dataset_size != null ? v2Status.benchmark_dataset_size : '--'}
+              </p>
+              <p className="text-xs text-gray-muted">production cases</p>
+            </>
+          )}
+        </div>
+
+        {/* Latest experiment — labeled breakdown */}
+        <div className="flex flex-col gap-1 rounded-xl border border-cyan-glow/15 bg-ocean-deep/40 px-4 py-3">
+          <div className="flex items-center gap-2 text-xs text-gray-muted">
+            <FlaskConical className="h-3.5 w-3.5 text-cyan-glow/70" />
+            Last Experiment
+          </div>
+          {v2Status?.latest_experiment ? (
+            <div className="mt-1 space-y-1.5">
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-gray-muted">Baseline</span>
+                <span className="font-mono text-white">
+                  {v2Status.latest_experiment.baseline_score != null
+                    ? `${Math.round(v2Status.latest_experiment.baseline_score * 100)}%`
+                    : '--'}
+                </span>
+              </div>
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-gray-muted">Candidate</span>
+                <span className={`font-mono ${
+                  v2Status.latest_experiment.delta != null && v2Status.latest_experiment.delta > 0
+                    ? 'text-coral-safe'
+                    : v2Status.latest_experiment.delta != null && v2Status.latest_experiment.delta < 0
+                    ? 'text-coral-critical'
+                    : 'text-white'
+                }`}>
+                  {v2Status.latest_experiment.candidate_score != null
+                    ? `${Math.round(v2Status.latest_experiment.candidate_score * 100)}%`
+                    : '--'}
+                </span>
+              </div>
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-gray-muted">Delta</span>
+                <span className={`font-mono ${
+                  v2Status.latest_experiment.delta != null && v2Status.latest_experiment.delta > 0
+                    ? 'text-coral-safe'
+                    : v2Status.latest_experiment.delta != null && v2Status.latest_experiment.delta < 0
+                    ? 'text-coral-critical'
+                    : 'text-white'
+                }`}>
+                  {v2Status.latest_experiment.delta != null
+                    ? `${v2Status.latest_experiment.delta > 0 ? '+' : ''}${(v2Status.latest_experiment.delta * 100).toFixed(1)}%`
+                    : '--'}
+                </span>
+              </div>
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-gray-muted">Result</span>
+                <span className={`font-medium ${
+                  v2Status.latest_experiment.promoted ? 'text-coral-safe' : 'text-coral-warning'
+                }`}>
+                  {v2Status.latest_experiment.promoted === true
+                    ? 'Promoted ✓'
+                    : v2Status.latest_experiment.promoted === false
+                    ? 'Rejected ✗'
+                    : '--'}
+                </span>
+              </div>
+            </div>
+          ) : (
+            <>
+              <p className="text-xl font-semibold text-gray-muted">--</p>
+              <p className="text-xs text-gray-muted">no experiments yet</p>
+            </>
+          )}
+        </div>
+
+        {/* Validation — promoted/rejected with reason */}
+        <div className="flex flex-col gap-1 rounded-xl border border-cyan-glow/15 bg-ocean-deep/40 px-4 py-3">
+          <div className="flex items-center gap-2 text-xs text-gray-muted">
+            <CheckCircle2 className="h-3.5 w-3.5 text-cyan-glow/70" />
+            Validation
+          </div>
+          {v2Status?.latest_experiment?.promoted != null ? (
+            <>
+              <p className={`text-sm font-semibold ${v2Status.latest_experiment.promoted ? 'text-coral-safe' : 'text-coral-warning'}`}>
+                {v2Status.latest_experiment.promoted ? 'Promoted ✓' : 'Rejected ✗'}
+              </p>
+              {v2Status.latest_experiment.benchmark_cases != null && (
+                <p className="text-xs text-gray-muted">
+                  {v2Status.latest_experiment.benchmark_cases} benchmark case{v2Status.latest_experiment.benchmark_cases !== 1 ? 's' : ''}
+                </p>
+              )}
+              {v2Status.latest_experiment.promoted ? (
+                <p className="text-xs text-coral-safe">
+                  Production prompt {v2Status.prompt_version} active
+                </p>
+              ) : v2Status.latest_experiment.promotion_reason ? (
+                <p className="text-xs text-gray-muted truncate" title={v2Status.latest_experiment.promotion_reason}>
+                  {v2Status.latest_experiment.promotion_reason}
+                </p>
+              ) : (
+                <p className="text-xs text-gray-muted">
+                  Production prompt {v2Status.prompt_version} retained
+                </p>
+              )}
+            </>
+          ) : (
+            <>
+              <p className="text-sm font-medium text-gray-muted">Pending</p>
+              <p className="text-xs text-gray-muted">awaiting first experiment</p>
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Prompt promotion history — only shown when history exists */}
+      {v2Status?.prompt_history && v2Status.prompt_history.length > 1 && (
+        <div className="rounded-xl border border-cyan-glow/10 bg-ocean-deep/35 p-4">
+          <p className="mb-3 text-xs text-gray-muted">Prompt promotion history</p>
+          <div className="flex flex-wrap gap-2">
+            {[...v2Status.prompt_history].reverse().slice(0, 6).map((entry) => (
+              <div
+                key={entry.version}
+                className={`flex items-center gap-2 rounded-lg border px-3 py-1.5 text-xs ${
+                  entry.version === v2Status.prompt_version
+                    ? 'border-cyan-glow/40 bg-cyan-glow/10 text-cyan-glow'
+                    : 'border-gray-border/30 bg-ocean-deep/50 text-gray-muted'
+                }`}
+              >
+                <span className="font-mono font-medium">{entry.version}</span>
+                {entry.improvement_delta != null && entry.improvement_delta > 0 && (
+                  <span className="text-coral-safe">+{(entry.improvement_delta * 100).toFixed(1)}%</span>
+                )}
+                {entry.rewrite_reason && (
+                  <span className="max-w-[120px] truncate opacity-70">{entry.rewrite_reason}</span>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Core quality metrics */}
       <div className="grid gap-4 md:grid-cols-4">
@@ -684,6 +899,14 @@ export function SelfImprovementCard() {
       <div className="grid gap-4 lg:grid-cols-[1.25fr_0.75fr]">
         <div className="rounded-xl border border-cyan-glow/10 bg-ocean-deep/35 p-5">
           <p className="mb-3 text-sm text-gray-muted">Main weaknesses found</p>
+          {run?.diagnosis?.data_gap_dimensions && run.diagnosis.data_gap_dimensions.length > 0 && (
+            <div className="mb-3 flex items-start gap-2 rounded-lg border border-cyan-glow/20 bg-cyan-glow/5 px-3 py-2 text-xs text-cyan-glow/80">
+              <span className="mt-0.5 shrink-0">ℹ</span>
+              <span>
+                Low scores in {run.diagnosis.data_gap_dimensions.join(', ')} may reflect missing NOAA data, not model reasoning failures.
+              </span>
+            </div>
+          )}
           {run?.issues?.length ? (
             <div className="grid gap-3">
               {run.issues.slice(0, 4).map((issue) => (
@@ -697,7 +920,15 @@ export function SelfImprovementCard() {
               ))}
             </div>
           ) : (
-            <p className="text-sm text-gray-light">{isHealthyRun ? 'All briefs meeting quality threshold' : 'Waiting for the first nightly judge run.'}</p>
+            <p className="text-sm text-gray-light">
+              {isSkippedHealthy
+                ? 'Nightly evaluation skipped — no new weaknesses found.'
+                : qualityScore !== null && normalizeScore(qualityScore) !== null && (normalizeScore(qualityScore) as number) >= 0.75
+                ? 'All briefs meeting quality threshold.'
+                : run
+                ? 'No specific weaknesses logged for this run.'
+                : 'Waiting for the first nightly judge run.'}
+            </p>
           )}
         </div>
 
@@ -706,44 +937,148 @@ export function SelfImprovementCard() {
             <TrendingUp className="h-4 w-4 text-cyan-glow" />
             Before vs after
           </div>
-          {promptImproved ? (
+          {hasExperimentResult ? (
+            /* Experiment completed — show authoritative pipeline result */
             <div className="space-y-4">
-              {hasPreviousScore && (
+              <div className="flex items-end justify-between gap-4">
+                <div>
+                  <p className="text-xs text-gray-muted">Baseline</p>
+                  <p className="text-3xl text-white">
+                    {formatPercent(v2Status!.latest_experiment!.baseline_score)}
+                  </p>
+                </div>
+                <RefreshCw className={`mb-2 h-5 w-5 ${v2Status!.latest_experiment!.promoted ? 'text-coral-safe' : 'text-coral-warning'}`} />
+                <div className="text-right">
+                  <p className="text-xs text-gray-muted">Candidate</p>
+                  <p className={`text-3xl ${
+                    v2Status!.latest_experiment!.delta != null && v2Status!.latest_experiment!.delta > 0
+                      ? 'text-coral-safe'
+                      : 'text-coral-warning'
+                  }`}>
+                    {formatPercent(v2Status!.latest_experiment!.candidate_score)}
+                  </p>
+                </div>
+              </div>
+              <p className={`text-sm font-semibold ${v2Status!.latest_experiment!.promoted ? 'text-coral-safe' : 'text-coral-warning'}`}>
+                {v2Status!.latest_experiment!.promoted
+                  ? `Candidate promoted to ${v2Status!.prompt_version} ✓`
+                  : `Candidate rejected — ${v2Status!.prompt_version} retained`}
+              </p>
+              {v2Status!.latest_experiment!.promotion_reason && (
+                <p className="text-xs text-gray-muted">{v2Status!.latest_experiment!.promotion_reason}</p>
+              )}
+            </div>
+          ) : isSkippedHealthy ? (
+            /* Nightly check was a healthy skip — show what was skipped and why */
+            <div className="space-y-2">
+              <p className="text-sm leading-6 text-gray-light">
+                {run?.skip_reason
+                  ? `Evaluation skipped — ${run.skip_reason}.`
+                  : 'System healthy — Gemini evaluation skipped to conserve quota.'}
+              </p>
+              {run?.last_full_eval_at && (
+                <p className="text-xs text-gray-muted">
+                  Last full evaluation:{' '}
+                  {(() => { try { return new Date(run.last_full_eval_at!).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }); } catch { return run.last_full_eval_at; } })()}
+                </p>
+              )}
+            </div>
+          ) : rewriteStatus === 'confirmed_improved' ? (
+            /* Follow-up eval confirmed the rewrite improved quality */
+            <div className="space-y-4">
+              {hasBeforeAfter && (
                 <div className="flex items-end justify-between gap-4">
                   <div>
-                    <p className="text-xs text-gray-muted">Score before rewrite</p>
+                    <p className="text-xs text-gray-muted">Pre-rewrite score</p>
                     <p className="text-3xl text-coral-critical">{formatScore(previousScore)}</p>
                   </div>
                   <RefreshCw className="mb-2 h-5 w-5 text-cyan-glow" />
                   <div className="text-right">
-                    <p className="text-xs text-gray-muted">
-                      {latestScore !== null ? 'Score after rewrite' : 'Next eval'}
-                    </p>
-                    <p className={`text-3xl ${latestScore !== null ? 'text-cyan-glow' : 'text-gray-muted'}`}>
-                      {latestScore !== null ? formatScore(latestScore) : '--'}
-                    </p>
+                    <p className="text-xs text-gray-muted">Verified score</p>
+                    <p className="text-3xl text-coral-safe">{formatScore(latestScore)}</p>
                   </div>
                 </div>
               )}
               <p className="text-sm leading-6 text-gray-light">
-                {hasPreviousScore
-                  ? `Prompt improved ✨ — rewrote from score ${formatScore(previousScore)} → running next evaluation to confirm improvement`
-                  : (run?.prompt_change_summary
-                      || 'Prompt rewritten to strengthen DHW thresholds, uncertainty language, and specific action requirements.')}
+                Prompt rewrite confirmed successful — score improved from{' '}
+                {formatScore(previousScore)} to {formatScore(latestScore)}.
               </p>
             </div>
-          ) : run && typeof run.average_score === 'number' && run.average_score < 0.75 ? (
-            <p className="text-sm leading-6 text-gray-light">
-              Quality scored {formatScore(run.average_score)} — below the 0.75 threshold.
-              No validated prompt rewrite was produced this run.
-            </p>
+          ) : rewriteStatus === 'rewritten_pending' ? (
+            /* Prompt was just rewritten — awaiting a follow-up evaluation */
+            <div className="space-y-4">
+              {hasBeforeAfter && (
+                <div className="flex items-end justify-between gap-4">
+                  <div>
+                    <p className="text-xs text-gray-muted">Score before rewrite</p>
+                    <p className="text-3xl text-gray-muted">{formatScore(previousScore)}</p>
+                  </div>
+                  <RefreshCw className="mb-2 h-5 w-5 text-coral-warning" />
+                  <div className="text-right">
+                    <p className="text-xs text-gray-muted">Score this run</p>
+                    <p className="text-3xl text-coral-warning">{formatScore(latestScore)}</p>
+                  </div>
+                </div>
+              )}
+              {run?.rewrite_reason && (
+                <p className="text-xs text-coral-warning/80">
+                  Targeted fix: {run.rewrite_reason}
+                </p>
+              )}
+              <p className="text-sm leading-6 text-gray-light">
+                {hasPreviousScore
+                  ? `Prompt rewritten (score: ${formatScore(latestScore)} → awaiting verification). Run next evaluation to confirm improvement.`
+                  : (run?.prompt_change_summary || 'Prompt rewritten to strengthen identified weak dimensions. Run next evaluation to confirm improvement.')}
+              </p>
+            </div>
+          ) : rewriteStatus === 'did_not_improve' ? (
+            /* Follow-up eval showed rewrite didn't help */
+            <div className="space-y-4">
+              {hasBeforeAfter && (
+                <div className="flex items-end justify-between gap-4">
+                  <div>
+                    <p className="text-xs text-gray-muted">Pre-rewrite score</p>
+                    <p className="text-3xl text-gray-muted">{formatScore(previousScore)}</p>
+                  </div>
+                  <RefreshCw className="mb-2 h-5 w-5 text-coral-critical" />
+                  <div className="text-right">
+                    <p className="text-xs text-gray-muted">Follow-up score</p>
+                    <p className="text-3xl text-coral-critical">{formatScore(latestScore)}</p>
+                  </div>
+                </div>
+              )}
+              <p className="text-sm leading-6 text-gray-light">
+                Rewrite did not improve quality — score went from {formatScore(previousScore)} to {formatScore(latestScore)}.
+                Manual prompt review may be needed.
+              </p>
+            </div>
+          ) : scoreActuallyDecreased ? (
+            /* No rewrite context, but score fell */
+            <div className="space-y-3">
+              {hasBeforeAfter && (
+                <div className="flex items-end justify-between gap-4">
+                  <div>
+                    <p className="text-xs text-gray-muted">Previous score</p>
+                    <p className="text-3xl text-gray-muted">{formatScore(previousScore)}</p>
+                  </div>
+                  <RefreshCw className="mb-2 h-5 w-5 text-coral-critical" />
+                  <div className="text-right">
+                    <p className="text-xs text-gray-muted">Latest score</p>
+                    <p className="text-3xl text-coral-critical">{formatScore(latestScore)}</p>
+                  </div>
+                </div>
+              )}
+              <p className="text-sm leading-6 text-gray-light">
+                Quality dropped from {formatScore(previousScore)} to {formatScore(latestScore)} — below the 0.75 threshold.
+              </p>
+            </div>
           ) : run ? (
             <p className="text-sm leading-6 text-gray-light">
-              Prompt stable — quality above threshold.
+              Prompt stable — quality above the 0.75 threshold.
             </p>
           ) : (
             <p className="text-sm leading-6 text-gray-light">
-              The next run will create a trend once there is a prior score to compare.
+              The next run will create a comparison once there is a prior score.
             </p>
           )}
         </div>
@@ -802,6 +1137,80 @@ export function SelfImprovementCard() {
             </div>
           )}
         </div>
+      </div>
+
+      {/* Recent Autonomous Checks — real history data only, no seeds */}
+      <div className="rounded-xl border border-cyan-glow/10 bg-ocean-deep/35 p-5">
+        <p className="mb-4 text-sm text-gray-muted">Recent autonomous checks</p>
+        {history === null ? (
+          <div className="flex items-center gap-2 text-sm text-gray-light">
+            {isLoading && <Loader2 className="h-4 w-4 animate-spin" />}
+            {isLoading ? 'Loading…' : 'No checks recorded yet.'}
+          </div>
+        ) : history.history.length === 0 ? (
+          <p className="text-sm text-gray-light">No autonomous checks recorded yet — history will appear after the first run.</p>
+        ) : (
+          <div className="divide-y" style={{ borderColor: 'rgba(34,211,238,0.06)' }}>
+            {history.history.slice(0, 5).map((check, i) => {
+              const ts = check.last_checked ?? check.completed_at ?? check.stored_at ?? check.date;
+              const timeLabel = ts
+                ? (() => { try { return new Date(ts).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }); } catch { return ts; } })()
+                : '—';
+              const src = check.source === 'nightly_scheduler' ? 'nightly' : check.source ?? 'manual';
+              const st = check.status ?? '—';
+              const isSkipped = st === 'skipped_healthy';
+              const isPromptRewrite = Boolean(check.prompt_updated) && !isSkipped;
+              const score = typeof check.average_score === 'number' ? check.average_score : null;
+
+              // Human-readable run type label
+              const runTypeLabel = isSkipped
+                ? 'skipped healthy'
+                : isPromptRewrite
+                ? 'prompt rewrite'
+                : st === 'improved'
+                ? 'verification run'
+                : st === 'degraded'
+                ? 'full evaluation'
+                : 'full evaluation';
+
+              // Style for run-type chip
+              const runTypeStyle = isSkipped
+                ? { borderColor: 'rgba(16,185,129,0.35)', backgroundColor: 'rgba(16,185,129,0.07)', color: '#10b981' }
+                : isPromptRewrite
+                ? { borderColor: 'rgba(234,179,8,0.35)', backgroundColor: 'rgba(234,179,8,0.07)', color: 'rgb(234,179,8)' }
+                : st === 'improved'
+                ? { borderColor: 'rgba(34,197,94,0.35)', backgroundColor: 'rgba(34,197,94,0.07)', color: 'rgb(34,197,94)' }
+                : { borderColor: 'rgba(148,163,184,0.3)', backgroundColor: 'rgba(148,163,184,0.06)', color: '#94a3b8' };
+
+              return (
+                <div key={i} className="flex flex-wrap items-center gap-x-3 gap-y-1 py-3 text-sm">
+                  <span className="w-32 shrink-0 text-xs text-gray-muted">{timeLabel}</span>
+                  <span
+                    className="shrink-0 rounded-full border px-2 py-0.5 text-xs"
+                    style={
+                      src === 'nightly'
+                        ? { borderColor: 'rgba(34,211,238,0.3)', backgroundColor: 'rgba(34,211,238,0.07)', color: '#22d3ee' }
+                        : { borderColor: 'rgba(148,163,184,0.3)', backgroundColor: 'rgba(148,163,184,0.06)', color: '#94a3b8' }
+                    }
+                  >
+                    {src}
+                  </span>
+                  <span className="shrink-0 rounded-full border px-2 py-0.5 text-xs" style={runTypeStyle}>
+                    {runTypeLabel}
+                  </span>
+                  <span className={`flex-1 truncate text-xs ${isSkipped ? 'text-gray-muted' : scoreBadge(score)}`}>
+                    {isSkipped
+                      ? (check.skip_reason ?? 'quality above target — evaluation skipped')
+                      : check.summary?.slice(0, 60) || st}
+                  </span>
+                  <span className={`w-12 shrink-0 text-right font-mono text-sm ${scoreBadge(score)}`}>
+                    {score !== null ? formatPercent(score) : '—'}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
     </section>
   );

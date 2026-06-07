@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo } from 'react';
 import { motion } from 'motion/react';
-import { AlertTriangle, TrendingUp, Droplet, Activity, ArrowRight, MapPin, RefreshCw, Radio } from 'lucide-react';
+import { AlertTriangle, TrendingUp, Droplet, Activity, ArrowRight, Loader2, MapPin, RefreshCw, Radio } from 'lucide-react';
 import { type LiveReef } from '../services/reefApi';
 import { useReefData } from '../context/ReefDataContext';
 import { SelfImprovementCard } from './SelfImprovementCard';
@@ -48,7 +48,8 @@ const toNavigationReef = (reef: LiveReef) => ({
 export function DashboardOverview({ onNavigate }: DashboardOverviewProps) {
   const { allReefs, activeReefs, activeReefIds, storageAvailable, totalStationCount, isLoading: isLoadingReefs, error: reefError, refetch } = useReefData();
 
-  // Top stat cards reflect active monitored reefs only (personal monitoring summary)
+  // All four stat cards reflect active monitored reefs only (personal monitoring summary).
+  // Computed only after allReefs loads so all four numbers transition atomically.
   const reefStats = useMemo(() => ({
     total: activeReefs.length,
     critical: activeReefs.filter((reef) => reef.status === 'critical').length,
@@ -56,7 +57,7 @@ export function DashboardOverview({ onNavigate }: DashboardOverviewProps) {
     healthy: activeReefs.filter((reef) => reef.status === 'safe').length,
   }), [activeReefs]);
 
-  // Critical alerts pull from global NOAA data so researchers see real risk even before selecting reefs
+  // UI display only — highest-risk NOAA reefs on the dashboard overview.
   const alertReefs = useMemo(() => {
     return [...allReefs]
       .filter((reef) => reef.status === 'critical' || reef.status === 'warning' || reef.riskScore >= 40)
@@ -64,10 +65,31 @@ export function DashboardOverview({ onNavigate }: DashboardOverviewProps) {
       .slice(0, 3);
   }, [allReefs]);
 
-  // activeReefIds is loaded synchronously from localStorage — always available without waiting for the backend
-  const activeMonitoringCount = activeReefIds.length;
-  // Critical/Warning/Healthy require allReefs to be loaded; show 0 while loading (they're empty by definition)
-  const statValue = (value: number) => value;
+  // Single loading guard used by all four stat cards — they all show '...' until allReefs
+  // is populated, then transition to their final values at the same moment.
+  const dataReady = !isLoadingReefs || allReefs.length > 0;
+  const statValue = (value: number): number | string => dataReady ? value : '...';
+
+  // IDs that exist in localStorage but couldn't be matched to any reef returned by the backend.
+  // Only meaningful after data has loaded.
+  const orphanedCount = dataReady
+    ? activeReefIds.filter(id => !allReefs.find(r => r.id === id)).length
+    : 0;
+
+  // Log counts and timing once data is ready so map/dashboard discrepancies are visible in DevTools
+  useEffect(() => {
+    if (dataReady && allReefs.length > 0) {
+      console.log(
+        '[reefwatch:dashboard] counts —',
+        `activeMonitoring=${reefStats.total}`,
+        `critical=${reefStats.critical}`,
+        `warning=${reefStats.warning}`,
+        `healthy=${reefStats.healthy}`,
+        `orphaned=${orphanedCount}`,
+        `(activeReefIds=${activeReefIds.length}, activeReefs=${activeReefs.length})`,
+      );
+    }
+  }, [dataReady, reefStats, orphanedCount]);
 
   return (
     <div className="h-full overflow-auto">
@@ -78,7 +100,7 @@ export function DashboardOverview({ onNavigate }: DashboardOverviewProps) {
           animate={{ opacity: 1, y: 0 }}
         >
           <h1 className="text-4xl text-white mb-3">Global Reef Status</h1>
-          <p className="text-gray-muted mb-12">{totalStationCount > 0 ? totalStationCount : '...'} NOAA reef stations monitored globally · {activeMonitoringCount} under deep AI analysis</p>
+          <p className="text-gray-muted mb-12">{totalStationCount > 0 ? totalStationCount : '...'} NOAA reef stations monitored globally · {statValue(reefStats.total)} under deep AI analysis</p>
 
           <div className="grid grid-cols-4 gap-6">
             <motion.div
@@ -90,7 +112,7 @@ export function DashboardOverview({ onNavigate }: DashboardOverviewProps) {
                 <Activity className="w-6 h-6 text-cyan-glow" />
                 <span className="text-sm text-gray-muted">Active Monitoring</span>
               </div>
-              <p className="text-5xl text-white mb-2">{activeMonitoringCount}</p>
+              <p className="text-5xl text-white mb-2">{statValue(reefStats.total)}</p>
               <p className="text-sm text-gray-light">Actively monitored</p>
             </motion.div>
 
@@ -147,27 +169,62 @@ export function DashboardOverview({ onNavigate }: DashboardOverviewProps) {
             </div>
           )}
 
-          {/* Note 1: no active reefs selected yet */}
-          {activeReefIds.length === 0 && (
+          {/* Loading banner — shown while reef data is in flight */}
+          {!dataReady && (
+            <motion.div
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.06 }}
+              className="mt-8 flex items-center gap-4 rounded-2xl border border-cyan-glow/25 bg-ocean-medium/60 p-6"
+            >
+              <Loader2 className="h-5 w-5 shrink-0 animate-spin text-cyan-glow" />
+              <span className="text-sm text-gray-light">Loading reef data…</span>
+            </motion.div>
+          )}
+
+          {/* Orphaned IDs warning — shown when some saved reef IDs couldn't be matched after loading.
+               IDs are preserved in storage; this is display-only, never a deletion. */}
+          {dataReady && orphanedCount > 0 && (
             <motion.div
               initial={{ opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: 0.05 }}
-              className="mt-6 flex items-start gap-4 rounded-2xl border border-cyan-glow/25 bg-cyan-glow/5 p-5"
+              className="mt-6 flex items-center gap-3 rounded-xl border border-coral-warning/30 bg-coral-warning/6 px-5 py-3"
             >
-              <MapPin className="mt-0.5 h-5 w-5 shrink-0 text-cyan-glow" />
-              <div className="flex-1 min-w-0">
-                <p className="text-sm text-white mb-1">No active reefs selected yet</p>
-                <p className="text-sm text-gray-light leading-relaxed">
-                  Go to the Live Reef Map, choose the reef stations you want to monitor, and click <span className="text-white">Start Monitoring</span> to begin deep AI analysis and alerts.
-                </p>
+              <AlertTriangle className="h-4 w-4 shrink-0 text-coral-warning" />
+              <span className="text-sm text-coral-warning">
+                {activeReefs.length} active reef{activeReefs.length !== 1 ? 's' : ''} matched live NOAA data
+                {'; '}{orphanedCount} saved reef{orphanedCount > 1 ? 's' : ''} could not be matched to current NOAA data (IDs preserved).
+              </span>
+            </motion.div>
+          )}
+
+          {/* Onboarding card — shown when no reefs are active after data has loaded */}
+          {reefStats.total === 0 && dataReady && (
+            <motion.div
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.06 }}
+              className="mt-8 rounded-2xl border border-cyan-glow/30 bg-gradient-to-br from-cyan-glow/8 to-ocean-dark/60 p-8"
+            >
+              <div className="flex items-start gap-5">
+                <div className="mt-1 flex h-12 w-12 shrink-0 items-center justify-center rounded-xl border border-cyan-glow/35 bg-cyan-glow/12">
+                  <Radio className="h-6 w-6 text-cyan-glow" />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <h3 className="text-xl text-white mb-3">No reefs are currently being actively monitored.</h3>
+                  <p className="text-sm text-gray-light leading-relaxed mb-6 max-w-2xl">
+                    Open the Live Reef Map and select the reefs you want ReefWatch AI to track. Once added, the system will continuously monitor those reefs, generate AI assessments, and send email alerts when bleaching risk or thermal stress reaches critical levels.
+                  </p>
+                  <button
+                    onClick={() => onNavigate('map')}
+                    className="inline-flex items-center gap-2 rounded-xl border border-cyan-glow/50 bg-cyan-glow/15 px-5 py-2.5 text-sm text-cyan-glow transition hover:bg-cyan-glow/25 hover:border-cyan-glow/70"
+                  >
+                    <MapPin className="h-4 w-4" />
+                    Go to Live Reef Map
+                    <ArrowRight className="h-4 w-4" />
+                  </button>
+                </div>
               </div>
-              <button
-                onClick={() => onNavigate('map')}
-                className="shrink-0 rounded-xl border border-cyan-glow/35 bg-cyan-glow/10 px-4 py-2 text-xs text-cyan-glow transition hover:bg-cyan-glow/20 hover:border-cyan-glow/55"
-              >
-                Go to Map
-              </button>
             </motion.div>
           )}
 

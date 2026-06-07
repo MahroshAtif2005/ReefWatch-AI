@@ -13,7 +13,15 @@ PROJECT_ID="project-9b3e2672-8819-4fa5-afe"
 REGION="us-central1"
 SERVICE_NAME="reefwatch-ai-service"
 IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/cloud-run-source-deploy/${SERVICE_NAME}"
+SI_BUCKET="reefwatch-ai-state"   # GCS bucket for durable self-improvement history
 # ──────────────────────────────────────────────────────────────────────────────
+
+echo "==> Ensuring GCS bucket gs://${SI_BUCKET} exists (us-central1, uniform access)"
+gcloud storage buckets create "gs://${SI_BUCKET}" \
+  --project "${PROJECT_ID}" \
+  --location "${REGION}" \
+  --uniform-bucket-level-access 2>/dev/null \
+  || echo "    Bucket already exists — continuing"
 
 echo "==> Building and pushing image: ${IMAGE}"
 gcloud builds submit . \
@@ -33,7 +41,8 @@ gcloud run deploy "${SERVICE_NAME}" \
   --cpu 1 \
   --port 8000 \
   --timeout 300 \
-  --cpu-boost
+  --cpu-boost \
+  --update-env-vars "SELF_IMPROVEMENT_STORAGE=GCS,SELF_IMPROVEMENT_GCS_BUCKET=${SI_BUCKET}"
 
 # Grab the live service URL (avoids hardcoding it)
 SERVICE_URL=$(gcloud run services describe "${SERVICE_NAME}" \
@@ -87,16 +96,17 @@ if gcloud scheduler jobs describe "${SI_JOB_NAME}" \
      --location "${REGION}" \
      --project "${PROJECT_ID}" &>/dev/null; then
   echo "    Job exists — updating URI and deadline"
+  # Note: --update-headers (not --headers) is required for the update subcommand.
+  # --time-zone is omitted from update; it was set at creation time and cannot be changed here.
   gcloud scheduler jobs update http "${SI_JOB_NAME}" \
     --location "${REGION}" \
     --project "${PROJECT_ID}" \
     --schedule "0 2 * * *" \
     --uri "${SI_URL}" \
     --http-method POST \
-    --headers "Content-Type=application/json" \
+    --update-headers "Content-Type=application/json" \
     --message-body "{}" \
-    --attempt-deadline 270s \
-    --time-zone "UTC"
+    --attempt-deadline 270s
 else
   echo "    Creating new job"
   gcloud scheduler jobs create http "${SI_JOB_NAME}" \
@@ -105,7 +115,7 @@ else
     --schedule "0 2 * * *" \
     --uri "${SI_URL}" \
     --http-method POST \
-    --headers "Content-Type=application/json" \
+    --update-headers "Content-Type=application/json" \
     --message-body "{}" \
     --attempt-deadline 270s \
     --time-zone "UTC" \

@@ -81,7 +81,7 @@ export function LiveAgentFeed() {
 
     try {
       const result = await sendTestAlert();
-      setAlertToast(`Alert sent! Check inbox at ${result.sentTo || 'rosche.atif@gmail.com'}`);
+      setAlertToast(`Alert sent! Check your configured notification inbox${result.sentTo ? ` (${result.sentTo})` : ''}`);
       window.setTimeout(() => setAlertToast(null), 5000);
       const activity = await fetchAgentActivity();
       setEvents(activity);

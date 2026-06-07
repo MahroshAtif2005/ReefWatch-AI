@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { motion } from 'motion/react';
 import { Github, Mail, RefreshCw, Save, Settings as SettingsIcon } from 'lucide-react';
-import { REEF_API_BASE_URL, fetchArizeStatus, fetchLiveReefs, fetchSettings, saveSettings, type LiveReef } from '../services/reefApi';
+import { REEF_API_BASE_URL, fetchArizeStatus, fetchLiveReefs, fetchSettings, getResearcherId, saveSettings, type LiveReef } from '../services/reefApi';
 import { Switch } from './ui/switch';
 
 interface AlertSettings {
@@ -35,12 +35,6 @@ const defaultRefreshSettings: RefreshSettings = {
   autoRefresh: true,
   interval: '15min',
   lastSynced: null,
-};
-
-const statusStyles = {
-  safe: 'text-coral-safe bg-coral-safe/10 border-coral-safe/35',
-  warning: 'text-coral-warning bg-coral-warning/10 border-coral-warning/35',
-  critical: 'text-coral-critical bg-coral-critical/10 border-coral-critical/35',
 };
 
 function readStorage<T>(key: string, fallback: T): T {
@@ -86,10 +80,6 @@ function getLatestReefTimestamp(reefs: LiveReef[]) {
   return new Date(Math.max(...timestamps)).toISOString();
 }
 
-function formatTemperature(temp: number | null) {
-  return typeof temp === 'number' ? `${temp.toFixed(1)}°C` : 'Unavailable';
-}
-
 type ServiceStatus = 'operational' | 'degraded' | 'offline';
 
 function HealthDot({ status }: { status: ServiceStatus }) {
@@ -117,7 +107,6 @@ function HealthDot({ status }: { status: ServiceStatus }) {
 }
 
 export function Settings() {
-  const [reefs, setReefs] = useState<LiveReef[]>([]);
   const [alertSettings, setAlertSettings] = useState<AlertSettings>(() => {
     const storedSettings = readStorage(ALERT_SETTINGS_KEY, defaultAlertSettings);
     return {
@@ -127,6 +116,7 @@ export function Settings() {
   });
   const [refreshSettings, setRefreshSettings] = useState<RefreshSettings>(() => readStorage(REFRESH_SETTINGS_KEY, defaultRefreshSettings));
   const [alertSaveStatus, setAlertSaveStatus] = useState<'idle' | 'success' | 'error'>('idle');
+  const [emailError, setEmailError] = useState<string | null>(null);
   const [isSavingAlerts, setIsSavingAlerts] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [noaaStatus, setNoaaStatus] = useState<ServiceStatus>('offline');
@@ -139,16 +129,10 @@ export function Settings() {
     loadServerSettings();
   }, []);
 
-  const monitoredCount = useMemo(
-    () => reefs.length,
-    [reefs]
-  );
-
   async function loadReefs() {
     setIsRefreshing(true);
     try {
       const liveReefs = await fetchLiveReefs();
-      setReefs(liveReefs);
       setNoaaStatus('operational');
       const lastSynced = getLatestReefTimestamp(liveReefs);
       if (lastSynced) {
@@ -165,9 +149,16 @@ export function Settings() {
     }
   }
 
+  function isValidEmail(email: string) {
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+  }
+
   function updateAlertSettings(next: Partial<AlertSettings>) {
     setAlertSettings((current) => ({ ...current, ...next }));
     setAlertSaveStatus('idle');
+    if ('email' in next) {
+      setEmailError(next.email && !isValidEmail(next.email) ? 'Enter a valid email address.' : null);
+    }
   }
 
   function updateAnomalyThreshold(threshold: number) {
@@ -181,6 +172,10 @@ export function Settings() {
   }
 
   async function saveAlertSettings() {
+    if (alertSettings.email && !isValidEmail(alertSettings.email)) {
+      setEmailError('Enter a valid email address before saving.');
+      return;
+    }
     setIsSavingAlerts(true);
     setAlertSaveStatus('idle');
 
@@ -191,9 +186,10 @@ export function Settings() {
         critical_alerts_enabled: alertSettings.criticalAlerts,
         temp_anomaly_alerts_enabled: alertSettings.anomalyWarnings,
         weekly_summary_enabled: alertSettings.weeklySummary,
-      });
+      }, getResearcherId());
       writeStorage(ALERT_SETTINGS_KEY, alertSettings);
       localStorage.setItem(ANOMALY_THRESHOLD_KEY, String(alertSettings.anomalyThreshold));
+      setEmailError(null);
       setAlertSaveStatus('success');
     } catch {
       setAlertSaveStatus('error');
@@ -227,8 +223,13 @@ export function Settings() {
   }
 
   async function loadServerSettings() {
+    // Read the email directly from localStorage — this is the user-facing source of truth.
+    // The server's _SETTINGS_STORE is shared (single Cloud Run instance) and resets on redeploy.
+    // localStorage scopes the recipient to this browser/researcher session.
+    const localEmail = readStorage<AlertSettings>(ALERT_SETTINGS_KEY, defaultAlertSettings).email;
+
     try {
-      const settings = await fetchSettings();
+      const settings = await fetchSettings(getResearcherId());
       const hasServerAlertSettings = Object.keys(settings).some((key) => [
         'notification_email',
         'anomaly_threshold',
@@ -237,27 +238,37 @@ export function Settings() {
         'weekly_summary_enabled',
       ].includes(key));
 
-      if (!hasServerAlertSettings) return;
+      if (hasServerAlertSettings) {
+        setAlertSettings((current) => {
+          // Email is always taken from localStorage — never overwritten by server.
+          const nextSettings = {
+            ...current,
+            anomalyThreshold: parseStoredNumber(settings.anomaly_threshold, current.anomalyThreshold),
+            criticalAlerts: settings.critical_alerts_enabled === undefined
+              ? current.criticalAlerts
+              : settings.critical_alerts_enabled === 'true',
+            anomalyWarnings: settings.temp_anomaly_alerts_enabled === undefined
+              ? current.anomalyWarnings
+              : settings.temp_anomaly_alerts_enabled === 'true',
+            weeklySummary: settings.weekly_summary_enabled === undefined
+              ? current.weeklySummary
+              : settings.weekly_summary_enabled === 'true',
+          };
+          writeStorage(ALERT_SETTINGS_KEY, nextSettings);
+          localStorage.setItem(ANOMALY_THRESHOLD_KEY, String(nextSettings.anomalyThreshold));
+          return nextSettings;
+        });
+      }
 
-      setAlertSettings((current) => {
-        const nextSettings = {
-          ...current,
-          email: settings.notification_email ?? current.email,
-          anomalyThreshold: parseStoredNumber(settings.anomaly_threshold, current.anomalyThreshold),
-          criticalAlerts: settings.critical_alerts_enabled === undefined
-            ? current.criticalAlerts
-            : settings.critical_alerts_enabled === 'true',
-          anomalyWarnings: settings.temp_anomaly_alerts_enabled === undefined
-            ? current.anomalyWarnings
-            : settings.temp_anomaly_alerts_enabled === 'true',
-          weeklySummary: settings.weekly_summary_enabled === undefined
-            ? current.weeklySummary
-            : settings.weekly_summary_enabled === 'true',
-        };
-        writeStorage(ALERT_SETTINGS_KEY, nextSettings);
-        localStorage.setItem(ANOMALY_THRESHOLD_KEY, String(nextSettings.anomalyThreshold));
-        return nextSettings;
-      });
+      // Re-sync local email to server whenever it differs.
+      // This handles server restarts (Cloud Run instance recycle) where _SETTINGS_STORE
+      // is wiped but the researcher's localStorage still has their email.
+      // Without this, the next 6-hour alert cycle would have no recipient.
+      if (localEmail && localEmail !== settings.notification_email) {
+        saveSettings({ notification_email: localEmail }, getResearcherId()).catch(() =>
+          console.warn('[settings] silent email re-sync to server failed')
+        );
+      }
     } catch {
       console.warn('[settings] server settings unavailable; using localStorage fallback');
     }
@@ -287,12 +298,18 @@ export function Settings() {
               type="email"
               value={alertSettings.email}
               onChange={(event) => updateAlertSettings({ email: event.target.value })}
-              placeholder="marine-team@example.com"
-              className="w-full rounded-xl border border-cyan-glow/15 bg-ocean-deep/70 px-4 py-3 text-white outline-none transition placeholder:text-gray-muted/70 focus:border-cyan-glow/50"
+              placeholder="researcher@example.com"
+              className={`w-full rounded-xl border bg-ocean-deep/70 px-4 py-3 text-white outline-none transition placeholder:text-gray-muted/70 focus:border-cyan-glow/50 ${emailError ? 'border-coral-critical/60' : 'border-cyan-glow/15'}`}
             />
-            {alertSettings.email && (
-              <p className="mt-3 text-sm text-coral-safe">Alerts will be sent to: {alertSettings.email}</p>
+            {emailError && (
+              <p className="mt-2 text-xs text-coral-critical">{emailError}</p>
             )}
+            {!emailError && alertSettings.email ? (
+              <p className="mt-2 text-sm text-coral-safe">Alerts will be sent to: {alertSettings.email}</p>
+            ) : !emailError && (
+              <p className="mt-2 text-sm text-gray-muted">Add an email address to receive alerts for reefs you actively monitor.</p>
+            )}
+            <p className="mt-2 text-xs text-gray-muted/70">Alerts are only sent for reefs you add to your active monitoring list.</p>
           </div>
 
           <div className="space-y-4">
@@ -355,36 +372,6 @@ export function Settings() {
           {alertSaveStatus === 'error' && <span className="text-sm text-coral-critical">Save failed</span>}
         </div>
       </motion.section>
-
-      <section className="reef-panel rounded-2xl border border-gray-border/70 bg-ocean-dark/62 p-6">
-        <div className="mb-5 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-          <div>
-            <h3 className="text-2xl text-white">Monitored Reefs</h3>
-            <p className="text-sm text-gray-muted">{monitoredCount} reefs selected for active monitoring</p>
-          </div>
-        </div>
-
-        <div className="grid gap-3 md:grid-cols-2">
-          {reefs.map((reef) => (
-            <div key={reef.id} className="flex items-center justify-between gap-4 rounded-xl border border-cyan-glow/10 bg-ocean-medium/25 p-4">
-              <div className="flex items-center gap-3">
-                <div>
-                  <span className="block text-sm text-white">{reef.name}</span>
-                  <span className="text-xs text-gray-muted">Current temperature: {formatTemperature(reef.seaSurfaceTemp)}</span>
-                </div>
-              </div>
-              <span className={`shrink-0 rounded-lg border px-2 py-1 text-[11px] capitalize ${statusStyles[reef.status]}`}>
-                {reef.status} risk
-              </span>
-            </div>
-          ))}
-          {reefs.length === 0 && (
-            <div className="rounded-xl border border-cyan-glow/10 bg-ocean-medium/25 p-5 text-sm text-gray-light">
-              No reefs are actively monitored. Use the global map to select NOAA reef locations for monitoring.
-            </div>
-          )}
-        </div>
-      </section>
 
       <section className="reef-panel rounded-2xl border border-gray-border/70 bg-ocean-dark/62 p-6">
         <div className="mb-6 flex items-center gap-3">

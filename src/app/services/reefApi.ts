@@ -211,8 +211,38 @@ export interface TestAlertResponse {
   message?: string;
 }
 
+export interface SelfImprovementVerifiedMetrics {
+  average_score: number | null;
+  accuracy: number | null;
+  specificity: number | null;
+  actionability: number | null;
+  scientific_reliability: number | null;
+  dhw_interpretation: number | null;
+  dhw_interpretation_accuracy: number | null;
+  uncertainty_communication: number | null;
+  hallucination_avoidance: number | null;
+  last_eval_at: string | null;
+}
+
 export interface SelfImprovementRun {
-  status?: 'completed' | 'improved' | 'partial' | 'insufficient_data' | 'timeout' | 'error' | 'no_traces' | 'skipped_healthy' | string;
+  /** Raw run status from the backend (e.g. completed, improved, skipped_healthy). */
+  status?: 'completed' | 'improved' | 'degraded' | 'partial' | 'insufficient_data' | 'timeout' | 'error' | 'no_traces' | 'skipped_healthy' | string;
+  /**
+   * Computed overall system state — always use this for badge/narrative logic.
+   * healthy | improved | degraded | rewrite_pending_verification | skipped_healthy | no_data
+   */
+  system_status?: 'healthy' | 'improved' | 'degraded' | 'rewrite_pending_verification' | 'skipped_healthy' | 'no_data' | string;
+  /**
+   * Describes the prompt rewrite lifecycle across multiple runs.
+   * none | rewritten_pending | confirmed_improved | did_not_improve
+   */
+  prompt_rewrite_status?: 'none' | 'rewritten_pending' | 'confirmed_improved' | 'did_not_improve';
+  /** Metrics from the latest non-skipped full evaluation (authoritative for display). */
+  latest_verified_metrics?: SelfImprovementVerifiedMetrics | null;
+  /** Human-readable summary of the current system state. */
+  current_state_summary?: string | null;
+  /** ISO timestamp of the latest full evaluation (not a skip). */
+  last_full_eval_at?: string | null;
   cached_from?: string | null;
   cached?: boolean;
   /** ISO timestamp of when this run (or health check) completed. */
@@ -242,6 +272,18 @@ export interface SelfImprovementRun {
   summary: string;
   research_narrative?: string;
   prompt_change_summary?: string;
+  /** Which model-reasoning dimensions triggered the rewrite (e.g. "actionability, specificity"). */
+  rewrite_reason?: string | null;
+  /** Root cause diagnosis from the self-improvement run. */
+  diagnosis?: {
+    failing_dimensions: string[];
+    failing_scores: Record<string, number>;
+    model_reasoning_dimensions: string[];
+    data_gap_dimensions: string[];
+    data_gap_likely: boolean;
+    rewrite_warranted: boolean;
+    diagnosis_summary: string;
+  } | null;
   empty?: boolean;
   partial?: boolean;
   before_after: {
@@ -252,6 +294,12 @@ export interface SelfImprovementRun {
 
 export interface SelfImprovementHistoryPoint {
   date: string | null;
+  stored_at?: string | null;
+  completed_at?: string | null;
+  last_checked?: string | null;
+  source?: string | null;
+  status?: string | null;
+  skip_reason?: string | null;
   average_score: number | null;
   assessment_count: number;
   prompt_updated: boolean;
@@ -272,8 +320,118 @@ export interface SelfImprovementHistory {
   count: number;
 }
 
+// ── V2 Production Evaluation System types ──────────────────────────────────
+
+export interface PromptVersionEntry {
+  version: string;
+  deployed_at: string | null;
+  experiment_score: number | null;
+  improvement_delta: number | null;
+  rewrite_reason: string | null;
+}
+
+export interface ExperimentResult {
+  experiment_id: string;
+  status: string;
+  timestamp: string;
+  benchmark_cases_used: number;
+  baseline_score: number | null;
+  candidate_score: number | null;
+  delta: number | null;
+  promoted: boolean;
+  promotion_reason: string;
+  baseline_dimensions: Record<string, number>;
+  candidate_dimensions: Record<string, number>;
+  dimension_deltas: Record<string, number>;
+  rewrite_reason: string | null;
+  diagnosis_summary: string | null;
+}
+
+export interface SelfImprovementV2Status {
+  prompt_version: string;
+  prompt_deployed_at: string | null;
+  prompt_experiment_score: number | null;
+  prompt_baseline_score: number | null;
+  prompt_improvement_delta: number | null;
+  prompt_rewrite_reason: string | null;
+  benchmark_dataset_size: number;
+  latest_experiment: {
+    experiment_id: string | null;
+    timestamp: string | null;
+    baseline_score: number | null;
+    candidate_score: number | null;
+    delta: number | null;
+    promoted: boolean | null;
+    promotion_reason: string | null;
+    benchmark_cases: number | null;
+  } | null;
+  prompt_history: PromptVersionEntry[];
+  current_quality: number | null;
+  current_system_status: string | null;
+  last_updated: string;
+}
+
+export interface BenchmarkStats {
+  total_cases: number;
+  evaluation_types: Record<string, number>;
+  oldest: string | null;
+  newest: string | null;
+  gcs_bucket: string;
+}
+
+export async function fetchSelfImprovementV2Status(): Promise<SelfImprovementV2Status> {
+  const response = await fetch(`${REEF_API_BASE_URL}/api/self-improvement/v2/status`);
+  if (!response.ok) throw new Error(`v2 status request failed: ${response.status}`);
+  return response.json();
+}
+
+export async function fetchSelfImprovementV2Experiments(limit = 10): Promise<{ experiments: ExperimentResult[]; count: number }> {
+  const response = await fetch(`${REEF_API_BASE_URL}/api/self-improvement/v2/experiments?limit=${limit}`);
+  if (!response.ok) throw new Error(`v2 experiments request failed: ${response.status}`);
+  return response.json();
+}
+
+export async function fetchSelfImprovementV2PromptHistory(): Promise<{ active_version: string; history: PromptVersionEntry[]; total_versions: number }> {
+  const response = await fetch(`${REEF_API_BASE_URL}/api/self-improvement/v2/prompt-history`);
+  if (!response.ok) throw new Error(`v2 prompt history request failed: ${response.status}`);
+  return response.json();
+}
+
+export async function fetchBenchmarkStats(): Promise<BenchmarkStats> {
+  const response = await fetch(`${REEF_API_BASE_URL}/api/self-improvement/v2/benchmark-stats`);
+  if (!response.ok) throw new Error(`benchmark stats request failed: ${response.status}`);
+  return response.json();
+}
+
 export const REEF_API_BASE_URL = 'https://reefwatch-ai-service-876566369096.us-central1.run.app';
 const BACKEND_HEALTH_TIMEOUT_MS = 4500;
+
+export const RESEARCHER_ID_KEY = 'reefwatch_researcher_id';
+
+export function getResearcherId(): string {
+  try {
+    let id = localStorage.getItem(RESEARCHER_ID_KEY);
+    if (!id) {
+      id = crypto.randomUUID();
+      localStorage.setItem(RESEARCHER_ID_KEY, id);
+    }
+    return id;
+  } catch {
+    return 'anonymous';
+  }
+}
+
+export async function syncResearcherActiveReefs(researcherId: string, reefIds: string[]): Promise<void> {
+  try {
+    await fetch(`${REEF_API_BASE_URL}/api/researcher/active-reefs`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ researcher_id: researcherId, reef_ids: reefIds }),
+    });
+  } catch {
+    // non-critical background sync
+  }
+}
 const SELF_EVALUATION_TIMEOUT_MS = 120000;
 export const SELF_EVALUATION_SLOW_MESSAGE =
   'AI evaluation is taking longer than expected. Try again with a smaller limit or check Gemini quota.';
@@ -426,7 +584,7 @@ export async function sendTestAlert(reefId?: string): Promise<TestAlertResponse>
   const response = await fetch(`${REEF_API_BASE_URL}/api/alerts/test`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(reefId ? { reefId } : {}),
+    body: JSON.stringify({ researcher_id: getResearcherId(), ...(reefId ? { reefId } : {}) }),
   });
 
   const data = await response.json().catch(() => null) as TestAlertResponse | null;
@@ -438,8 +596,11 @@ export async function sendTestAlert(reefId?: string): Promise<TestAlertResponse>
   return data;
 }
 
-export async function fetchSettings(): Promise<Record<string, string>> {
-  const response = await fetch(`${REEF_API_BASE_URL}/api/settings`);
+export async function fetchSettings(researcherId?: string): Promise<Record<string, string>> {
+  const url = researcherId
+    ? `${REEF_API_BASE_URL}/api/settings?researcher_id=${encodeURIComponent(researcherId)}`
+    : `${REEF_API_BASE_URL}/api/settings`;
+  const response = await fetch(url);
 
   if (!response.ok) {
     throw new Error(`Settings request failed with ${response.status}`);
@@ -448,11 +609,16 @@ export async function fetchSettings(): Promise<Record<string, string>> {
   return response.json();
 }
 
-export async function saveSettings(settings: Record<string, string | number | boolean>): Promise<{ success: boolean }> {
+export async function saveSettings(
+  settings: Record<string, string | number | boolean>,
+  researcherId?: string,
+): Promise<{ success: boolean }> {
+  const body: Record<string, unknown> = { settings };
+  if (researcherId) body.researcher_id = researcherId;
   const response = await fetch(`${REEF_API_BASE_URL}/api/settings`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ settings }),
+    body: JSON.stringify(body),
   });
 
   if (!response.ok) {
@@ -590,6 +756,7 @@ export async function addStationToActiveMonitoring(payload: {
   name: string;
   lat: number;
   lng: number;
+  researcher_id?: string;
 }): Promise<LiveReef> {
   const response = await fetch(`${REEF_API_BASE_URL}/api/reefs/monitor`, {
     method: 'POST',
@@ -614,8 +781,11 @@ export async function addStationToActiveMonitoring(payload: {
   return data;
 }
 
-export async function removeFromActiveMonitoring(id: string): Promise<{ removed: boolean }> {
-  const response = await fetch(`${REEF_API_BASE_URL}/api/reefs/monitor/${encodeURIComponent(id)}`, {
+export async function removeFromActiveMonitoring(id: string, researcherId?: string): Promise<{ removed: boolean }> {
+  const url = researcherId
+    ? `${REEF_API_BASE_URL}/api/reefs/monitor/${encodeURIComponent(id)}?researcher_id=${encodeURIComponent(researcherId)}`
+    : `${REEF_API_BASE_URL}/api/reefs/monitor/${encodeURIComponent(id)}`;
+  const response = await fetch(url, {
     method: 'DELETE',
   });
 

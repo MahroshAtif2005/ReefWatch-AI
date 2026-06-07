@@ -111,8 +111,9 @@ def _phoenix_client_base_url() -> str:
     return PHOENIX_BASE_URL or PHOENIX_UI_URL
 ENABLE_FULL_LLM_TRACE = os.getenv("ENABLE_FULL_LLM_TRACE", "false").lower() == "true"
 ALERT_EMAIL_FROM = os.getenv("ALERT_EMAIL_FROM", "")
-ALERT_EMAIL_TO = os.getenv("ALERT_EMAIL_TO", "")
 ALERT_EMAIL_PASSWORD = os.getenv("ALERT_EMAIL_PASSWORD", "")
+# Recipient is set by the user in Settings (/api/settings → notification_email).
+# ALERT_EMAIL_TO env var is intentionally not read here.
 ALERT_COOLDOWN_HOURS = 24
 REEFWATCH_API_URL = os.getenv(
     "REEFWATCH_API_URL",
@@ -130,8 +131,18 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 AI_SERVICE_ROOT = Path(__file__).resolve().parent
 REEF_ANALYSIS_PROMPT_PATH = AI_SERVICE_ROOT / "prompts" / "reef_analysis.txt"
 REEF_ANALYSIS_PROMPT_HISTORY_DIR = AI_SERVICE_ROOT / "prompts" / "history"
-SELF_IMPROVEMENT_RUNS_PATH = REPO_ROOT / "data" / "self_improvement_runs.json"
+SELF_IMPROVEMENT_RUNS_PATH = AI_SERVICE_ROOT / "data" / "self_improvement_runs.json"
 LAST_SCORES_PATH = Path("/tmp/last_scores.json")
+SELF_IMPROVEMENT_STORAGE = os.getenv("SELF_IMPROVEMENT_STORAGE", "local").upper()
+SELF_IMPROVEMENT_GCS_BUCKET = os.getenv("SELF_IMPROVEMENT_GCS_BUCKET", "")
+_GCS_SI_OBJECT = "self-improvement/runs.jsonl"
+_GCS_PROFILES_OBJECT = "researcher-profiles/profiles.json"
+# Production evaluation system — Phase 1-8
+_GCS_BENCHMARK_OBJECT = "evaluation-datasets/cases.jsonl"
+_GCS_EXPERIMENTS_PREFIX = "experiments/"
+_GCS_PROMPTS_ACTIVE = "prompts/active_prompt.json"
+_GCS_PROMPTS_HISTORY = "prompts/prompt_history.json"
+_GCS_IMPROVEMENT_HISTORY_PREFIX = "improvement-history/"
 DEFAULT_REEF_ANALYSIS_PROMPT = """You are ReefWatch AI, an expert coral bleaching risk analyst.
 
 Analyze NOAA Coral Reef Watch snapshots using DHW, SST, SST anomaly, bleaching alert level, risk thresholds, and uncertainty. Be specific, actionable, and return JSON only."""
@@ -153,6 +164,7 @@ app.add_middleware(
 gemini_connected = False
 _alert_scheduler = AsyncIOScheduler(timezone="UTC")
 _alert_last_sent: Dict[str, str] = {}
+_demo_alert_events: List[Dict[str, Any]] = []
 tracer = trace.get_tracer(__name__)
 
 gemini_cache: Dict[str, Dict[str, Any]] = {}
@@ -164,6 +176,8 @@ last_noaa_latency_ms: float = 0.0
 _mcp_tool_call_log: List[Dict[str, Any]] = []
 _MCP_DB_PATH = Path("/tmp/mcp_tool_calls.db")
 _mcp_db_lock = threading.Lock()
+_gcs_write_lock = threading.Lock()
+_gcs_profiles_lock = threading.Lock()
 
 
 def _init_mcp_db() -> None:
@@ -202,6 +216,37 @@ def _init_mcp_db() -> None:
                 con.execute(_col_sql)
             except Exception:
                 pass  # Column already present — safe to ignore
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS self_improvement_runs (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                stored_at    TEXT NOT NULL,
+                completed_at TEXT,
+                source       TEXT,
+                status       TEXT,
+                average_score REAL,
+                prompt_updated INTEGER NOT NULL DEFAULT 0,
+                run_json     TEXT NOT NULL,
+                UNIQUE(stored_at)
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS researcher_profiles (
+                researcher_id           TEXT PRIMARY KEY,
+                notification_email      TEXT NOT NULL DEFAULT '',
+                active_reef_ids         TEXT NOT NULL DEFAULT '[]',
+                critical_alerts_enabled INTEGER NOT NULL DEFAULT 1,
+                anomaly_alerts_enabled  INTEGER NOT NULL DEFAULT 1,
+                weekly_summary_enabled  INTEGER NOT NULL DEFAULT 0,
+                anomaly_threshold       REAL NOT NULL DEFAULT 1.0,
+                created_at              TEXT NOT NULL,
+                updated_at              TEXT NOT NULL
+            )
+        """)
+        # Add researcher_id to monitored_reefs for per-researcher tracking
+        try:
+            con.execute("ALTER TABLE monitored_reefs ADD COLUMN researcher_id TEXT")
+        except Exception:
+            pass  # Column already present
         con.commit()
         # Seed in-memory log from DB so it survives page refreshes within the same instance
         rows = con.execute(
@@ -271,6 +316,344 @@ def _delete_monitored_reef_from_db(reef_id: str) -> None:
             con.close()
     except Exception as err:
         print(f"[monitored-reefs] DB delete failed (non-fatal): {err}")
+
+
+# ---------------------------------------------------------------------------
+# Researcher profile helpers — per-browser persistent profiles keyed by UUID
+# ---------------------------------------------------------------------------
+
+def _mask_email(email: str) -> str:
+    """Return a masked email safe for logs: alice@example.com → a***@example.com"""
+    if not email or "@" not in email:
+        return "***"
+    local, domain = email.split("@", 1)
+    return f"{local[0]}***@{domain}" if local else f"***@{domain}"
+
+
+def _get_or_create_researcher_profile(researcher_id: str) -> Dict[str, Any]:
+    """Return the researcher profile, creating a blank one if it doesn't exist."""
+    now = utc_now()
+    try:
+        with _mcp_db_lock:
+            con = sqlite3.connect(_MCP_DB_PATH)
+            con.execute(
+                """INSERT OR IGNORE INTO researcher_profiles
+                   (researcher_id, notification_email, active_reef_ids,
+                    critical_alerts_enabled, anomaly_alerts_enabled,
+                    weekly_summary_enabled, anomaly_threshold,
+                    created_at, updated_at)
+                   VALUES (?, '', '[]', 1, 1, 0, 1.0, ?, ?)""",
+                (researcher_id, now, now),
+            )
+            con.commit()
+            row = con.execute(
+                """SELECT researcher_id, notification_email, active_reef_ids,
+                          critical_alerts_enabled, anomaly_alerts_enabled,
+                          weekly_summary_enabled, anomaly_threshold,
+                          created_at, updated_at
+                   FROM researcher_profiles WHERE researcher_id = ?""",
+                (researcher_id,),
+            ).fetchone()
+            con.close()
+        if not row:
+            return {}
+        return {
+            "researcher_id": row[0],
+            "notification_email": row[1] or "",
+            "active_reef_ids": row[2] or "[]",
+            "critical_alerts_enabled": bool(row[3]),
+            "anomaly_alerts_enabled": bool(row[4]),
+            "weekly_summary_enabled": bool(row[5]),
+            "anomaly_threshold": row[6] if row[6] is not None else 1.0,
+            "created_at": row[7],
+            "updated_at": row[8],
+        }
+    except Exception as err:
+        print(f"[researcher] get_or_create failed: {err}")
+        return {}
+
+
+def _update_researcher_settings(researcher_id: str, settings: Dict[str, Any]) -> bool:
+    """Upsert alert preferences for a researcher. Creates profile on first call."""
+    profile = _get_or_create_researcher_profile(researcher_id)
+    if not profile:
+        return False
+
+    def _to_bool(val: Any, default: bool) -> bool:
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, str):
+            return val.lower() == "true"
+        return default
+
+    email = str(settings.get("notification_email", profile["notification_email"])).strip()
+    critical = _to_bool(settings.get("critical_alerts_enabled"), profile["critical_alerts_enabled"])
+    anomaly = _to_bool(settings.get("temp_anomaly_alerts_enabled"), profile["anomaly_alerts_enabled"])
+    weekly = _to_bool(settings.get("weekly_summary_enabled"), profile["weekly_summary_enabled"])
+    try:
+        threshold = float(settings.get("anomaly_threshold", profile["anomaly_threshold"]))
+    except (TypeError, ValueError):
+        threshold = profile["anomaly_threshold"]
+
+    try:
+        with _mcp_db_lock:
+            con = sqlite3.connect(_MCP_DB_PATH)
+            con.execute(
+                """UPDATE researcher_profiles SET
+                   notification_email      = ?,
+                   critical_alerts_enabled = ?,
+                   anomaly_alerts_enabled  = ?,
+                   weekly_summary_enabled  = ?,
+                   anomaly_threshold       = ?,
+                   updated_at              = ?
+                   WHERE researcher_id = ?""",
+                (
+                    email,
+                    1 if critical else 0,
+                    1 if anomaly else 0,
+                    1 if weekly else 0,
+                    threshold,
+                    utc_now(),
+                    researcher_id,
+                ),
+            )
+            con.commit()
+            con.close()
+        if email:
+            print(f"[researcher] {researcher_id[:8]}… settings saved — email={_mask_email(email)}")
+        # Write-through: push updated profile to GCS so it survives Cloud Run restarts
+        fresh = _get_or_create_researcher_profile(researcher_id)
+        gcs_ok = _upsert_profile_to_gcs(researcher_id, fresh)
+        if not gcs_ok:
+            print(f"[researcher:gcs] profile GCS write skipped or failed for {researcher_id[:8]}… (profiles_gcs_enabled={_profiles_gcs_enabled()})")
+        return True
+    except Exception as err:
+        print(f"[researcher] settings update failed: {err}")
+        return False
+
+
+def _update_researcher_active_reefs(researcher_id: str, reef_ids: List[str]) -> bool:
+    """Replace active_reef_ids for a researcher. Creates profile if needed."""
+    _get_or_create_researcher_profile(researcher_id)
+    try:
+        with _mcp_db_lock:
+            con = sqlite3.connect(_MCP_DB_PATH)
+            con.execute(
+                "UPDATE researcher_profiles SET active_reef_ids = ?, updated_at = ? WHERE researcher_id = ?",
+                (json.dumps(reef_ids), utc_now(), researcher_id),
+            )
+            con.commit()
+            con.close()
+        print(f"[researcher] {researcher_id[:8]}… active reefs updated — count={len(reef_ids)}")
+        # Write-through: push updated profile to GCS so alerts survive Cloud Run restarts
+        fresh = _get_or_create_researcher_profile(researcher_id)
+        gcs_ok = _upsert_profile_to_gcs(researcher_id, fresh)
+        if not gcs_ok:
+            print(f"[researcher:gcs] reef sync GCS write skipped or failed for {researcher_id[:8]}… (profiles_gcs_enabled={_profiles_gcs_enabled()})")
+        return True
+    except Exception as err:
+        print(f"[researcher] active reefs update failed: {err}")
+        return False
+
+
+def _list_researcher_profiles_with_alerts() -> List[Dict[str, Any]]:
+    """Return all profiles that have both a notification_email and at least one active reef."""
+    try:
+        with _mcp_db_lock:
+            con = sqlite3.connect(_MCP_DB_PATH)
+            rows = con.execute(
+                """SELECT researcher_id, notification_email, active_reef_ids,
+                          critical_alerts_enabled, anomaly_alerts_enabled,
+                          weekly_summary_enabled, anomaly_threshold
+                   FROM researcher_profiles
+                   WHERE notification_email != ''
+                     AND active_reef_ids NOT IN ('[]', '', 'null')"""
+            ).fetchall()
+            con.close()
+        return [
+            {
+                "researcher_id": r[0],
+                "notification_email": r[1],
+                "active_reef_ids_json": r[2],
+                "critical_alerts_enabled": bool(r[3]),
+                "anomaly_alerts_enabled": bool(r[4]),
+                "weekly_summary_enabled": bool(r[5]),
+                "anomaly_threshold": r[6] if r[6] is not None else 1.0,
+            }
+            for r in rows
+        ]
+    except Exception as err:
+        print(f"[researcher] list_profiles_with_alerts failed: {err}")
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Researcher profile GCS persistence
+# ---------------------------------------------------------------------------
+
+def _profiles_gcs_enabled() -> bool:
+    """True whenever the GCS bucket is configured, independent of SELF_IMPROVEMENT_STORAGE."""
+    return bool(SELF_IMPROVEMENT_GCS_BUCKET)
+
+
+def _get_profiles_gcs_bucket() -> Optional[Any]:
+    """Return a GCS Bucket object for researcher-profile storage, or None on failure."""
+    if not _profiles_gcs_enabled():
+        return None
+    try:
+        from google.cloud import storage as _gcs_storage  # noqa: PLC0415
+        return _gcs_storage.Client().bucket(SELF_IMPROVEMENT_GCS_BUCKET)
+    except ImportError:
+        print("[profiles-gcs] google-cloud-storage not installed")
+        return None
+    except Exception as _e:
+        print(f"[profiles-gcs] bucket init failed: {type(_e).__name__}: {_e}")
+        return None
+
+
+def _load_all_profiles_from_gcs() -> Dict[str, Any]:
+    """Read all researcher profiles from GCS.  Returns {} when unavailable."""
+    if not _profiles_gcs_enabled():
+        return {}
+    try:
+        bucket = _get_profiles_gcs_bucket()
+        if bucket is None:
+            return {}
+        blob = bucket.blob(_GCS_PROFILES_OBJECT)
+        if not blob.exists():
+            return {}
+        data = json.loads(blob.download_as_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception as _e:
+        print(f"[profiles-gcs] load failed: {type(_e).__name__}: {_e}")
+        return {}
+
+
+def _upsert_profile_to_gcs(researcher_id: str, profile: Dict[str, Any]) -> bool:
+    """Write/update a single researcher profile in GCS (read-modify-write, thread-safe)."""
+    if not _profiles_gcs_enabled():
+        return False
+    try:
+        with _gcs_profiles_lock:
+            bucket = _get_profiles_gcs_bucket()
+            if bucket is None:
+                return False
+            blob = bucket.blob(_GCS_PROFILES_OBJECT)
+            existing: Dict[str, Any] = {}
+            if blob.exists():
+                try:
+                    existing = json.loads(blob.download_as_text(encoding="utf-8"))
+                    if not isinstance(existing, dict):
+                        existing = {}
+                except Exception:
+                    existing = {}
+            existing[researcher_id] = profile
+            blob.upload_from_string(
+                json.dumps(existing, ensure_ascii=False, indent=2, default=str),
+                content_type="application/json",
+            )
+            _active_ids_raw = profile.get("active_reef_ids", "[]")
+            try:
+                _active_ids_count = len(json.loads(_active_ids_raw)) if isinstance(_active_ids_raw, str) else len(_active_ids_raw)
+            except Exception:
+                _active_ids_count = 0
+            print(f"[active-reefs:gcs] saved researcher_id={researcher_id[:8]}… active_reef_ids count={_active_ids_count}")
+            print(f"[researcher:gcs] saved profile researcher={researcher_id[:8]}… total_profiles={len(existing)}")
+            return True
+    except Exception as _e:
+        print(f"[researcher:gcs] failed profile save: {type(_e).__name__}: {_e}")
+        return False
+
+
+def _hydrate_researcher_profiles_from_gcs() -> None:
+    """On startup: INSERT OR IGNORE each GCS profile into the SQLite cache."""
+    if not _profiles_gcs_enabled():
+        return
+    try:
+        profiles = _load_all_profiles_from_gcs()
+        if not profiles:
+            print("[profiles-gcs] no profiles in GCS — starting with empty SQLite table")
+            return
+        hydrated = 0
+        with _mcp_db_lock:
+            con = sqlite3.connect(_MCP_DB_PATH)
+            for rid, p in profiles.items():
+                con.execute(
+                    """INSERT OR IGNORE INTO researcher_profiles
+                       (researcher_id, notification_email, active_reef_ids,
+                        critical_alerts_enabled, anomaly_alerts_enabled,
+                        weekly_summary_enabled, anomaly_threshold,
+                        created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        rid,
+                        p.get("notification_email", ""),
+                        p.get("active_reef_ids", "[]"),
+                        1 if p.get("critical_alerts_enabled", True) else 0,
+                        1 if p.get("anomaly_alerts_enabled", True) else 0,
+                        1 if p.get("weekly_summary_enabled", False) else 0,
+                        float(p.get("anomaly_threshold", 1.0)),
+                        p.get("created_at", utc_now()),
+                        p.get("updated_at", utc_now()),
+                    ),
+                )
+                if con.execute("SELECT changes()").fetchone()[0] > 0:
+                    hydrated += 1
+            con.commit()
+            con.close()
+        print(f"[profiles-gcs] hydrated {hydrated}/{len(profiles)} researcher profiles into SQLite")
+    except Exception as _e:
+        print(f"[profiles-gcs] startup hydration failed (non-fatal): {_e}")
+
+
+def _migrate_sqlite_profiles_to_gcs() -> None:
+    """On startup: push any SQLite researcher profiles not yet in GCS up to GCS."""
+    if not _profiles_gcs_enabled():
+        return
+    try:
+        with _mcp_db_lock:
+            con = sqlite3.connect(_MCP_DB_PATH)
+            rows = con.execute(
+                """SELECT researcher_id, notification_email, active_reef_ids,
+                          critical_alerts_enabled, anomaly_alerts_enabled,
+                          weekly_summary_enabled, anomaly_threshold, created_at, updated_at
+                   FROM researcher_profiles"""
+            ).fetchall()
+            con.close()
+        if not rows:
+            return
+        existing = _load_all_profiles_from_gcs()
+        additions: Dict[str, Any] = {}
+        for row in rows:
+            rid = row[0]
+            if rid in existing:
+                continue
+            additions[rid] = {
+                "researcher_id": rid,
+                "notification_email": row[1] or "",
+                "active_reef_ids": row[2] or "[]",
+                "critical_alerts_enabled": bool(row[3]),
+                "anomaly_alerts_enabled": bool(row[4]),
+                "weekly_summary_enabled": bool(row[5]),
+                "anomaly_threshold": row[6] if row[6] is not None else 1.0,
+                "created_at": row[7],
+                "updated_at": row[8],
+            }
+        if not additions:
+            print(f"[profiles-gcs] all {len(rows)} SQLite profiles already in GCS")
+            return
+        merged = {**existing, **additions}
+        with _gcs_profiles_lock:
+            bucket = _get_profiles_gcs_bucket()
+            if bucket:
+                blob = bucket.blob(_GCS_PROFILES_OBJECT)
+                blob.upload_from_string(
+                    json.dumps(merged, ensure_ascii=False, indent=2, default=str),
+                    content_type="application/json",
+                )
+        print(f"[profiles-gcs] migrated {len(additions)}/{len(rows)} SQLite profiles to GCS")
+    except Exception as _e:
+        print(f"[profiles-gcs] migration to GCS failed (non-fatal): {_e}")
 
 
 def _log_mcp_call(tool_name: str, summary: str, data: Any = None) -> None:
@@ -362,8 +745,218 @@ def _persist_scores_to_disk() -> None:
         print(f"[self-improvement] failed to persist scores: {_e}")
 
 
+def _gcs_enabled() -> bool:
+    return SELF_IMPROVEMENT_STORAGE == "GCS" and bool(SELF_IMPROVEMENT_GCS_BUCKET)
+
+
+def _get_gcs_bucket_obj() -> Optional[Any]:
+    """Return a GCS Bucket object, or None if GCS is not configured or unavailable."""
+    if not _gcs_enabled():
+        return None
+    try:
+        from google.cloud import storage as _gcs_storage  # noqa: PLC0415
+        client = _gcs_storage.Client()
+        return client.bucket(SELF_IMPROVEMENT_GCS_BUCKET)
+    except ImportError:
+        print("[gcs] google-cloud-storage not installed; falling back to local storage")
+        return None
+    except Exception as _e:
+        print(f"[gcs] failed to init GCS bucket: {type(_e).__name__}: {_e}")
+        return None
+
+
+def _load_history_from_gcs(limit: int = 90) -> List[Dict[str, Any]]:
+    """Read self-improvement runs from GCS JSONL, newest-first. Returns [] when GCS unavailable."""
+    if not _gcs_enabled():
+        return []
+    try:
+        bucket = _get_gcs_bucket_obj()
+        if bucket is None:
+            return []
+        blob = bucket.blob(_GCS_SI_OBJECT)
+        if not blob.exists():
+            return []
+        content = blob.download_as_text(encoding="utf-8")
+        runs: List[Dict[str, Any]] = []
+        for line in content.splitlines():
+            line = line.strip()
+            if line:
+                try:
+                    runs.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+        runs.sort(
+            key=lambda r: r.get("stored_at") or r.get("completed_at") or r.get("date") or "",
+            reverse=True,
+        )
+        return runs[:limit]
+    except Exception as _e:
+        print(f"[gcs] failed to load history: {type(_e).__name__}: {_e}")
+        return []
+
+
+def _append_run_to_gcs(record: Dict[str, Any]) -> bool:
+    """Append a single run record to the GCS JSONL file. Returns True on success."""
+    if not _gcs_enabled():
+        return False
+    try:
+        with _gcs_write_lock:
+            bucket = _get_gcs_bucket_obj()
+            if bucket is None:
+                return False
+            blob = bucket.blob(_GCS_SI_OBJECT)
+            existing = blob.download_as_text(encoding="utf-8") if blob.exists() else ""
+            stored_at = record.get("stored_at", "")
+            # Dedup by stored_at timestamp
+            if stored_at and stored_at in existing:
+                print(f"[gcs] record stored_at={stored_at} already present, skipping")
+                return True
+            new_line = json.dumps(record, ensure_ascii=False, default=str)
+            updated = (existing.rstrip("\n") + "\n" + new_line + "\n") if existing.strip() else (new_line + "\n")
+            blob.upload_from_string(updated, content_type="application/x-ndjson")
+            print(f"[gcs] appended run to gs://{SELF_IMPROVEMENT_GCS_BUCKET}/{_GCS_SI_OBJECT} stored_at={stored_at}")
+            return True
+    except Exception as _e:
+        print(f"[gcs] failed to append run: {type(_e).__name__}: {_e}")
+        return False
+
+
+def _hydrate_sqlite_from_gcs() -> None:
+    """On startup: load GCS history into SQLite cache so local lookups are fast."""
+    if not _gcs_enabled():
+        return
+    try:
+        runs = _load_history_from_gcs(limit=90)
+        if not runs:
+            return
+        hydrated = 0
+        for run in runs:
+            stored_at = run.get("stored_at") or run.get("completed_at") or run.get("date")
+            if not stored_at:
+                continue
+            record = {**run, "stored_at": stored_at}
+            if _save_run_to_history_sqlite(record):
+                hydrated += 1
+        print(f"[gcs] hydrated SQLite cache from GCS: {hydrated}/{len(runs)} runs")
+    except Exception as _e:
+        print(f"[gcs] SQLite hydration from GCS failed (non-fatal): {_e}")
+
+
+def _migrate_json_history_to_gcs() -> None:
+    """One-time migration: upload existing JSON history records to GCS, skipping duplicates."""
+    if not _gcs_enabled():
+        return
+    try:
+        runs: List[Dict[str, Any]] = json.loads(
+            SELF_IMPROVEMENT_RUNS_PATH.read_text(encoding="utf-8")
+        )
+        if not isinstance(runs, list) or not runs:
+            return
+    except Exception:
+        return
+    existing_gcs = _load_history_from_gcs(limit=200)
+    existing_stored_ats = {r.get("stored_at") for r in existing_gcs if r.get("stored_at")}
+    migrated = 0
+    for run in runs:
+        stored_at = run.get("stored_at") or run.get("completed_at") or run.get("date")
+        if not stored_at:
+            continue
+        if stored_at in existing_stored_ats:
+            continue
+        record = {**run, "stored_at": stored_at}
+        if _append_run_to_gcs(record):
+            existing_stored_ats.add(stored_at)
+            migrated += 1
+    print(f"[gcs] migrated {migrated}/{len(runs)} JSON history entries to GCS")
+
+
+def _save_run_to_history_sqlite(record: Dict[str, Any]) -> bool:
+    """Write a run record to SQLite. Returns True on success."""
+    try:
+        with _mcp_db_lock:
+            con = sqlite3.connect(_MCP_DB_PATH)
+            con.execute(
+                """
+                INSERT OR IGNORE INTO self_improvement_runs
+                    (stored_at, completed_at, source, status, average_score, prompt_updated, run_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.get("stored_at") or utc_now(),
+                    record.get("completed_at") or record.get("last_checked"),
+                    record.get("source"),
+                    record.get("status"),
+                    record.get("average_score"),
+                    1 if record.get("prompt_updated") else 0,
+                    json.dumps(record, ensure_ascii=False),
+                ),
+            )
+            con.commit()
+            con.close()
+        return True
+    except Exception as _e:
+        print(f"[self-improvement] sqlite write failed: {type(_e).__name__}: {_e}")
+        return False
+
+
+def _load_history_from_sqlite(limit: int = 90) -> List[Dict[str, Any]]:
+    """Return runs from SQLite ordered newest-first. Returns [] on any error."""
+    try:
+        with _mcp_db_lock:
+            con = sqlite3.connect(_MCP_DB_PATH)
+            rows = con.execute(
+                """
+                SELECT run_json FROM self_improvement_runs
+                ORDER BY COALESCE(completed_at, stored_at) DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            con.close()
+        return [json.loads(row[0]) for row in rows]
+    except Exception as _e:
+        print(f"[self-improvement] sqlite read failed: {type(_e).__name__}: {_e}")
+        return []
+
+
+def _migrate_json_history_to_sqlite() -> None:
+    """Import existing JSON history into SQLite once, skipping duplicates via UNIQUE(stored_at)."""
+    try:
+        runs: List[Dict[str, Any]] = json.loads(
+            SELF_IMPROVEMENT_RUNS_PATH.read_text(encoding="utf-8")
+        )
+        if not isinstance(runs, list) or not runs:
+            return
+        imported = 0
+        for run in runs:
+            stored_at = run.get("stored_at") or run.get("completed_at") or run.get("date")
+            if not stored_at:
+                continue
+            record = {**run, "stored_at": stored_at}
+            if _save_run_to_history_sqlite(record):
+                imported += 1
+        print(f"[self-improvement] migrated {imported}/{len(runs)} JSON history entries to SQLite")
+    except Exception as _e:
+        print(f"[self-improvement] json→sqlite migration skipped: {type(_e).__name__}: {_e}")
+
+
 def _save_run_to_history(result: Dict[str, Any]) -> None:
-    """Append a completed (or skipped) run to the persistent history file."""
+    """Persist a completed (or skipped) run — GCS primary, SQLite cache, JSON local fallback."""
+    stored_at = result.get("stored_at") or utc_now()
+    record = {**result, "stored_at": stored_at}
+
+    gcs_ok = _append_run_to_gcs(record)
+    sqlite_ok = _save_run_to_history_sqlite(record)
+    if gcs_ok:
+        storage_label = "gcs+sqlite" if sqlite_ok else "gcs"
+    else:
+        storage_label = "sqlite" if sqlite_ok else "(all backends failed)"
+    print(
+        f"[self-improvement] run saved to {storage_label} "
+        f"— status={result.get('status')} score={result.get('average_score')}"
+    )
+
+    # Mirror to local JSON as dev fallback (not production source of truth)
     try:
         SELF_IMPROVEMENT_RUNS_PATH.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -374,16 +967,13 @@ def _save_run_to_history(result: Dict[str, Any]) -> None:
                 runs = []
         except Exception:
             runs = []
-        runs.append({**result, "stored_at": utc_now()})
+        runs.append(record)
         SELF_IMPROVEMENT_RUNS_PATH.write_text(
             json.dumps(runs, indent=2, ensure_ascii=False)
         )
-        print(
-            f"[self-improvement] run saved to history — total={len(runs)} "
-            f"status={result.get('status')} score={result.get('average_score')}"
-        )
     except Exception as _e:
-        print(f"[self-improvement] failed to save run to history: {type(_e).__name__}: {_e}")
+        if not gcs_ok and not sqlite_ok:
+            print(f"[self-improvement] all storage backends failed: {type(_e).__name__}: {_e}")
 
 
 def _load_scores_from_disk() -> bool:
@@ -475,10 +1065,11 @@ class ReefAnalysisRequest(BaseModel):
 
 
 class MonitorStationRequest(BaseModel):
-    station_id: str
+    station_id: Optional[str] = None
     name: str
     lat: float
     lng: float
+    researcher_id: Optional[str] = None
 
 
 class BriefRequest(BaseModel):
@@ -512,6 +1103,8 @@ class SelfImprovementRequest(BaseModel):
     demo: bool = False
     save_empty: bool = False
     source: str = "manual"
+    skip_rewrite: bool = False   # evaluation-only; rewrite handled by autonomous experiment pipeline
+    force_fresh: bool = False    # bypass 30-min freshness cache
 
 
 class SelfEvaluationRequest(BaseModel):
@@ -578,13 +1171,21 @@ async def startup() -> None:
     configure_gemini()
     _load_scores_from_disk()
     _init_mcp_db()
+    _migrate_json_history_to_sqlite()
+    _migrate_json_history_to_gcs()
+    _hydrate_sqlite_from_gcs()
+    _restore_scores_from_history()           # Recover real scores from GCS/SQLite after cold starts
+    _hydrate_researcher_profiles_from_gcs()  # Restore researcher profiles from GCS into SQLite
+    _migrate_sqlite_profiles_to_gcs()        # Push any pre-existing SQLite profiles up to GCS
     _load_monitored_reefs_from_db()
     os.makedirs(REEF_ANALYSIS_PROMPT_HISTORY_DIR, exist_ok=True)
     print(f"[env] REEFWATCH_API_URL={REEFWATCH_API_URL}")
     print(f"[env] REEFWATCH_TRACE_URL={REEFWATCH_TRACE_URL}")
     print(f"[env] OPENAI_API_KEY={'set' if os.getenv('OPENAI_API_KEY') else 'missing'}")
     print(f"[env] ALERT_EMAIL_FROM={'set' if ALERT_EMAIL_FROM else 'missing'}")
-    print(f"[env] ALERT_EMAIL_TO={'set' if ALERT_EMAIL_TO else 'missing'}")
+    print(f"[env] ALERT_EMAIL_PASSWORD={'set' if ALERT_EMAIL_PASSWORD else 'missing'} (recipient configured via Settings UI)")
+    print(f"[env] SELF_IMPROVEMENT_STORAGE={SELF_IMPROVEMENT_STORAGE} bucket={SELF_IMPROVEMENT_GCS_BUCKET or '(not set)'}")
+    print(f"[env] researcher-profiles GCS={'enabled' if _profiles_gcs_enabled() else 'disabled (set SELF_IMPROVEMENT_GCS_BUCKET)'}")
     _alert_scheduler.add_job(
         _run_alert_check,
         "interval",
@@ -595,9 +1196,13 @@ async def startup() -> None:
     _alert_scheduler.start()
     print("[alert-scheduler] started — reef alert check will run every 6 hours")
 
-    # Seed caches immediately so first requests return instantly (short TTL lets real data replace)
-    _cache_set(_NOAA_CACHE, "live:list", _STATIC_LIVE_REEFS, 300)
-    print(f"[startup] seeded live reef cache with {len(_STATIC_LIVE_REEFS)} static entries (5-min TTL)")
+    # Seed caches immediately so first requests return instantly (short TTL lets real data replace).
+    # Use _snapshot_fallback_reefs() so startup IDs match _NOAA_REEF_LOCATIONS — the same IDs that
+    # live NOAA data will return after warm-up. _STATIC_LIVE_REEFS used different IDs (e.g.
+    # "florida-keys" vs "florida-keys-reef") causing localStorage selections to become orphaned.
+    _startup_seed = _snapshot_fallback_reefs()
+    _cache_set(_NOAA_CACHE, "live:list", _startup_seed, 300)
+    print(f"[startup] seeded live reef cache with {len(_startup_seed)} snapshot entries (5-min TTL, IDs match NOAA locations)")
 
     # Warm all NOAA caches in the background so real data is ready quickly
     asyncio.ensure_future(_warm_caches_on_startup())
@@ -1705,24 +2310,104 @@ def validate_judge_result(result: Dict[str, Any]) -> Dict[str, Any]:
         for suggestion in raw_suggestions
         if str(suggestion).strip()
     ][:5]
+
+    # Explainability fields for transparency into why each assessment scored as it did
+    validated["reasoning"] = str(result.get("reasoning", "")).strip()[:500]
+    validated["positive_signals"] = [
+        str(s).strip()[:200] for s in (result.get("positive_signals") or [])[:3]
+        if str(s).strip()
+    ]
+    validated["penalties"] = [
+        str(p).strip()[:200] for p in (result.get("penalties") or [])[:3]
+        if str(p).strip()
+    ]
+    validated["score_breakdown"] = {k: validated[k] for k in score_keys}
     return validated
 
 
 def build_judge_prompt(assessment: AssessmentForImprovement) -> str:
-    return f"""
-You are evaluating a coral reef AI assessment for quality.
+    inp = assessment.input_data or {}
+    noaa = inp.get("noaa") or {}
+    if isinstance(noaa, str):
+        try:
+            noaa = json.loads(noaa)
+        except Exception:
+            noaa = {}
+    dhw = inp.get("degreeHeatingWeeks") or noaa.get("degreeHeatingWeeks") or inp.get("dhw")
+    dhw_available = dhw is not None
+    dhw_note = f"DHW = {dhw} wk" if dhw_available else "DHW = UNAVAILABLE (missing from NOAA feed)"
 
-Original NOAA data: {json.dumps(assessment.input_data, default=str, indent=2)}
-AI Assessment: {json.dumps(assessment.model_output, default=str, indent=2)}
+    output = assessment.model_output or {}
+    if isinstance(output, dict):
+        recommended_actions = output.get("recommended_actions", [])
+        if isinstance(recommended_actions, list):
+            actions_text = "\n".join(f"  - {act}" for act in recommended_actions[:5]) or "  (none provided)"
+        else:
+            actions_text = f"  {str(recommended_actions)[:300]}"
+    else:
+        actions_text = "  (not available)"
 
-Score each dimension 0-100:
-- accuracy: Does risk level match the temperature/DHW data?
-- specificity: Is this specific to this reef or generic?
-- actionability: Score 80+ ONLY when recommended_actions contains specific named parties (dive operators, AIMS, local rangers, government agencies), specific timeframes (within 24h, within 72h, this week), specific locations within the reef, AND specific measurable actions (deploy X loggers, conduct Y surveys, notify Z organizations). Score below 40 when actions contain generic phrases like "monitor conditions", "increase awareness", "continue monitoring" without specifics, or any action that could apply to ANY reef anywhere.
-- scientific_reliability: Are NOAA thresholds correctly applied? Use DHW >4 = Alert Level 1 and DHW >8 = Alert Level 2.
-- dhw_interpretation: Is DHW value correctly interpreted?
-- uncertainty_communication: Are data gaps acknowledged?
-- hallucination_avoidance: No invented data beyond input?
+    return f"""You are evaluating a coral reef AI assessment for quality.
+
+CRITICAL PRINCIPLE: Evaluate MODEL REASONING QUALITY, not data availability.
+Missing NOAA data is a data infrastructure limitation, NOT an AI failure.
+
+NOAA INPUT DATA:
+{json.dumps(assessment.input_data, default=str, indent=2)}
+Note: {dhw_note}
+
+AI ASSESSMENT OUTPUT:
+{json.dumps(assessment.model_output, default=str, indent=2)}
+
+RECOMMENDED ACTIONS:
+{actions_text}
+
+Score each dimension 0-100 using these graduated scales:
+
+accuracy: Does risk level match the available data?
+  80-100: Risk level perfectly matches SST/DHW data (DHW>8→critical, DHW 4-8→warning, DHW<4→safe)
+  60-79: Risk level mostly correct with minor misestimation
+  40-59: Risk level partially mismatched
+  0-39: Risk level directly contradicts the data — only if DHW is available and ignored
+
+specificity: Is this specific to this reef or generic?
+  76-100: References exact reef name, exact NOAA values, location-relevant factors
+  51-75: Mostly specific with some generic elements
+  26-50: Mix of specific and generic content
+  0-25: Completely generic — could apply to any reef
+
+actionability: Quality of recommended_actions:
+  76-100: Names specific parties, timeframes, and measurable steps
+  51-75: Practical and relevant; specifies what to do even without named parties
+  26-50: Basic but applicable (conduct surveys, increase monitoring frequency)
+  0-25: Vague platitudes only ("stay informed", "be aware") OR no actions at all
+  *** Hard zero ONLY when: no actions exist, or all are completely unusable ***
+
+scientific_reliability: Are scientific thresholds correctly applied?
+  DHW >8 = Alert Level 2, DHW 4-8 = Alert Level 1, DHW <4 = no alert
+  80-100: All thresholds correctly applied with appropriate uncertainty language
+  50-79: Mostly correct; minor threshold misapplication acceptable
+  0-49: Major scientific errors (e.g., "safe" assessment when DHW=9)
+
+dhw_interpretation: How well was DHW interpreted?
+  IF DHW IS AVAILABLE: score on whether the value was correctly contextualized (80-100 = cited + threshold)
+  IF DHW IS UNAVAILABLE:
+    65-80: AI explicitly stated DHW is unavailable and limited precision accordingly
+    40-64: AI noted general data limitations without naming DHW specifically
+    20-39: AI gave confident assessment without acknowledging the DHW gap
+    0-19: AI fabricated a DHW value (hallucination)
+  *** DO NOT give 0 simply because DHW data was unavailable ***
+
+uncertainty_communication: Are data gaps and limitations communicated?
+  76-100: Names missing fields, qualifies conclusions, uses hedging language
+  51-75: Acknowledges uncertainty in general terms
+  26-50: Minimal hedging; some awareness of limitations
+  0-25: States conclusions as facts when data is incomplete; no uncertainty acknowledged
+
+hallucination_avoidance: Does the AI avoid fabricating data?
+  80-100: Only references provided data; extrapolations clearly labeled as inference
+  60-79: Mostly grounded; minor scientifically-reasonable interpretive leaps
+  0-59: Invents specific values, events, or conditions not in the input
 
 Return JSON only:
 {{
@@ -1733,6 +2418,9 @@ Return JSON only:
   "dhw_interpretation": 0,
   "uncertainty_communication": 0,
   "hallucination_avoidance": 0,
+  "reasoning": "2-3 sentence explanation of the scores",
+  "positive_signals": ["strength 1", "strength 2"],
+  "penalties": ["issue 1", "issue 2"],
   "main_weaknesses": ["weakness 1", "weakness 2"],
   "improvement_suggestion": "specific prompt change needed"
 }}
@@ -1749,48 +2437,213 @@ def build_batch_judge_prompt(assessments: "List[AssessmentForImprovement]") -> s
                 noaa = json.loads(noaa)
             except Exception:
                 noaa = {}
-        sst = inp.get("seaSurfaceTemp") or noaa.get("seaSurfaceTemp") or inp.get("sst") or "?"
-        dhw = inp.get("degreeHeatingWeeks") or noaa.get("degreeHeatingWeeks") or inp.get("dhw") or "?"
-        anomaly = inp.get("tempAnomaly") or noaa.get("tempAnomaly") or inp.get("sst_anomaly") or "?"
-        alert = inp.get("bleachingAlertLevel") or noaa.get("bleachingAlertLevel") or inp.get("alert_level") or "?"
-        if isinstance(a.model_output, dict):
-            output_text = a.model_output.get("analysis", a.model_output.get("summary", str(a.model_output)))[:200]
-        elif isinstance(a.model_output, str):
-            output_text = a.model_output[:200]
+        sst = inp.get("seaSurfaceTemp") or noaa.get("seaSurfaceTemp") or inp.get("sst")
+        dhw = inp.get("degreeHeatingWeeks") or noaa.get("degreeHeatingWeeks") or inp.get("dhw")
+        anomaly = inp.get("tempAnomaly") or noaa.get("tempAnomaly") or inp.get("sst_anomaly")
+        alert = inp.get("bleachingAlertLevel") or noaa.get("bleachingAlertLevel") or inp.get("alert_level")
+
+        missing = []
+        if sst is None: missing.append("SST")
+        if dhw is None: missing.append("DHW")
+        if anomaly is None: missing.append("anomaly")
+        data_note = f"[MISSING: {', '.join(missing)}]" if missing else "[all fields available]"
+
+        sst_str = f"{sst}°C" if sst is not None else "unavailable"
+        dhw_str = f"{dhw} wk" if dhw is not None else "UNAVAILABLE"
+        anomaly_str = f"{anomaly}°C" if anomaly is not None else "unavailable"
+        alert_str = str(alert) if alert is not None else "none"
+
+        output = a.model_output or {}
+        if isinstance(output, dict):
+            risk_score = output.get("risk_score")
+            risk_level = output.get("risk_level") or output.get("status")
+            confidence = output.get("confidence")
+            threat_summary = (output.get("threat_summary") or output.get("summary") or "")[:300]
+            historical_context = str(output.get("historical_context") or "")[:200]
+            recommended_actions = output.get("recommended_actions", [])
+            if isinstance(recommended_actions, list):
+                actions_text = "\n".join(f"    - {act}" for act in recommended_actions[:5]) or "    (none provided)"
+            else:
+                actions_text = f"    {str(recommended_actions)[:300]}"
         else:
-            output_text = ""
+            risk_score = None; risk_level = None; confidence = None
+            threat_summary = str(output)[:300]; historical_context = ""; actions_text = "    (not available)"
+
         items.append(
-            f"Assessment {i+1} — {a.reef_name}:\n"
-            f"  SST={sst}°C, DHW={dhw}wk, anomaly={anomaly}°C, alert={alert}\n"
-            f"  Analysis: {output_text}"
+            f"--- Assessment {i+1}: {a.reef_name} ---\n"
+            f"NOAA DATA {data_note}:\n"
+            f"  SST={sst_str}, DHW={dhw_str}, Anomaly={anomaly_str}, Alert={alert_str}\n"
+            f"AI OUTPUT:\n"
+            f"  Risk score={risk_score}, Risk level={risk_level}, Confidence={confidence}\n"
+            f"  Threat summary: {threat_summary}\n"
+            f"  Historical context: {historical_context}\n"
+            f"  Recommended actions:\n{actions_text}"
         )
 
     assessments_text = "\n\n".join(items)
     n = len(assessments)
 
-    return f"""You are evaluating coral reef AI assessments for quality. Score each on 7 dimensions (0-100).
+    return f"""You are a scientific evaluator scoring coral reef AI assessments on 7 dimensions (0-100).
+
+CRITICAL PRINCIPLE: Evaluate MODEL REASONING QUALITY, not data availability.
+Missing NOAA data (SST, DHW, anomaly) is a data infrastructure limitation, NOT an AI failure.
+The AI earns high scores by correctly reasoning with the data that IS available.
 
 {assessments_text}
 
-Return a JSON array with exactly {n} objects (one per assessment):
-[{{"accuracy":0,"specificity":0,"actionability":0,"scientific_reliability":0,"dhw_interpretation":0,"uncertainty_communication":0,"hallucination_avoidance":0,"main_weaknesses":["weakness"],"improvement_suggestion":"change needed"}}]
+SCORING RUBRIC (apply to each assessment independently):
 
-Scoring rules:
-- accuracy: Does risk level match SST/DHW data?
-- specificity: Is this specific to this reef, not generic?
-- actionability: 80+ only when actions name specific parties, timeframes, locations, and measurable steps. Below 40 for generic phrases like "monitor conditions" or "continue monitoring".
-- scientific_reliability: DHW >4 = Alert Level 1, DHW >8 = Alert Level 2.
-- dhw_interpretation: Is DHW value correctly interpreted?
-- uncertainty_communication: Are data gaps acknowledged?
-- hallucination_avoidance: No invented data beyond input?
+accuracy (0-100): Does risk level match available data?
+  80-100: Risk level perfectly matches DHW/SST (DHW>8→critical, DHW 4-8→warning, DHW<4→safe)
+  60-79: Mostly correct with minor over/under-estimation
+  40-59: Partial mismatch with data
+  0-39: Risk level directly contradicts the data (only if DHW/SST is available and was ignored)
 
-Return the JSON array only, no explanation."""
+specificity (0-100): Is this assessment specific to this reef?
+  76-100: References exact reef name, exact NOAA values, location-specific factors
+  51-75: Mostly specific with some generic elements
+  26-50: Mix of specific and generic content
+  0-25: Completely generic; could apply to any reef anywhere
+
+actionability (0-100): Quality of recommended actions:
+  76-100: Names specific parties (AIMS, local rangers, dive operators), specific timeframes, measurable steps
+  51-75: Practical and relevant; specifies what to do even without named parties
+  26-50: Basic but applicable actions (conduct surveys, increase monitoring frequency)
+  0-25: Only vague platitudes ("stay informed", "continue monitoring") OR no actions provided at all
+  *** HARD ZERO only when: no recommended_actions at all, OR every action is completely unusable ***
+  *** Do NOT give 0 simply because actions lack named parties or timeframes ***
+
+scientific_reliability (0-100): Are scientific thresholds correctly applied?
+  DHW>8 = Alert Level 2 (high bleaching risk), DHW 4-8 = Alert Level 1 (watch), DHW<4 = no alert
+  SST anomaly >1°C = elevated stress, >2°C = high stress
+  80-100: All thresholds correctly applied; appropriate uncertainty stated
+  50-79: Mostly correct; minor threshold errors acceptable
+  0-49: Major scientific errors (e.g., "safe" when DHW=9)
+
+dhw_interpretation (0-100): How well was DHW interpreted?
+  IF DHW IS AVAILABLE: score whether the exact value was correctly contextualized
+    80-100: DHW value cited and compared against Alert Level thresholds
+    50-79: DHW acknowledged but imprecisely contextualized
+    0-49: DHW value ignored or grossly misinterpreted
+  IF DHW IS UNAVAILABLE ("UNAVAILABLE" above):
+    65-80: AI explicitly stated DHW unavailability and qualified conclusions accordingly
+    40-64: AI noted general data limitations without naming DHW specifically
+    20-39: AI gave confident conclusions without acknowledging the major gap
+    0-19: AI fabricated a DHW value (hallucination) — the ONLY valid reason for very low score here
+  *** DO NOT score below 40 simply because DHW data was missing from NOAA ***
+
+uncertainty_communication (0-100): Are data gaps and limitations communicated?
+  76-100: Names missing fields explicitly; qualifies conclusions; uses hedging language
+  51-75: Acknowledges uncertainty in general terms; some qualification
+  26-50: Minimal hedging; some awareness of limitations
+  0-25: States conclusions as certain facts when data is incomplete; zero acknowledgment
+
+hallucination_avoidance (0-100): Does the AI avoid fabricating data beyond input?
+  80-100: Only references provided data; extrapolations clearly labeled as inference
+  60-79: Mostly grounded; minor scientifically-reasonable interpretive leaps
+  0-59: Invents specific values, events, or conditions not present in the input
+
+Return a JSON array with exactly {n} objects (one per assessment, in order):
+[{{
+  "accuracy": 0,
+  "specificity": 0,
+  "actionability": 0,
+  "scientific_reliability": 0,
+  "dhw_interpretation": 0,
+  "uncertainty_communication": 0,
+  "hallucination_avoidance": 0,
+  "reasoning": "2-3 sentence explanation of these specific scores",
+  "positive_signals": ["strength 1", "strength 2"],
+  "penalties": ["issue 1", "issue 2"],
+  "main_weaknesses": ["weakness 1", "weakness 2"],
+  "improvement_suggestion": "specific prompt change needed"
+}}]
+
+Return the JSON array only, no additional text."""
 
 
 def average_score(judgements: List[Dict[str, Any]], key: str) -> float:
     if not judgements:
         return 0.0
     return round(sum(float(item[key]) for item in judgements) / len(judgements), 3)
+
+
+def _format_diagnosis(failing_dims: Dict[str, float], causes: Dict[str, str], data_gap_likely: bool) -> str:
+    if not failing_dims:
+        return "All dimensions meet threshold — no rewrite needed."
+    parts = [f"{dim}={score:.0%} ({causes.get(dim, 'unknown')})" for dim, score in failing_dims.items()]
+    summary = "; ".join(parts)
+    if data_gap_likely:
+        summary += " [note: some low scores may be due to missing NOAA data, not model reasoning]"
+    return summary
+
+
+def diagnose_root_cause(
+    judgements: List[Dict[str, Any]],
+    assessments: List[Any],
+    dim_averages: Dict[str, float],
+) -> Dict[str, Any]:
+    """Analyze why quality scores are low to inform targeted, surgical prompt rewrites.
+
+    Returns a diagnosis dict with failing_dimensions, likely causes, and whether a rewrite
+    is warranted (i.e., there are model-reasoning failures beyond data-gap issues).
+    """
+    FAILING_THRESHOLD = 0.60
+    failing_dims = {k: v for k, v in dim_averages.items() if v < FAILING_THRESHOLD}
+
+    # Detect how many assessments are missing DHW — a common cause of artificially low scores
+    missing_dhw_count = 0
+    for a in assessments:
+        inp = getattr(a, "input_data", None) or {}
+        noaa = inp.get("noaa") or {}
+        if isinstance(noaa, str):
+            try:
+                noaa = json.loads(noaa)
+            except Exception:
+                noaa = {}
+        dhw = inp.get("degreeHeatingWeeks") or noaa.get("degreeHeatingWeeks") or inp.get("dhw")
+        if dhw is None:
+            missing_dhw_count += 1
+
+    data_gap_likely = missing_dhw_count > 0 and missing_dhw_count >= len(assessments) / 2
+
+    causes: Dict[str, str] = {}
+    for dim in failing_dims:
+        if dim == "dhw_interpretation" and data_gap_likely:
+            causes[dim] = "missing_noaa_dhw_data"
+        elif dim == "actionability":
+            causes[dim] = "prompt_lacks_specificity_guidance"
+        elif dim == "specificity":
+            causes[dim] = "prompt_produces_generic_output"
+        elif dim in ("accuracy", "scientific_reliability"):
+            causes[dim] = "prompt_lacks_threshold_guidance"
+        elif dim == "uncertainty_communication":
+            causes[dim] = "prompt_lacks_uncertainty_language"
+        elif dim == "hallucination_avoidance":
+            causes[dim] = "prompt_allows_extrapolation"
+        else:
+            causes[dim] = "unknown"
+
+    data_gap_dims = [d for d, c in causes.items() if c == "missing_noaa_dhw_data"]
+    model_reasoning_dims = [d for d, c in causes.items() if c != "missing_noaa_dhw_data"]
+
+    all_penalties: List[str] = []
+    for j in judgements:
+        all_penalties.extend(j.get("penalties", []))
+
+    return {
+        "failing_dimensions": list(failing_dims.keys()),
+        "failing_scores": failing_dims,
+        "dimension_causes": causes,
+        "data_gap_likely": data_gap_likely,
+        "missing_dhw_count": missing_dhw_count,
+        "total_assessments": len(assessments),
+        "data_gap_dimensions": data_gap_dims,
+        "model_reasoning_dimensions": model_reasoning_dims,
+        "rewrite_warranted": len(model_reasoning_dims) >= 1,
+        "collected_penalties": all_penalties[:10],
+        "diagnosis_summary": _format_diagnosis(failing_dims, causes, data_gap_likely),
+    }
 
 
 def is_valid_improved_prompt(new_prompt: str, old_prompt: str = "") -> bool:
@@ -1831,23 +2684,109 @@ def _summarize_prompt_changes(old_prompt: str, new_prompt: str) -> str:
     )
 
 
-def build_improvement_prompt(current_prompt: str, feedback: Dict[str, Any]) -> str:
-    return f"""
-Current system prompt for reef analysis:
+def build_improvement_prompt(
+    current_prompt: str,
+    feedback: Dict[str, Any],
+    diagnosis: Optional[Dict[str, Any]] = None,
+    phoenix_failure_modes: Optional[List[Dict[str, Any]]] = None,
+    prior_rejections: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    model_dims = (diagnosis or {}).get("model_reasoning_dimensions", [])
+    diagnosis_summary = (diagnosis or {}).get("diagnosis_summary", "General quality issues detected.")
+
+    target_instructions: List[str] = []
+    for dim in model_dims:
+        if dim == "actionability":
+            target_instructions.append(
+                "STRENGTHEN the recommended_actions section: require the AI to name specific "
+                "stakeholders (e.g., 'notify AIMS monitoring team', 'alert local dive operators'), "
+                "include timeframes ('within 24 hours', 'this week'), and specify measurable steps "
+                "('deploy temperature loggers', 'conduct bleaching survey'). "
+                "The prompt must explicitly prohibit vague actions like 'monitor conditions' without specifics."
+            )
+        elif dim == "specificity":
+            target_instructions.append(
+                "STRENGTHEN specificity requirements: the AI must reference the exact reef name, "
+                "the exact NOAA values provided, and consider location-specific ecological factors. "
+                "Generic statements that could apply to any reef anywhere must be prohibited."
+            )
+        elif dim in ("accuracy", "scientific_reliability"):
+            target_instructions.append(
+                "STRENGTHEN threshold guidance: explicitly state DHW >8 = Alert Level 2 (high bleaching risk), "
+                "DHW 4-8 = Alert Level 1 (bleaching watch), DHW <4 = no alert. "
+                "SST anomaly >1°C = elevated stress, >2°C = high stress. "
+                "The assigned risk level must directly match these thresholds."
+            )
+        elif dim == "uncertainty_communication":
+            target_instructions.append(
+                "STRENGTHEN uncertainty language: when any NOAA field (SST, DHW, anomaly) is unavailable, "
+                "the AI must explicitly name the missing field and state how it limits assessment precision. "
+                "Required phrasing: 'Due to unavailable DHW data, bleaching risk estimates carry higher uncertainty.'"
+            )
+        elif dim == "dhw_interpretation":
+            target_instructions.append(
+                "STRENGTHEN DHW handling: when DHW is available, cite the exact value and compare against "
+                "Alert Level thresholds. When DHW is unavailable, explicitly acknowledge this and qualify "
+                "all bleaching risk conclusions accordingly — never omit mention of the data gap."
+            )
+
+    if not target_instructions:
+        target_instructions = ["Address the identified weaknesses listed below while preserving all working sections."]
+
+    target_text = "\n\n".join(f"{i+1}. {inst}" for i, inst in enumerate(target_instructions))
+
+    # Phoenix trace evidence section
+    phoenix_section = ""
+    if phoenix_failure_modes:
+        lines = [
+            f"  - {m['dimension']}: failing in {m['frequency']} production trace(s)"
+            for m in phoenix_failure_modes[:5]
+        ]
+        phoenix_section = (
+            "\n\nPHOENIX TRACE EVIDENCE (recurring failures observed across real production assessments):\n"
+            + "\n".join(lines)
+            + "\nThese dimensions appear most often in low-quality spans — prioritise them."
+        )
+
+    # Prior rejection section — tell Gemini what NOT to repeat
+    rejection_section = ""
+    if prior_rejections:
+        lines = []
+        for r in prior_rejections[:3]:
+            target = r.get("target_dims") or "general"
+            delta = r.get("delta")
+            reason = r.get("rejection_reason") or r.get("reason") or "insufficient improvement"
+            delta_str = f"{delta:+.3f}" if isinstance(delta, (int, float)) else "n/a"
+            lines.append(f"  - Targeted [{target}]: experiment delta {delta_str} — {reason}")
+        rejection_section = (
+            "\n\nPREVIOUSLY ATTEMPTED REWRITES THAT FAILED EXPERIMENT VALIDATION (do NOT repeat these approaches):\n"
+            + "\n".join(lines)
+            + "\nChoose a meaningfully different strategy for the dimensions listed above."
+        )
+
+    return f"""You are improving a coral reef AI assessment system prompt. Make targeted, surgical changes — only fix the identified weak areas. Do not rewrite sections that are already working.
+
+ROOT CAUSE DIAGNOSIS:
+{diagnosis_summary}{phoenix_section}{rejection_section}
+
+CURRENT SYSTEM PROMPT:
 {current_prompt}
 
-Weaknesses found in recent assessments:
+IDENTIFIED WEAKNESSES IN RECENT ASSESSMENTS:
 {json.dumps(feedback.get("issues", []), default=str, indent=2)}
 
-Write an improved system prompt that fixes these weaknesses.
-The prompt should:
-- Emphasize DHW thresholds (>4 = Alert 1, >8 = Alert 2)
-- Require acknowledging fallback/unavailable data
-- Require specific actionable recommendations
-- Avoid generic statements
+TARGETED CHANGES REQUIRED:
+{target_text}
 
-Return ONLY the improved prompt text, nothing else.
-"""
+CONSTRAINTS:
+- Only modify sections that address the identified weaknesses
+- Do not remove accurate DHW threshold guidance if already present
+- Do not add fabricated data or hallucinate reef-specific facts
+- Do not relax scientific accuracy requirements
+- Preserve the overall structure and any sections that are already working
+- The result must be a complete, usable system prompt — not a diff or patch
+
+Return ONLY the improved prompt text, nothing else."""
 
 
 def summarize_issue_list(judgements: List[Dict[str, Any]]) -> List[str]:
@@ -1863,24 +2802,40 @@ def build_improvement_summary(
     issues: List[str],
     prompt_updated: bool,
     quota_limited: bool = False,
+    diagnosis: Optional[Dict[str, Any]] = None,
 ) -> str:
-    issue_text = issues[0] if issues else "no dominant weakness was found"
+    score_pct = f"{average_overall:.0%}"
+    issue_text = issues[0] if issues else "no dominant weakness identified"
+
+    dim_note = ""
+    if diagnosis and diagnosis.get("model_reasoning_dimensions"):
+        dims = diagnosis["model_reasoning_dimensions"]
+        dim_note = f" Weakest dimensions: {', '.join(dims)}."
+
     if prompt_updated:
+        targeted = ""
+        if diagnosis and diagnosis.get("model_reasoning_dimensions"):
+            targeted = f" Targeted fix applied to: {', '.join(diagnosis['model_reasoning_dimensions'])}."
         return (
-            f"Yesterday the agent scored {average_overall:.2f} quality. "
-            f"It was weakest on: {issue_text}. The system prompt was rewritten overnight. "
-            "Future reef assessments will use the improved prompt."
+            f"Evaluation completed — quality score {score_pct}.{dim_note}"
+            f" System prompt rewritten to address identified weaknesses.{targeted}"
+            " Verification will confirm improvement in the next evaluation cycle."
         )
     if average_overall < 0.75:
+        if quota_limited:
+            return (
+                f"Evaluation completed — quality score {score_pct}.{dim_note}"
+                f" Main finding: {issue_text}."
+                " Prompt update needed but skipped — Gemini quota exhausted."
+            )
         return (
-            f"Yesterday the agent scored {average_overall:.2f} quality. "
-            f"Main finding: {issue_text}. "
-            "Prompt update was needed, but the rewrite was skipped because Gemini quota was exhausted or no safe rewrite was available."
+            f"Evaluation completed — quality score {score_pct}.{dim_note}"
+            f" Main finding: {issue_text}."
+            " Prompt preserved — rewrite conditions not met (requires model-reasoning failures, not data gaps)."
         )
     return (
-        f"Yesterday the agent scored {average_overall:.2f} quality. "
-        f"Main finding: {issue_text}. "
-        "Quality met the 0.75 threshold, so the current prompt was preserved."
+        f"Evaluation completed — quality score {score_pct}.{dim_note}"
+        " Quality meets the 0.75 threshold; current prompt preserved."
     )
 
 
@@ -1937,11 +2892,22 @@ def build_research_narrative(
     )
 
 
-def latest_self_improvement_from_disk() -> Dict[str, Any]:
-    empty = {
+def _compute_system_state(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Compute the authoritative current system state from history runs (newest-first).
+
+    Separates the latest run (which may be a skipped_healthy nightly) from the
+    latest full evaluation (non-skip with real metrics) so the dashboard always
+    shows the most recent verified quality — not a stale failed run.
+    """
+    _empty: Dict[str, Any] = {
+        "system_status": "no_data",
+        "status": None,
         "date": None,
+        "last_checked": None,
+        "last_full_eval_at": None,
         "assessment_count": 0,
         "average_score": None,
+        "quality_score": None,
         "accuracy": None,
         "specificity": None,
         "actionability": None,
@@ -1954,55 +2920,235 @@ def latest_self_improvement_from_disk() -> Dict[str, Any]:
         "quota_limited": False,
         "issues": [],
         "summary": "No self-improvement run has completed yet.",
+        "skip_reason": None,
+        "source": None,
         "before_after": {"previous_score": None, "latest_score": None},
+        "latest_verified_metrics": None,
+        "prompt_rewrite_status": "none",
+        "current_state_summary": "No evaluation has run yet.",
     }
-    try:
-        runs = json.loads(SELF_IMPROVEMENT_RUNS_PATH.read_text(encoding="utf-8"))
-        if not isinstance(runs, list) or not runs:
-            return empty
-        latest = sorted(
-            runs,
-            key=lambda run: run.get("stored_at") or run.get("completed_at") or run.get("date") or "",
-            reverse=True,
-        )[0]
-    except Exception as error:
-        print(f"[self-improvement] unable to read latest run history: {error}")
-        return empty
 
-    summary = latest.get("summary", "")
-    if latest.get("quota_limited") and (latest.get("average_score") or 0) < 0.75 and not latest.get("prompt_updated"):
-        summary = "Prompt update was needed but skipped because Gemini quota was exhausted."
-    elif (latest.get("average_score") or 1) < 0.75 and not latest.get("prompt_updated") and "quality met the threshold" in summary:
-        summary = summary.replace(
-            "The current prompt was kept because quality met the threshold or no safe rewrite was available.",
-            "Prompt update was needed but no safe rewrite was available.",
+    if not runs:
+        return _empty
+
+    latest_run = runs[0]
+
+    # Find the latest full evaluation: non-skipped, has a real numeric score.
+    latest_full_eval: Optional[Dict[str, Any]] = None
+    for run in runs:
+        if run.get("status") != "skipped_healthy" and isinstance(run.get("average_score"), (int, float)):
+            latest_full_eval = run
+            break
+
+    if latest_full_eval is None:
+        return {
+            **_empty,
+            "status": latest_run.get("status"),
+            "date": latest_run.get("date"),
+            "last_checked": latest_run.get("last_checked") or latest_run.get("completed_at"),
+            "skip_reason": latest_run.get("skip_reason"),
+            "summary": latest_run.get("summary", ""),
+            "current_state_summary": latest_run.get("summary", "No full evaluation has completed yet."),
+        }
+
+    # Find the previous full evaluation (the one before latest_full_eval).
+    prev_full_eval: Optional[Dict[str, Any]] = None
+    past_latest = False
+    for run in runs:
+        if run is latest_full_eval:
+            past_latest = True
+            continue
+        if past_latest and run.get("status") != "skipped_healthy" and isinstance(run.get("average_score"), (int, float)):
+            prev_full_eval = run
+            break
+
+    latest_score: float = float(latest_full_eval.get("average_score") or 0)
+    prompt_was_updated_in_latest: bool = bool(latest_full_eval.get("prompt_updated"))
+    latest_is_skip: bool = latest_run.get("status") == "skipped_healthy"
+    prev_score: Optional[float] = float(prev_full_eval["average_score"]) if prev_full_eval and isinstance(prev_full_eval.get("average_score"), (int, float)) else None
+
+    # latest_verified_metrics always comes from the latest non-skipped full eval.
+    latest_verified_metrics: Dict[str, Any] = {
+        "average_score": latest_full_eval.get("average_score"),
+        "accuracy": latest_full_eval.get("accuracy"),
+        "specificity": latest_full_eval.get("specificity"),
+        "actionability": latest_full_eval.get("actionability"),
+        "scientific_reliability": latest_full_eval.get("scientific_reliability"),
+        "dhw_interpretation": latest_full_eval.get("dhw_interpretation") or latest_full_eval.get("dhw_interpretation_accuracy"),
+        "dhw_interpretation_accuracy": latest_full_eval.get("dhw_interpretation_accuracy") or latest_full_eval.get("dhw_interpretation"),
+        "uncertainty_communication": latest_full_eval.get("uncertainty_communication"),
+        "hallucination_avoidance": latest_full_eval.get("hallucination_avoidance"),
+        "last_eval_at": latest_full_eval.get("last_checked") or latest_full_eval.get("completed_at") or latest_full_eval.get("date"),
+    }
+
+    # Determine prompt_rewrite_status:
+    #   "rewritten_pending"    — latest full eval rewrote the prompt (score < 0.75 triggered rewrite)
+    #   "confirmed_improved"   — previous eval rewrote prompt; latest follow-up shows score improvement
+    #   "did_not_improve"      — previous eval rewrote prompt; latest follow-up did NOT improve
+    #   "none"                 — no rewrite context
+    if prompt_was_updated_in_latest:
+        prompt_rewrite_status = "rewritten_pending"
+    elif prev_full_eval and bool(prev_full_eval.get("prompt_updated")):
+        if prev_score is not None and latest_score > prev_score:
+            prompt_rewrite_status = "confirmed_improved"
+        else:
+            prompt_rewrite_status = "did_not_improve"
+    else:
+        prompt_rewrite_status = "none"
+
+    # Determine system_status:
+    if latest_is_skip:
+        system_status = "skipped_healthy"
+    elif prompt_rewrite_status == "rewritten_pending":
+        system_status = "rewrite_pending_verification"
+    elif prompt_rewrite_status == "confirmed_improved":
+        system_status = "improved"
+    elif prompt_rewrite_status == "did_not_improve":
+        system_status = "degraded"
+    elif latest_score >= 0.75:
+        system_status = "improved" if (prev_score is not None and latest_score > prev_score) else "healthy"
+    else:
+        system_status = "degraded"
+
+    # Build human-readable current_state_summary.
+    pct = round(latest_score * 100)
+    if system_status == "skipped_healthy":
+        skip_reason_txt = latest_run.get("skip_reason", "")
+        current_state_summary = (
+            f"Latest nightly check skipped evaluation because recent quality is above the 0.75 target. "
+            f"({skip_reason_txt})" if skip_reason_txt else
+            "Latest nightly check skipped evaluation because recent quality is above the 0.75 target."
         )
+    elif system_status == "rewrite_pending_verification":
+        current_state_summary = (
+            f"A previous low-quality evaluation (score: {pct}%) triggered a prompt rewrite. "
+            "The next evaluation will confirm whether quality has recovered."
+        )
+    elif system_status == "improved" and prompt_rewrite_status == "confirmed_improved":
+        prev_pct = round((prev_score or 0) * 100)
+        if latest_score >= 0.75:
+            current_state_summary = (
+                f"A previous prompt rewrite was confirmed successful. "
+                f"Latest verified quality improved from {prev_pct}% to {pct}% — above the 0.75 target."
+            )
+        else:
+            current_state_summary = (
+                f"A previous prompt rewrite improved quality from {prev_pct}% to {pct}%, "
+                "but still below the 0.75 target."
+            )
+    elif system_status == "did_not_improve":
+        current_state_summary = (
+            f"A prompt rewrite was attempted, but the follow-up evaluation scored {pct}% — "
+            "still below the 0.75 target. Manual review may be needed."
+        )
+    elif system_status == "improved":
+        if latest_score >= 0.75:
+            current_state_summary = f"Quality improved to {pct}% — above the 0.75 target."
+        else:
+            current_state_summary = f"Quality improved to {pct}% but still below the 0.75 target."
+    elif system_status == "degraded":
+        current_state_summary = f"Latest evaluation scored {pct}% — below the 0.75 target."
+    else:
+        current_state_summary = f"System quality is {pct}% — above the 0.75 target."
 
     return {
-        "status": latest.get("status"),
-        "date": latest.get("date"),
-        "last_checked": latest.get("last_checked") or latest.get("completed_at"),
-        "skip_reason": latest.get("skip_reason"),
-        "source": latest.get("source"),
-        "assessment_count": latest.get("assessment_count", 0),
-        "average_score": latest.get("average_score"),
-        "accuracy": latest.get("accuracy"),
-        "specificity": latest.get("specificity"),
-        "actionability": latest.get("actionability"),
-        "scientific_reliability": latest.get("scientific_reliability"),
-        "dhw_interpretation": latest.get("dhw_interpretation") or latest.get("dhw_interpretation_accuracy"),
-        "dhw_interpretation_accuracy": latest.get("dhw_interpretation_accuracy") or latest.get("dhw_interpretation"),
-        "uncertainty_communication": latest.get("uncertainty_communication"),
-        "hallucination_avoidance": latest.get("hallucination_avoidance"),
-        "prompt_updated": bool(latest.get("prompt_updated")),
-        "quota_limited": bool(latest.get("quota_limited")),
-        "issues": latest.get("issues") if isinstance(latest.get("issues"), list) else [],
-        "summary": summary,
-        "before_after": latest.get("before_after") or {
-            "previous_score": None,
-            "latest_score": latest.get("average_score"),
+        "system_status": system_status,
+        "status": latest_full_eval.get("status"),
+        "date": latest_full_eval.get("date"),
+        "last_checked": latest_run.get("last_checked") or latest_run.get("completed_at"),
+        "last_full_eval_at": latest_verified_metrics["last_eval_at"],
+        "skip_reason": latest_run.get("skip_reason") if latest_is_skip else None,
+        "source": latest_run.get("source"),
+        "assessment_count": latest_full_eval.get("assessment_count", 0),
+        # Metrics always from the latest verified full evaluation:
+        "average_score": latest_verified_metrics["average_score"],
+        "quality_score": round((latest_verified_metrics["average_score"] or 0) * 100),
+        "accuracy": latest_verified_metrics["accuracy"],
+        "specificity": latest_verified_metrics["specificity"],
+        "actionability": latest_verified_metrics["actionability"],
+        "scientific_reliability": latest_verified_metrics["scientific_reliability"],
+        "dhw_interpretation": latest_verified_metrics["dhw_interpretation"],
+        "dhw_interpretation_accuracy": latest_verified_metrics["dhw_interpretation_accuracy"],
+        "uncertainty_communication": latest_verified_metrics["uncertainty_communication"],
+        "hallucination_avoidance": latest_verified_metrics["hallucination_avoidance"],
+        "prompt_updated": prompt_was_updated_in_latest,
+        "quota_limited": bool(latest_full_eval.get("quota_limited")),
+        "issues": latest_full_eval.get("issues") if isinstance(latest_full_eval.get("issues"), list) else [],
+        "summary": latest_full_eval.get("summary", ""),
+        "research_narrative": latest_full_eval.get("research_narrative"),
+        "prompt_change_summary": latest_full_eval.get("prompt_change_summary") or latest_full_eval.get("gemini_improvement_summary"),
+        "before_after": latest_full_eval.get("before_after") or {
+            "previous_score": prev_score,
+            "latest_score": latest_score,
         },
+        "latest_verified_metrics": latest_verified_metrics,
+        "prompt_rewrite_status": prompt_rewrite_status,
+        "current_state_summary": current_state_summary,
+        "stored_at": latest_full_eval.get("stored_at"),
     }
+
+
+def _restore_scores_from_history() -> None:
+    """Restore _last_self_improvement_scores from the latest verified full evaluation.
+
+    Called on startup when /tmp/last_scores.json is missing (e.g. after a Cloud Run
+    cold start) so the nightly cost-guard uses real scores, not the fake 89% baseline.
+    """
+    global _last_self_improvement_scores
+    if _last_self_improvement_scores.get("date") is not None:
+        return  # Already loaded from disk — nothing to do.
+    runs = _load_history_from_gcs(limit=10) or _load_history_from_sqlite(limit=10)
+    if not runs:
+        return
+    for run in runs:
+        if run.get("status") != "skipped_healthy" and isinstance(run.get("average_score"), (int, float)):
+            _last_self_improvement_scores = {
+                "date": run.get("date"),
+                "average_score": run.get("average_score"),
+                "quality_score": round((run.get("average_score") or 0) * 100),
+                "accuracy": run.get("accuracy"),
+                "specificity": run.get("specificity"),
+                "actionability": run.get("actionability"),
+                "scientific_reliability": run.get("scientific_reliability"),
+                "dhw_interpretation": run.get("dhw_interpretation"),
+                "dhw_interpretation_accuracy": run.get("dhw_interpretation_accuracy"),
+                "uncertainty_communication": run.get("uncertainty_communication"),
+                "hallucination_avoidance": run.get("hallucination_avoidance"),
+                "assessment_count": run.get("assessment_count", 0),
+                "prompt_updated": bool(run.get("prompt_updated")),
+                "quota_limited": bool(run.get("quota_limited")),
+                "updated_at": run.get("last_checked") or run.get("completed_at") or run.get("date"),
+                "summary": run.get("summary", ""),
+            }
+            print(f"[startup] restored scores from GCS/SQLite history: avg={run.get('average_score')} date={run.get('date')}")
+            _persist_scores_to_disk()
+            return
+
+
+def latest_self_improvement_from_disk() -> Dict[str, Any]:
+    # Load up to 10 runs so _compute_system_state can see the full rewrite/recovery context.
+    # GCS is source of truth; SQLite is local cache; JSON is local/dev fallback.
+    gcs_runs = _load_history_from_gcs(limit=10)
+    if gcs_runs:
+        return _compute_system_state(gcs_runs)
+
+    sqlite_runs = _load_history_from_sqlite(limit=10)
+    if sqlite_runs:
+        return _compute_system_state(sqlite_runs)
+
+    try:
+        runs = json.loads(SELF_IMPROVEMENT_RUNS_PATH.read_text(encoding="utf-8"))
+        if isinstance(runs, list) and runs:
+            sorted_runs = sorted(
+                runs,
+                key=lambda r: r.get("stored_at") or r.get("completed_at") or r.get("date") or "",
+                reverse=True,
+            )[:10]
+            return _compute_system_state(sorted_runs)
+    except Exception as error:
+        print(f"[self-improvement] unable to read latest run history: {error}")
+
+    return _compute_system_state([])
 
 
 @app.post("/analyze-reef")
@@ -2710,20 +3856,26 @@ async def self_improvement_status() -> Dict[str, Any]:
 @app.get("/self-improvement/history")
 @app.get("/api/self-improvement/history")
 async def self_improvement_history(limit: int = 14) -> Dict[str, Any]:
-    try:
-        runs = json.loads(SELF_IMPROVEMENT_RUNS_PATH.read_text(encoding="utf-8"))
-        if not isinstance(runs, list):
-            runs = []
-    except Exception as error:
-        print(f"[self-improvement] unable to read run history: {error}")
-        runs = []
-
     bounded_limit = max(1, min(int(limit or 14), 90))
-    history = sorted(
-        runs,
-        key=lambda run: run.get("stored_at") or run.get("completed_at") or run.get("date") or "",
-        reverse=True,
-    )[:bounded_limit]
+
+    # GCS is source of truth; fall through to SQLite then JSON for local/dev
+    history = _load_history_from_gcs(limit=bounded_limit)
+    if not history:
+        history = _load_history_from_sqlite(limit=bounded_limit)
+    if not history:
+        try:
+            runs = json.loads(SELF_IMPROVEMENT_RUNS_PATH.read_text(encoding="utf-8"))
+            if not isinstance(runs, list):
+                runs = []
+        except Exception as error:
+            print(f"[self-improvement] unable to read run history: {error}")
+            runs = []
+        history = sorted(
+            runs,
+            key=lambda run: run.get("stored_at") or run.get("completed_at") or run.get("date") or "",
+            reverse=True,
+        )[:bounded_limit]
+
     scored = [run for run in history[:7] if isinstance(run.get("average_score"), (int, float))]
     seven_day_avg = round(sum(run["average_score"] for run in scored) / len(scored), 3) if scored else None
     return {"history": history, "seven_day_avg": seven_day_avg, "count": len(history)}
@@ -2737,8 +3889,8 @@ async def run_self_improvement(payload: Optional[SelfImprovementRequest] = None)
     print("SELF_IMPROVEMENT_RUN_ROUTE_HIT", request_payload)
     started_at = utc_now()
 
-    # Skip Gemini if scores were updated < 30 minutes ago
-    if _scores_are_fresh(1800) and not request_payload.assessments:
+    # Skip Gemini if scores were updated < 30 minutes ago (bypass when autonomous cycle forces fresh run)
+    if _scores_are_fresh(1800) and not request_payload.assessments and not request_payload.force_fresh:
         cached = dict(_last_self_improvement_scores)
         cached["status"] = "cached"
         cached["cached_from"] = _last_self_improvement_scores.get("updated_at", "")
@@ -2758,7 +3910,7 @@ async def run_self_improvement(payload: Optional[SelfImprovementRequest] = None)
 
     if not request_payload.assessments:
         # Build fresh assessments from cached NOAA data (no Node.js proxy)
-        source_reefs = _cache_get(_NOAA_CACHE, "live:list") or _STATIC_LIVE_REEFS
+        source_reefs = _cache_get(_NOAA_CACHE, "live:list") or _snapshot_fallback_reefs()
         valid_reefs = [r for r in source_reefs if reef_has_real_noaa_values(r)][:3]
         if valid_reefs:
             try:
@@ -2804,7 +3956,13 @@ async def run_self_improvement(payload: Optional[SelfImprovementRequest] = None)
         return fallback
 
     # Capture the previous score before this run so we can populate before_after.
-    previous_score: Optional[float] = _last_self_improvement_scores.get("average_score")
+    # Only use a score from a real, dated run — the hardcoded default has date=None
+    # and an artificial 0.89 that would make every first real run look like a degradation.
+    previous_score: Optional[float] = (
+        _last_self_improvement_scores.get("average_score")
+        if _last_self_improvement_scores.get("date") is not None
+        else None
+    )
 
     judgements: List[Dict[str, Any]] = []
     errors: List[str] = []
@@ -2901,11 +4059,68 @@ async def run_self_improvement(payload: Optional[SelfImprovementRequest] = None)
         prompt_updated = False
         backup_path: Optional[str] = None
         improvement_summary = ""
+        diagnosis: Optional[Dict[str, Any]] = None
 
-        if judgements and average_overall < 0.75 and quota_limited:
+        # ── Root cause analysis ────────────────────────────────────────────────────
+        # Run diagnosis before deciding whether to rewrite. This separates genuine
+        # model-reasoning failures from data-gap issues (missing NOAA DHW/SST) that
+        # should not trigger a prompt rewrite.
+        if judgements:
+            dim_averages = {
+                "accuracy": average_accuracy,
+                "specificity": average_specificity,
+                "actionability": average_actionability,
+                "scientific_reliability": average_scientific_reliability,
+                "uncertainty_communication": average_uncertainty_communication,
+                "dhw_interpretation": average_dhw_interpretation,
+                "hallucination_avoidance": average_hallucination_avoidance,
+            }
+            diagnosis = diagnose_root_cause(judgements, assessments, dim_averages)
+            print(f"[self-improvement] diagnosis: {diagnosis['diagnosis_summary']}")
+            print(f"[self-improvement] model_reasoning_dims={diagnosis['model_reasoning_dimensions']} "
+                  f"data_gap_dims={diagnosis['data_gap_dimensions']} "
+                  f"rewrite_warranted={diagnosis['rewrite_warranted']}")
+
+        # Cooldown: if the previous run already rewrote the prompt, skip this cycle
+        # to allow at least one verification run before stacking another rewrite.
+        last_run_was_rewrite = (
+            bool(_last_self_improvement_scores.get("prompt_updated", False))
+            and _last_self_improvement_scores.get("date") is not None
+        )
+
+        # Rewrite is warranted when:
+        #   1. Quality is below threshold
+        #   2. Root cause analysis finds model-reasoning failures (not just data gaps)
+        #   3. The previous run was not also a rewrite (cooldown)
+        rewrite_needed = (
+            judgements
+            and average_overall < 0.75
+            and diagnosis is not None
+            and diagnosis["rewrite_warranted"]
+            and not last_run_was_rewrite
+        )
+
+        if request_payload.skip_rewrite:
+            # Evaluation-only mode: prompt generation and promotion are handled by the
+            # autonomous experiment pipeline which runs baseline vs candidate before committing.
+            improvement_summary = "Evaluation only — rewrite handled by experiment pipeline."
+            print("[self-improvement] skip_rewrite=True: evaluation complete, rewrite deferred to autonomous cycle")
+        elif rewrite_needed and quota_limited:
             rewrite_failed_due_to_quota = True
-            improvement_summary = "Prompt update was needed but skipped because Gemini quota was exhausted."
-        elif judgements and average_overall < 0.75:
+            improvement_summary = "Prompt update needed but skipped — Gemini quota exhausted."
+        elif last_run_was_rewrite and average_overall < 0.75:
+            improvement_summary = (
+                "Verification cycle — evaluating the previous rewrite. "
+                "Another rewrite will not be triggered until this cycle completes."
+            )
+            print("[self-improvement] cooldown: skipping rewrite — previous run already rewrote the prompt")
+        elif judgements and average_overall < 0.75 and diagnosis and not diagnosis["rewrite_warranted"]:
+            improvement_summary = (
+                f"Quality below threshold but failing dimensions ({', '.join(diagnosis.get('data_gap_dimensions', []))}) "
+                "are attributable to missing NOAA data, not model reasoning. Prompt preserved."
+            )
+            print(f"[self-improvement] skipping rewrite — low scores caused by data gaps: {diagnosis['data_gap_dimensions']}")
+        elif rewrite_needed:
             current_prompt = load_reef_analysis_prompt()
             feedback = {
                 "average_accuracy": average_accuracy,
@@ -2916,10 +4131,11 @@ async def run_self_improvement(payload: Optional[SelfImprovementRequest] = None)
                 "improvement_suggestions": suggestions,
                 "sample_judgements": judgements[:5],
             }
+            print(f"[self-improvement] triggering targeted rewrite for dims: {diagnosis['model_reasoning_dimensions']}")
 
             try:
                 improved_prompt = generate_text_with_retry(
-                    build_improvement_prompt(current_prompt, feedback),
+                    build_improvement_prompt(current_prompt, feedback, diagnosis),
                     prompt_template_name="reef_prompt_improvement_v1",
                 ).strip()
                 improved_prompt = re.sub(r"^```(?:text)?|```$", "", improved_prompt).strip()
@@ -2927,11 +4143,12 @@ async def run_self_improvement(payload: Optional[SelfImprovementRequest] = None)
                 if is_valid_improved_prompt(improved_prompt):
                     backup_path = backup_and_save_reef_prompt(improved_prompt)
                     prompt_updated = True
-                    improvement_summary = "Prompt rewritten with stronger DHW/SST threshold reasoning, action guidance, and uncertainty language."
+                    targeted_dims = ", ".join(diagnosis["model_reasoning_dimensions"]) or "general quality"
+                    improvement_summary = f"Prompt rewritten targeting: {targeted_dims}."
                     span.add_event("reef_analysis_prompt_updated")
                     print(f"[self-improvement] prompt updated; backup={backup_path}")
                 else:
-                    improvement_summary = "Gemini proposed a prompt, but validation rejected it; current prompt was preserved."
+                    improvement_summary = "Gemini proposed a prompt but validation rejected it; current prompt preserved."
                     span.add_event("reef_analysis_prompt_rejected")
                     print("[self-improvement] improved prompt rejected by validation")
             except Exception as error:
@@ -2940,20 +4157,20 @@ async def run_self_improvement(payload: Optional[SelfImprovementRequest] = None)
                 if is_quota_error(error):
                     quota_limited = True
                     rewrite_failed_due_to_quota = True
-                    improvement_summary = "Prompt update was needed but skipped because Gemini quota was exhausted."
+                    improvement_summary = "Prompt update needed but skipped — Gemini quota exhausted."
                     span.add_event("gemini_quota_limited_during_prompt_rewrite")
                 else:
-                    improvement_summary = "Prompt improvement failed; current prompt was preserved."
+                    improvement_summary = "Prompt improvement failed; current prompt preserved."
                 print(f"[self-improvement] {message}")
         elif not judgements:
-            improvement_summary = "No assessments were successfully judged; current prompt was preserved."
+            improvement_summary = "No assessments were successfully judged; current prompt preserved."
         else:
-            improvement_summary = "Quality met the 0.75 threshold; current prompt was preserved."
+            improvement_summary = "Quality met the 0.75 threshold; current prompt preserved."
 
         if rewrite_failed_due_to_quota:
-            summary = "Prompt update was needed but skipped because Gemini quota was exhausted."
+            summary = "Prompt update needed but skipped — Gemini quota exhausted."
         else:
-            summary = build_improvement_summary(average_overall, issues, prompt_updated, quota_limited)
+            summary = build_improvement_summary(average_overall, issues, prompt_updated, quota_limited, diagnosis)
         if improvement_summary and not prompt_updated and not rewrite_failed_due_to_quota:
             summary = f"{summary} {improvement_summary}"
 
@@ -2967,8 +4184,23 @@ async def run_self_improvement(payload: Optional[SelfImprovementRequest] = None)
         )
 
         run_completed_at = utc_now()
+        # Status reflects actual score direction so the dashboard can display honestly.
+        # "improved"  = quality score went UP vs previous run
+        # "degraded"  = quality score went DOWN vs previous run
+        # "completed" = no comparable previous score (first run, or previous was None)
+        # prompt_updated is carried as a separate boolean field.
+        if previous_score is not None and average_overall is not None:
+            if average_overall > previous_score:
+                _run_status = "improved"
+            elif average_overall < previous_score:
+                _run_status = "degraded"
+            else:
+                _run_status = "completed"
+        else:
+            _run_status = "completed"
+
         result = {
-            "status": "improved" if prompt_updated else "completed",
+            "status": _run_status,
             "date": run_date,
             "last_checked": run_completed_at,
             "assessment_count": len(assessments),
@@ -2989,6 +4221,10 @@ async def run_self_improvement(payload: Optional[SelfImprovementRequest] = None)
             "main_weaknesses": issues,
             "improvement_suggestions": suggestions,
             "research_narrative": research_narrative,
+            "diagnosis": diagnosis,
+            "rewrite_reason": (
+                ", ".join(diagnosis["model_reasoning_dimensions"]) if diagnosis and diagnosis.get("model_reasoning_dimensions") else None
+            ),
             "before_after": {
                 "previous_score": previous_score,
                 "latest_score": average_overall,
@@ -3045,6 +4281,20 @@ async def run_self_improvement(payload: Optional[SelfImprovementRequest] = None)
             }
             _persist_scores_to_disk()
             _save_run_to_history(result)
+
+            # Phase 1: Automatically grow benchmark dataset from production evaluations.
+            # Each judged assessment becomes a benchmark case for future experiments.
+            if _gcs_enabled() and len(judgements) == len(assessments):
+                try:
+                    new_cases = [
+                        _extract_benchmark_case(assessments[i], judgements[i])
+                        for i in range(len(judgements))
+                    ]
+                    saved = _append_benchmark_cases_to_gcs(new_cases)
+                    if saved:
+                        print(f"[benchmark] collected {saved} new cases from this evaluation run")
+                except Exception as bm_err:
+                    print(f"[benchmark] case collection failed (non-fatal): {bm_err}")
         else:
             # No judgements — merge cached scores into result so the dashboard always shows values
             for key in ["accuracy", "specificity", "actionability", "scientific_reliability",
@@ -3053,6 +4303,992 @@ async def run_self_improvement(payload: Optional[SelfImprovementRequest] = None)
                 if result.get(key) in (None, 0.0) and _last_self_improvement_scores.get(key) is not None:
                     result[key] = _last_self_improvement_scores[key]
         return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  PRODUCTION EVALUATION SYSTEM — Phases 1-8
+#  Arize-powered autonomous evaluation, experiment validation, and promotion
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── Phase 1: Benchmark Dataset ─────────────────────────────────────────────
+
+def _gcs_bucket_client() -> Optional[Any]:
+    """Return GCS Bucket for the self-improvement bucket, or None."""
+    if not SELF_IMPROVEMENT_GCS_BUCKET:
+        return None
+    try:
+        from google.cloud import storage as _gcs
+        return _gcs.Client().bucket(SELF_IMPROVEMENT_GCS_BUCKET)
+    except Exception as e:
+        print(f"[eval-system] GCS bucket init failed: {e}")
+        return None
+
+
+def _extract_benchmark_case(
+    assessment: "AssessmentForImprovement",
+    judgement: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Convert a real production assessment + its judge scores into a benchmark case.
+
+    Derives expected_behavior purely from NOAA data — never from model output —
+    so the benchmark cannot be contaminated by the prompt being evaluated.
+    """
+    inp = assessment.input_data or {}
+    noaa = inp.get("noaa") or {}
+    if isinstance(noaa, str):
+        try:
+            noaa = json.loads(noaa)
+        except Exception:
+            noaa = {}
+    sst = inp.get("seaSurfaceTemp") or noaa.get("seaSurfaceTemp") or inp.get("sst")
+    dhw = inp.get("degreeHeatingWeeks") or noaa.get("degreeHeatingWeeks") or inp.get("dhw")
+    anomaly = inp.get("tempAnomaly") or noaa.get("tempAnomaly") or inp.get("sst_anomaly")
+    alert = inp.get("bleachingAlertLevel") or noaa.get("bleachingAlertLevel") or inp.get("alert_level")
+    coords = inp.get("coordinates") or {}
+
+    # Expected behavior derived from NOAA data — not from model output
+    if isinstance(dhw, (int, float)):
+        if dhw >= 8:
+            expected_risk = "critical"
+        elif dhw >= 4:
+            expected_risk = "warning"
+        else:
+            expected_risk = "safe"
+    elif isinstance(sst, (int, float)) and isinstance(anomaly, (int, float)) and anomaly >= 2:
+        expected_risk = "warning"
+    else:
+        expected_risk = "unknown"
+
+    case_id = hashlib.sha256(
+        f"{assessment.reef_name}:{assessment.trace_id}:{assessment.timestamp}".encode()
+    ).hexdigest()[:16]
+
+    return {
+        "case_id": case_id,
+        "input": {
+            "reef_name": assessment.reef_name,
+            "sst": sst,
+            "anomaly": anomaly,
+            "dhw": dhw,
+            "alert_level": alert,
+            "lat": coords.get("lat"),
+            "lng": coords.get("lng"),
+        },
+        "expected_behavior": {
+            "risk_level": expected_risk,
+            "should_mention_dhw_threshold": isinstance(dhw, (int, float)) and dhw >= 4,
+            "should_acknowledge_data_gaps": dhw is None or sst is None,
+            "should_cite_dhw_value": dhw is not None,
+        },
+        "reef_context": coords,
+        "evaluation_type": "reef_assessment",
+        "created_from_trace": assessment.trace_id,
+        "source": "production_trace",
+        "reference_scores": {
+            k: judgement.get(k)
+            for k in ["accuracy", "specificity", "actionability", "scientific_reliability",
+                      "dhw_interpretation", "uncertainty_communication", "hallucination_avoidance", "overall"]
+        },
+        "timestamp": assessment.timestamp or utc_now(),
+    }
+
+
+def _append_benchmark_cases_to_gcs(cases: List[Dict[str, Any]]) -> int:
+    """Append new cases to the benchmark JSONL in GCS. Returns count actually saved."""
+    if not cases:
+        return 0
+    bucket = _gcs_bucket_client()
+    if bucket is None:
+        return 0
+    try:
+        blob = bucket.blob(_GCS_BENCHMARK_OBJECT)
+        existing_ids: set = set()
+        existing_text = ""
+        try:
+            existing_text = blob.download_as_text(encoding="utf-8")
+            for line in existing_text.strip().splitlines():
+                try:
+                    existing_ids.add(json.loads(line)["case_id"])
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        new_lines = [
+            json.dumps(c, default=str)
+            for c in cases
+            if c.get("case_id") not in existing_ids
+        ]
+        if not new_lines:
+            return 0
+
+        combined = (existing_text.rstrip("\n") + "\n" + "\n".join(new_lines) + "\n").lstrip("\n")
+        blob.upload_from_string(combined.encode("utf-8"), content_type="application/jsonl")
+        print(f"[benchmark] +{len(new_lines)} cases saved to GCS (total ~{len(existing_ids) + len(new_lines)})")
+        return len(new_lines)
+    except Exception as e:
+        print(f"[benchmark] GCS append failed: {e}")
+        return 0
+
+
+def _load_benchmark_cases_from_gcs(limit: int = 50) -> List[Dict[str, Any]]:
+    """Load the most recent benchmark cases from GCS JSONL."""
+    bucket = _gcs_bucket_client()
+    if bucket is None:
+        return []
+    try:
+        blob = bucket.blob(_GCS_BENCHMARK_OBJECT)
+        if not blob.exists():
+            return []
+        text = blob.download_as_text(encoding="utf-8")
+        cases = []
+        for line in text.strip().splitlines():
+            try:
+                cases.append(json.loads(line))
+            except Exception:
+                pass
+        return cases[-limit:]
+    except Exception as e:
+        print(f"[benchmark] GCS load failed: {e}")
+        return []
+
+
+def _count_benchmark_cases_gcs() -> int:
+    """Return the number of benchmark cases stored in GCS."""
+    bucket = _gcs_bucket_client()
+    if bucket is None:
+        return 0
+    try:
+        blob = bucket.blob(_GCS_BENCHMARK_OBJECT)
+        if not blob.exists():
+            return 0
+        text = blob.download_as_text(encoding="utf-8")
+        return sum(1 for line in text.strip().splitlines() if line.strip())
+    except Exception:
+        return 0
+
+
+# ── Phase 3: Versioned Prompt Store ────────────────────────────────────────
+
+def _load_active_prompt_version() -> Dict[str, Any]:
+    """Load active prompt metadata from GCS. Falls back to local file as v1."""
+    bucket = _gcs_bucket_client()
+    if bucket is not None:
+        try:
+            blob = bucket.blob(_GCS_PROMPTS_ACTIVE)
+            if blob.exists():
+                data = json.loads(blob.download_as_text(encoding="utf-8"))
+                if isinstance(data, dict) and data.get("version"):
+                    return data
+        except Exception as e:
+            print(f"[prompts] GCS active prompt load failed: {e}")
+    return {
+        "version": "v1",
+        "content": load_reef_analysis_prompt(),
+        "deployed_at": None,
+        "experiment_score": None,
+        "baseline_score": None,
+        "improvement_delta": None,
+        "rewrite_reason": None,
+    }
+
+
+def _load_prompt_history_from_gcs(limit: int = 20) -> List[Dict[str, Any]]:
+    """Load prompt version history list from GCS."""
+    bucket = _gcs_bucket_client()
+    if bucket is None:
+        return []
+    try:
+        blob = bucket.blob(_GCS_PROMPTS_HISTORY)
+        if not blob.exists():
+            return []
+        history = json.loads(blob.download_as_text(encoding="utf-8"))
+        return history[-limit:] if isinstance(history, list) else []
+    except Exception as e:
+        print(f"[prompts] history load failed: {e}")
+        return []
+
+
+def _next_prompt_version(history: List[Dict[str, Any]]) -> str:
+    if not history:
+        return "v2"
+    last = history[-1].get("version", "v1")
+    try:
+        return f"v{int(last.lstrip('v')) + 1}"
+    except Exception:
+        return f"v{len(history) + 2}"
+
+
+def _promote_prompt_to_production(
+    new_prompt_text: str,
+    version: str,
+    experiment_score: float,
+    baseline_score: float,
+    rewrite_reason: Optional[str] = None,
+    diagnosis_summary: Optional[str] = None,
+) -> bool:
+    """Save new prompt as active in GCS and append to history. Returns True on success."""
+    now = utc_now()
+    version_data = {
+        "version": version,
+        "content": new_prompt_text,
+        "deployed_at": now,
+        "experiment_score": round(experiment_score, 4),
+        "baseline_score": round(baseline_score, 4),
+        "improvement_delta": round(experiment_score - baseline_score, 4),
+        "rewrite_reason": rewrite_reason,
+        "diagnosis_summary": diagnosis_summary,
+    }
+    bucket = _gcs_bucket_client()
+    if bucket is None:
+        # Fall back to local file only
+        backup_and_save_reef_prompt(new_prompt_text)
+        print(f"[prompts] {version} saved locally (no GCS)")
+        return True
+    try:
+        with _gcs_write_lock:
+            # Write active_prompt.json
+            bucket.blob(_GCS_PROMPTS_ACTIVE).upload_from_string(
+                json.dumps(version_data, default=str, indent=2).encode("utf-8"),
+                content_type="application/json",
+            )
+            # Append to prompt_history.json
+            hist_blob = bucket.blob(_GCS_PROMPTS_HISTORY)
+            history: List[Dict[str, Any]] = []
+            try:
+                if hist_blob.exists():
+                    history = json.loads(hist_blob.download_as_text(encoding="utf-8"))
+                    if not isinstance(history, list):
+                        history = []
+            except Exception:
+                pass
+            history.append({k: v for k, v in version_data.items() if k != "content"})
+            hist_blob.upload_from_string(
+                json.dumps(history, default=str, indent=2).encode("utf-8"),
+                content_type="application/json",
+            )
+        # Also write to local filesystem so analyze_reef picks it up immediately
+        backup_and_save_reef_prompt(new_prompt_text)
+        print(f"[prompts] {version} promoted to production — experiment={experiment_score:.3f} baseline={baseline_score:.3f}")
+        return True
+    except Exception as e:
+        print(f"[prompts] promotion failed: {e}")
+        return False
+
+
+# ── Phase 2: Phoenix Experiment Engine ─────────────────────────────────────
+
+async def _evaluate_single_case_with_prompt(
+    prompt_text: str,
+    case: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Run one benchmark case through a specific prompt and return the model output dict."""
+    inp = case.get("input") or {}
+    reef_context = case.get("reef_context") or {}
+    reef_name = inp.get("reef_name", "Unknown Reef")
+    sst = inp.get("sst", "N/A")
+    dhw = inp.get("dhw", "N/A")
+    anomaly = inp.get("anomaly", "N/A")
+    alert = inp.get("alert_level", "No Alert")
+    lat = reef_context.get("lat") or inp.get("lat") or 0
+    lng = reef_context.get("lng") or inp.get("lng") or 0
+
+    dhw_str = f"{dhw} wk" if dhw not in (None, "N/A") else "unavailable"
+    sst_str = f"{sst}°C" if sst not in (None, "N/A") else "unavailable"
+    anomaly_str = f"{anomaly}°C" if anomaly not in (None, "N/A") else "unavailable"
+
+    full_prompt = (
+        f"{prompt_text}\n\n"
+        f"Reef: {reef_name} at {lat}, {lng}\n"
+        f"SST: {sst_str} | Anomaly: {anomaly_str} | DHW: {dhw_str} | Alert: {alert}\n\n"
+        "Return JSON with keys: risk_score (0-100), risk_level (safe|warning|critical), "
+        "confidence (0-1), threat_summary (specific to this reef), "
+        "recommended_actions (list of 3-5 specific actions), historical_context."
+    )
+    try:
+        loop = asyncio.get_running_loop()
+        result_text = await asyncio.wait_for(
+            loop.run_in_executor(
+                None,
+                lambda p=full_prompt: generate_text_with_retry(
+                    p, json_only=True, prompt_template_name="experiment_run_v1"
+                ),
+            ),
+            timeout=50.0,
+        )
+        return json.loads(strip_json_fences(result_text))
+    except Exception as e:
+        print(f"[experiment] analysis failed for {reef_name}: {type(e).__name__}: {e}")
+        return None
+
+
+async def run_prompt_experiment(
+    baseline_prompt: str,
+    candidate_prompt: str,
+    benchmark_cases: List[Dict[str, Any]],
+    *,
+    experiment_id: Optional[str] = None,
+    rewrite_reason: Optional[str] = None,
+    diagnosis: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Run baseline and candidate prompts against benchmark cases and compare judge scores.
+
+    Returns an experiment result dict with delta, dimension breakdowns, and promotion decision.
+    Only benchmark cases with complete NOAA inputs are used to ensure fair comparison.
+    """
+    if not experiment_id:
+        experiment_id = hashlib.sha256(utc_now().encode()).hexdigest()[:12]
+
+    # Filter to cases with at least SST or DHW — never run on bare stubs
+    usable = [
+        c for c in benchmark_cases
+        if c.get("input") and (
+            c["input"].get("dhw") is not None or c["input"].get("sst") is not None
+        )
+    ][:5]  # Cost cap: 5 cases × 2 prompts = 10 Gemini calls + 2 judge calls
+
+    print(f"[experiment:{experiment_id}] starting on {len(usable)}/{len(benchmark_cases)} usable cases")
+    _log_mcp_call(
+        "run_prompt_experiment",
+        f"Experiment {experiment_id}: running {len(usable)} benchmark cases through baseline and candidate prompts",
+        {"experiment_id": experiment_id, "cases": len(usable)},
+    )
+
+    if not usable:
+        return {
+            "experiment_id": experiment_id,
+            "status": "skipped",
+            "reason": "no usable benchmark cases with NOAA data",
+            "baseline_score": None,
+            "candidate_score": None,
+            "delta": None,
+            "promoted": False,
+        }
+
+    # Semaphore limits to 3 concurrent Gemini calls to avoid rate-limit timeouts
+    _exp_sem = asyncio.Semaphore(3)
+
+    async def _limited_eval(prompt: str, case: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        async with _exp_sem:
+            return await _evaluate_single_case_with_prompt(prompt, case)
+
+    # Run baseline first, then candidate (staggered, not all-at-once)
+    baseline_outputs = await asyncio.gather(
+        *[_limited_eval(baseline_prompt, c) for c in usable],
+        return_exceptions=True,
+    )
+    candidate_outputs = await asyncio.gather(
+        *[_limited_eval(candidate_prompt, c) for c in usable],
+        return_exceptions=True,
+    )
+
+    # Build AssessmentForImprovement objects for the judge
+    def _make_assessment(case: Dict[str, Any], output: Any) -> Optional["AssessmentForImprovement"]:
+        if not isinstance(output, dict):
+            return None
+        inp = case.get("input") or {}
+        ctx = case.get("reef_context") or {}
+        return AssessmentForImprovement(
+            trace_id=case.get("case_id"),
+            reef_name=inp.get("reef_name", "Unknown"),
+            timestamp=utc_now(),
+            input_data={
+                "noaa": {
+                    "seaSurfaceTemp": inp.get("sst"),
+                    "degreeHeatingWeeks": inp.get("dhw"),
+                    "tempAnomaly": inp.get("anomaly"),
+                    "bleachingAlertLevel": inp.get("alert_level"),
+                },
+                "coordinates": ctx,
+            },
+            model_output=output,
+        )
+
+    # Only compare cases where BOTH prompts produced valid outputs (fair comparison)
+    matched_indices = [
+        i for i in range(len(usable))
+        if isinstance(baseline_outputs[i], dict) and isinstance(candidate_outputs[i], dict)
+    ]
+    baseline_assessments = [
+        a for i in matched_indices
+        if (a := _make_assessment(usable[i], baseline_outputs[i])) is not None
+    ]
+    candidate_assessments = [
+        a for i in matched_indices
+        if (a := _make_assessment(usable[i], candidate_outputs[i])) is not None
+    ]
+
+    total_attempted = len(usable)
+    timed_out = total_attempted - len(matched_indices)
+    if timed_out > 0:
+        print(f"[experiment:{experiment_id}] {timed_out}/{total_attempted} cases timed out — comparing on {len(matched_indices)} matched pairs")
+    print(f"[experiment:{experiment_id}] baseline outputs={len(baseline_assessments)} candidate={len(candidate_assessments)} (matched pairs only)")
+
+    async def _judge_batch(assessments: List["AssessmentForImprovement"]) -> List[Dict[str, Any]]:
+        if not assessments:
+            return []
+        try:
+            loop = asyncio.get_running_loop()
+            batch_prompt = build_batch_judge_prompt(assessments)
+            batch_text = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda p=batch_prompt: generate_text_with_retry(
+                        p, json_only=True, prompt_template_name="experiment_judge_v1"
+                    ),
+                ),
+                timeout=60.0,
+            )
+            raw = json.loads(strip_json_fences(batch_text))
+            raw_list = raw if isinstance(raw, list) else [raw]
+            results = []
+            for i, item in enumerate(raw_list[:len(assessments)]):
+                try:
+                    j = validate_judge_result(item)
+                    j["reef_name"] = assessments[i].reef_name
+                    results.append(j)
+                except Exception:
+                    pass
+            return results
+        except Exception as e:
+            print(f"[experiment:{experiment_id}] judge failed: {e}")
+            return []
+
+    baseline_judgements, candidate_judgements = await asyncio.gather(
+        _judge_batch(baseline_assessments),
+        _judge_batch(candidate_assessments),
+    )
+
+    DIMENSION_KEYS = [
+        "accuracy", "specificity", "actionability", "scientific_reliability",
+        "dhw_interpretation", "uncertainty_communication", "hallucination_avoidance",
+    ]
+
+    def _dim_averages(judgements: List[Dict[str, Any]]) -> Dict[str, float]:
+        if not judgements:
+            return {k: 0.0 for k in DIMENSION_KEYS}
+        return {k: average_score(judgements, k) for k in DIMENSION_KEYS}
+
+    baseline_dims = _dim_averages(baseline_judgements)
+    candidate_dims = _dim_averages(candidate_judgements)
+    baseline_overall = average_score(baseline_judgements, "overall") if baseline_judgements else 0.0
+    candidate_overall = average_score(candidate_judgements, "overall") if candidate_judgements else 0.0
+    delta = round(candidate_overall - baseline_overall, 4)
+
+    # Promotion decision: candidate must exceed baseline AND reach minimum threshold
+    PROMOTION_THRESHOLD = 0.75
+    MIN_DELTA = 0.01  # At least 1 percentage point improvement
+    promoted = (
+        bool(baseline_judgements) and bool(candidate_judgements)
+        and candidate_overall > baseline_overall + MIN_DELTA
+        and candidate_overall >= PROMOTION_THRESHOLD
+    )
+
+    dimension_deltas = {k: round(candidate_dims[k] - baseline_dims[k], 4) for k in DIMENSION_KEYS}
+
+    result = {
+        "experiment_id": experiment_id,
+        "status": "completed",
+        "timestamp": utc_now(),
+        "benchmark_cases_used": len(matched_indices),
+        "benchmark_cases_attempted": len(usable),
+        "cases_timed_out": timed_out,
+        "baseline_assessments_scored": len(baseline_judgements),
+        "candidate_assessments_scored": len(candidate_judgements),
+        "baseline_score": round(baseline_overall, 4),
+        "candidate_score": round(candidate_overall, 4),
+        "delta": delta,
+        "promoted": promoted,
+        "promotion_reason": (
+            f"candidate {candidate_overall:.3f} > baseline {baseline_overall:.3f} + {MIN_DELTA} and ≥ {PROMOTION_THRESHOLD}"
+            if promoted else
+            f"candidate {candidate_overall:.3f} did not exceed baseline {baseline_overall:.3f} + {MIN_DELTA}"
+            if baseline_judgements and candidate_judgements else
+            "insufficient judge results"
+        ),
+        "baseline_dimensions": baseline_dims,
+        "candidate_dimensions": candidate_dims,
+        "dimension_deltas": dimension_deltas,
+        "rewrite_reason": rewrite_reason,
+        "diagnosis_summary": (diagnosis or {}).get("diagnosis_summary"),
+    }
+    print(
+        f"[experiment:{experiment_id}] baseline={baseline_overall:.3f} candidate={candidate_overall:.3f} "
+        f"delta={delta:+.4f} promoted={promoted}"
+    )
+    return result
+
+
+def _save_experiment_to_gcs(experiment: Dict[str, Any]) -> bool:
+    """Save experiment result JSON to GCS under experiments/<id>.json."""
+    bucket = _gcs_bucket_client()
+    if bucket is None:
+        return False
+    exp_id = experiment.get("experiment_id", "unknown")
+    try:
+        blob_name = f"{_GCS_EXPERIMENTS_PREFIX}{exp_id}.json"
+        bucket.blob(blob_name).upload_from_string(
+            json.dumps(experiment, default=str, indent=2).encode("utf-8"),
+            content_type="application/json",
+        )
+        print(f"[experiment] saved to gs://{SELF_IMPROVEMENT_GCS_BUCKET}/{blob_name}")
+        return True
+    except Exception as e:
+        print(f"[experiment] GCS save failed: {e}")
+        return False
+
+
+def _load_recent_experiments_from_gcs(limit: int = 10) -> List[Dict[str, Any]]:
+    """Load the most recent experiment results from GCS."""
+    bucket = _gcs_bucket_client()
+    if bucket is None:
+        return []
+    try:
+        blobs = sorted(
+            [b for b in bucket.list_blobs(prefix=_GCS_EXPERIMENTS_PREFIX) if b.name.endswith(".json")],
+            key=lambda b: b.name,
+            reverse=True,
+        )[:limit]
+        results = []
+        for blob in blobs:
+            try:
+                results.append(json.loads(blob.download_as_text(encoding="utf-8")))
+            except Exception:
+                pass
+        return results
+    except Exception as e:
+        print(f"[experiment] list failed: {e}")
+        return []
+
+
+# ── Phase 4: Phoenix MCP Self-Introspection ─────────────────────────────────
+
+async def _query_phoenix_failure_modes(limit: int = 30) -> Dict[str, Any]:
+    """Query Phoenix for worst-performing traces to inform improvement planning.
+
+    Returns structured analysis: recurring failure dimensions, worst reef names, common issues.
+    """
+    phoenix = PhoenixMCPClient(
+        _phoenix_client_base_url(),
+        project_name=PHOENIX_PROJECT_NAME,
+        space_id=ARIZE_SPACE_ID,
+    )
+    spans = await phoenix.get_recent_spans(limit=limit)
+    if not spans:
+        return {"error": "no spans returned from Phoenix", "failure_modes": [], "worst_traces": []}
+
+    low_quality = phoenix.filter_low_quality(spans)
+    _log_mcp_call(
+        "query_phoenix_failure_modes",
+        f"Introspection: {len(low_quality)} low-quality traces out of {len(spans)} total spans",
+        {"total": len(spans), "low_quality": len(low_quality)},
+    )
+
+    failure_dims: Dict[str, int] = {}
+    worst_traces: List[Dict[str, Any]] = []
+
+    for span in low_quality[:10]:
+        from phoenix_mcp import _attributes as _span_attrs
+        attrs = _span_attrs(span)
+        reef_name = attrs.get("reef.name") or span.get("name") or "unknown"
+        quality = attrs.get("eval.quality_score")
+        worst_traces.append({
+            "reef_name": str(reef_name)[:60],
+            "quality_score": quality,
+            "status": span.get("statusCode") or span.get("status"),
+        })
+        # Collect any eval dimension annotations attached to the span
+        for key in attrs:
+            if key.startswith("eval.") and key != "eval.quality_score":
+                dim = key.replace("eval.", "")
+                try:
+                    val = float(attrs[key])
+                    if val < 0.6:
+                        failure_dims[dim] = failure_dims.get(dim, 0) + 1
+                except (TypeError, ValueError):
+                    pass
+
+    top_failures = sorted(failure_dims.items(), key=lambda x: x[1], reverse=True)[:5]
+    return {
+        "total_spans": len(spans),
+        "low_quality_count": len(low_quality),
+        "low_quality_rate": round(len(low_quality) / max(len(spans), 1), 3),
+        "failure_modes": [{"dimension": k, "frequency": v} for k, v in top_failures],
+        "worst_traces": worst_traces,
+        "phoenix_url": _phoenix_client_base_url(),
+    }
+
+
+# ── Phase 7: Audit Trail ─────────────────────────────────────────────────────
+
+def _save_improvement_audit_entry(entry: Dict[str, Any]) -> bool:
+    """Save a complete improvement cycle audit record to GCS."""
+    bucket = _gcs_bucket_client()
+    if bucket is None:
+        return False
+    cycle_id = entry.get("cycle_id") or hashlib.sha256(utc_now().encode()).hexdigest()[:12]
+    try:
+        blob_name = f"{_GCS_IMPROVEMENT_HISTORY_PREFIX}{cycle_id}.json"
+        bucket.blob(blob_name).upload_from_string(
+            json.dumps(entry, default=str, indent=2).encode("utf-8"),
+            content_type="application/json",
+        )
+        print(f"[audit] saved cycle {cycle_id} to GCS")
+        return True
+    except Exception as e:
+        print(f"[audit] GCS save failed: {e}")
+        return False
+
+
+def _load_improvement_history_from_gcs(limit: int = 20) -> List[Dict[str, Any]]:
+    """Load recent improvement audit entries from GCS."""
+    bucket = _gcs_bucket_client()
+    if bucket is None:
+        return []
+    try:
+        blobs = sorted(
+            [b for b in bucket.list_blobs(prefix=_GCS_IMPROVEMENT_HISTORY_PREFIX) if b.name.endswith(".json")],
+            key=lambda b: b.name,
+            reverse=True,
+        )[:limit]
+        entries = []
+        for blob in blobs:
+            try:
+                entries.append(json.loads(blob.download_as_text(encoding="utf-8")))
+            except Exception:
+                pass
+        return entries
+    except Exception as e:
+        print(f"[audit] history load failed: {e}")
+        return []
+
+
+# ── Phase 6: Autonomous Nightly Learning Cycle ────────────────────────────────
+
+async def _run_autonomous_improvement_cycle(source: str = "nightly_scheduler") -> Dict[str, Any]:
+    """Full autonomous improvement cycle:
+
+    1. Collect traces from Phoenix for failure mode analysis
+    2. Run evaluation on fresh reef assessments
+    3. Collect benchmark cases from judged assessments
+    4. If quality below threshold: diagnose root cause
+    5. Generate candidate prompt targeted to failing dimensions
+    6. Run Phoenix Experiment (baseline vs candidate on benchmark set)
+    7. Promote candidate only if experiment confirms improvement
+    8. Save audit trail
+    9. Log all activity to Agent Activity feed
+    """
+    cycle_id = hashlib.sha256(utc_now().encode()).hexdigest()[:12]
+    cycle_started = utc_now()
+    audit: Dict[str, Any] = {
+        "cycle_id": cycle_id,
+        "started_at": cycle_started,
+        "source": source,
+        "phases": {},
+    }
+
+    print(f"[autonomous-cycle:{cycle_id}] started")
+    _log_mcp_call(
+        "autonomous_cycle_started",
+        f"Autonomous improvement cycle {cycle_id} initiated by {source}",
+        {"cycle_id": cycle_id},
+    )
+
+    # ── Step 1: Phoenix self-introspection ─────────────────────────────────
+    print(f"[autonomous-cycle:{cycle_id}] step 1 — Phoenix introspection")
+    phoenix_data = await _query_phoenix_failure_modes(limit=30)
+    audit["phases"]["phoenix_introspection"] = phoenix_data
+    if phoenix_data.get("failure_modes"):
+        failure_summary = ", ".join(
+            f"{m['dimension']} ({m['frequency']} traces)"
+            for m in phoenix_data["failure_modes"][:3]
+        )
+        _log_mcp_call(
+            "phoenix_failure_analysis",
+            f"Phoenix introspection: {phoenix_data['low_quality_count']}/{phoenix_data['total_spans']} low-quality traces. Top failures: {failure_summary}",
+            phoenix_data,
+        )
+
+    # ── Step 2: Fresh evaluation (evaluation only — no prompt rewrite here) ──
+    print(f"[autonomous-cycle:{cycle_id}] step 2 — running fresh evaluation (skip_rewrite=True)")
+    eval_result = await run_self_improvement(
+        SelfImprovementRequest(source=source, skip_rewrite=True, force_fresh=True)
+    )
+    audit["phases"]["evaluation"] = {
+        "average_score": eval_result.get("average_score"),
+        "status": eval_result.get("status"),
+        "judged_count": eval_result.get("judged_assessment_count", 0),
+        "diagnosis": eval_result.get("diagnosis"),
+    }
+
+    average_overall = eval_result.get("average_score") or 0.0
+    judgements_count = eval_result.get("judged_assessment_count", 0)
+    diagnosis = eval_result.get("diagnosis")
+
+    _log_mcp_call(
+        "evaluation_completed",
+        f"Evaluation completed: quality={average_overall:.0%}, {judgements_count} assessments scored",
+        {"average_score": average_overall, "diagnosis": diagnosis},
+    )
+
+    # ── Step 3: Benchmark cases are collected as a side-effect of evaluation ─
+    # run_self_improvement writes benchmark cases to GCS automatically after each
+    # judged run (see _append_benchmark_cases_to_gcs post-hook).
+    benchmark_saved = judgements_count  # informational — actual save happens in eval post-hook
+    audit["phases"]["benchmark_collection"] = {"cases_saved": benchmark_saved}
+    print(f"[autonomous-cycle:{cycle_id}] step 3 — benchmark cases auto-saved by eval post-hook ({judgements_count} new)")
+
+    # ── Step 4-7: Prompt improvement via experiment pipeline ─────────────────
+    # Quality below threshold + model-reasoning failures → generate candidate → experiment → promote
+    experiment_result: Optional[Dict[str, Any]] = None
+    prompt_version_data = _load_active_prompt_version()
+    current_version = prompt_version_data.get("version", "v1")
+    prompt_history = _load_prompt_history_from_gcs()
+    promoted = False
+
+    if (
+        average_overall < 0.75
+        and diagnosis is not None
+        and diagnosis.get("rewrite_warranted")
+    ):
+        print(f"[autonomous-cycle:{cycle_id}] step 4-7 — quality low ({average_overall:.0%}), running experiment pipeline")
+        _log_mcp_call(
+            "improvement_pipeline_started",
+            f"Quality {average_overall:.0%} below threshold. Generating candidate prompt for experiment.",
+            {"current_version": current_version, "diagnosis": diagnosis.get("diagnosis_summary")},
+        )
+
+        # Load benchmark cases for experiment
+        benchmark_cases = _load_benchmark_cases_from_gcs(limit=20)
+        audit["phases"]["benchmark_loaded"] = {"count": len(benchmark_cases)}
+
+        if len(benchmark_cases) >= 3:
+            # Load prior rejected experiments so prompt generation avoids repeating failed strategies
+            prior_rejections: List[Dict[str, Any]] = []
+            recent_experiments = _load_recent_experiments_from_gcs(limit=5)
+            for exp in recent_experiments:
+                if not exp.get("promoted"):
+                    prior_rejections.append({
+                        "target_dims": exp.get("rewrite_reason", ""),
+                        "delta": exp.get("delta"),
+                        "rejection_reason": exp.get("promotion_reason", "insufficient improvement"),
+                    })
+            if prior_rejections:
+                print(f"[autonomous-cycle:{cycle_id}] {len(prior_rejections)} prior rejection(s) — informing candidate generation")
+
+            # Generate candidate prompt using Phoenix failure evidence + rejection history
+            current_prompt = load_reef_analysis_prompt()
+            issues = eval_result.get("issues", [])
+            suggestions = eval_result.get("improvement_suggestions", [])
+            feedback = {
+                "issues": issues,
+                "improvement_suggestions": suggestions,
+                "average_overall": average_overall,
+            }
+            phoenix_failure_modes = phoenix_data.get("failure_modes", [])
+            try:
+                loop = asyncio.get_running_loop()
+                candidate_text = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None,
+                        lambda: generate_text_with_retry(
+                            build_improvement_prompt(
+                                current_prompt,
+                                feedback,
+                                diagnosis,
+                                phoenix_failure_modes=phoenix_failure_modes,
+                                prior_rejections=prior_rejections,
+                            ),
+                            prompt_template_name="reef_prompt_improvement_v1",
+                        ).strip(),
+                    ),
+                    timeout=60.0,
+                )
+                candidate_text = re.sub(r"^```(?:text)?|```$", "", candidate_text, flags=re.MULTILINE).strip()
+
+                if is_valid_improved_prompt(candidate_text, current_prompt):
+                    next_version = _next_prompt_version(prompt_history)
+                    _log_mcp_call(
+                        "candidate_prompt_generated",
+                        f"Generated candidate prompt {next_version}. Running Phoenix Experiment against {len(benchmark_cases)} benchmark cases.",
+                        {"version": next_version, "target_dims": diagnosis.get("model_reasoning_dimensions")},
+                    )
+
+                    # Run experiment
+                    experiment_result = await run_prompt_experiment(
+                        baseline_prompt=current_prompt,
+                        candidate_prompt=candidate_text,
+                        benchmark_cases=benchmark_cases,
+                        experiment_id=cycle_id,
+                        rewrite_reason=", ".join(diagnosis.get("model_reasoning_dimensions", [])),
+                        diagnosis=diagnosis,
+                    )
+                    _save_experiment_to_gcs(experiment_result)
+
+                    if experiment_result.get("promoted"):
+                        # Promote candidate to production
+                        _promote_prompt_to_production(
+                            new_prompt_text=candidate_text,
+                            version=next_version,
+                            experiment_score=experiment_result["candidate_score"],
+                            baseline_score=experiment_result["baseline_score"],
+                            rewrite_reason=experiment_result.get("rewrite_reason"),
+                            diagnosis_summary=diagnosis.get("diagnosis_summary"),
+                        )
+                        promoted = True
+                        _log_mcp_call(
+                            "prompt_promoted",
+                            f"Promoted prompt {next_version} to production. "
+                            f"Experiment: {experiment_result['baseline_score']:.3f} → {experiment_result['candidate_score']:.3f} "
+                            f"(+{experiment_result['delta']:.3f})",
+                            experiment_result,
+                        )
+                    else:
+                        _log_mcp_call(
+                            "experiment_rejected",
+                            f"Candidate prompt rejected — experiment delta {experiment_result.get('delta', 0):+.3f} insufficient. "
+                            f"Production prompt {current_version} preserved.",
+                            experiment_result,
+                        )
+                else:
+                    print(f"[autonomous-cycle:{cycle_id}] candidate prompt failed validation")
+            except Exception as e:
+                print(f"[autonomous-cycle:{cycle_id}] improvement pipeline error: {e}")
+                audit["phases"]["improvement_error"] = str(e)
+        else:
+            print(f"[autonomous-cycle:{cycle_id}] only {len(benchmark_cases)} benchmark cases — need ≥3 for experiment")
+            _log_mcp_call(
+                "experiment_skipped",
+                f"Experiment skipped — only {len(benchmark_cases)} benchmark cases available (need ≥3). "
+                "Cases accumulate from production evaluations automatically.",
+                {"cases": len(benchmark_cases)},
+            )
+
+    audit["phases"]["experiment"] = experiment_result
+    audit["phases"]["promoted"] = promoted
+    audit["phases"]["current_prompt_version"] = current_version
+    audit["completed_at"] = utc_now()
+
+    # ── Step 8: Save audit trail ───────────────────────────────────────────
+    _save_improvement_audit_entry(audit)
+
+    final_status = "promoted" if promoted else ("evaluated" if judgements_count > 0 else "skipped")
+    _log_mcp_call(
+        "autonomous_cycle_completed",
+        f"Cycle {cycle_id} completed — status={final_status}, "
+        f"quality={average_overall:.0%}, "
+        f"prompt={current_version}{'→' + _next_prompt_version(prompt_history) if promoted else ''}",
+        {"cycle_id": cycle_id, "promoted": promoted, "quality": average_overall},
+    )
+
+    return {
+        "cycle_id": cycle_id,
+        "status": final_status,
+        "evaluation_score": average_overall,
+        "promoted": promoted,
+        "experiment": experiment_result,
+        "current_prompt_version": current_version,
+        "audit_saved": True,
+        "phoenix_introspection": phoenix_data,
+        "completed_at": audit["completed_at"],
+    }
+
+
+# ── Phase 5: New V2 API Endpoints ─────────────────────────────────────────────
+
+@app.get("/api/self-improvement/v2/status")
+async def self_improvement_v2_status() -> Dict[str, Any]:
+    """Production dashboard — current prompt version, latest experiment, benchmark stats."""
+    prompt_version = _load_active_prompt_version()
+    history = _load_prompt_history_from_gcs(limit=10)
+    experiments = _load_recent_experiments_from_gcs(limit=5)
+    benchmark_count = _count_benchmark_cases_gcs()
+
+    latest_exp = experiments[0] if experiments else None
+    latest_run = latest_self_improvement_from_disk()
+
+    return {
+        "prompt_version": prompt_version.get("version", "v1"),
+        "prompt_deployed_at": prompt_version.get("deployed_at"),
+        "prompt_experiment_score": prompt_version.get("experiment_score"),
+        "prompt_baseline_score": prompt_version.get("baseline_score"),
+        "prompt_improvement_delta": prompt_version.get("improvement_delta"),
+        "prompt_rewrite_reason": prompt_version.get("rewrite_reason"),
+        "benchmark_dataset_size": benchmark_count,
+        "latest_experiment": {
+            "experiment_id": latest_exp.get("experiment_id") if latest_exp else None,
+            "timestamp": latest_exp.get("timestamp") if latest_exp else None,
+            "baseline_score": latest_exp.get("baseline_score") if latest_exp else None,
+            "candidate_score": latest_exp.get("candidate_score") if latest_exp else None,
+            "delta": latest_exp.get("delta") if latest_exp else None,
+            "promoted": latest_exp.get("promoted") if latest_exp else None,
+            "promotion_reason": latest_exp.get("promotion_reason") if latest_exp else None,
+            "benchmark_cases": latest_exp.get("benchmark_cases_used") if latest_exp else None,
+        } if latest_exp else None,
+        "prompt_history": [
+            {
+                "version": h.get("version"),
+                "deployed_at": h.get("deployed_at"),
+                "experiment_score": h.get("experiment_score"),
+                "improvement_delta": h.get("improvement_delta"),
+                "rewrite_reason": h.get("rewrite_reason"),
+            }
+            for h in reversed(history)
+        ],
+        "current_quality": latest_run.get("average_score") if latest_run else None,
+        "current_system_status": latest_run.get("system_status") if latest_run else None,
+        "last_updated": utc_now(),
+    }
+
+
+@app.get("/api/self-improvement/v2/experiments")
+async def self_improvement_v2_experiments(limit: int = 10) -> Dict[str, Any]:
+    """Return recent experiment results with full dimension breakdowns."""
+    experiments = _load_recent_experiments_from_gcs(limit=min(int(limit), 20))
+    return {"experiments": experiments, "count": len(experiments)}
+
+
+@app.get("/api/self-improvement/v2/prompt-history")
+async def self_improvement_v2_prompt_history() -> Dict[str, Any]:
+    """Return complete prompt version history."""
+    history = _load_prompt_history_from_gcs(limit=50)
+    active = _load_active_prompt_version()
+    return {
+        "active_version": active.get("version"),
+        "history": list(reversed(history)),
+        "total_versions": len(history),
+    }
+
+
+@app.get("/api/self-improvement/v2/benchmark-stats")
+async def self_improvement_v2_benchmark_stats() -> Dict[str, Any]:
+    """Return benchmark dataset statistics."""
+    cases = _load_benchmark_cases_from_gcs(limit=200)
+    if not cases:
+        return {"total_cases": 0, "evaluation_types": {}, "oldest": None, "newest": None}
+
+    by_type: Dict[str, int] = {}
+    timestamps = []
+    for c in cases:
+        t = c.get("evaluation_type", "reef_assessment")
+        by_type[t] = by_type.get(t, 0) + 1
+        if c.get("timestamp"):
+            timestamps.append(c["timestamp"])
+
+    return {
+        "total_cases": len(cases),
+        "evaluation_types": by_type,
+        "oldest": min(timestamps) if timestamps else None,
+        "newest": max(timestamps) if timestamps else None,
+        "gcs_bucket": SELF_IMPROVEMENT_GCS_BUCKET or "not configured",
+    }
+
+
+@app.get("/api/self-improvement/v2/audit-history")
+async def self_improvement_v2_audit_history(limit: int = 10) -> Dict[str, Any]:
+    """Return improvement cycle audit trail."""
+    entries = _load_improvement_history_from_gcs(limit=min(int(limit), 30))
+    return {"entries": entries, "count": len(entries)}
 
 
 @app.post("/api/self-improvement/nightly")
@@ -3128,11 +5364,22 @@ async def run_nightly_self_improvement() -> Dict[str, Any]:
         f"{', '.join(run_reasons) or 'first run / no cached data'}"
     )
 
-    full_result = await run_self_improvement(SelfImprovementRequest(source="nightly_scheduler"))
+    # Route through the autonomous improvement cycle which handles evaluation +
+    # benchmark collection + experiment validation + prompt promotion + audit.
+    cycle_result = await _run_autonomous_improvement_cycle(source="nightly_scheduler")
+    cycle_result["last_checked"] = started_at
+
+    # Also return a compatible self-improvement run record for dashboard backwards-compat
+    full_result = latest_self_improvement_from_disk()
     full_result["last_checked"] = started_at
+    full_result["autonomous_cycle"] = {
+        "cycle_id": cycle_result.get("cycle_id"),
+        "promoted": cycle_result.get("promoted"),
+        "experiment": cycle_result.get("experiment"),
+    }
     print(
         f"[self-improvement] nightly completed at {utc_now()} — "
-        f"score={full_result.get('average_score')} status={full_result.get('status')}"
+        f"score={full_result.get('average_score')} promoted={cycle_result.get('promoted')}"
     )
     return full_result
 
@@ -4242,19 +6489,42 @@ async def monitor_reef(payload: MonitorStationRequest) -> Dict[str, Any]:
     _custom_monitored_reefs.append(reef)
     _save_monitored_reef_to_db(reef)
 
+    # Update researcher profile's active_reef_ids if researcher_id provided
+    if payload.researcher_id:
+        try:
+            profile = _get_or_create_researcher_profile(payload.researcher_id)
+            existing_ids: List[str] = json.loads(profile.get("active_reef_ids") or "[]")
+            if canon_id not in existing_ids:
+                existing_ids.append(canon_id)
+                _update_researcher_active_reefs(payload.researcher_id, existing_ids)
+        except Exception as _rp_err:
+            print(f"[monitor] researcher profile update failed (non-fatal): {_rp_err}")
+
     print(f"[monitor] added {reef['name']} (id={canon_id}, total={len(_custom_monitored_reefs)})")
     return {"success": True, "station": reef, "noaaData": "cached" if matched else "unavailable", "aiAnalysis": "pending"}
 
 
 @app.delete("/api/reefs/monitor/{reef_id:path}")
 @app.delete("/reefs/monitor/{reef_id:path}")
-async def unmonitor_reef(reef_id: str) -> Dict[str, Any]:
+async def unmonitor_reef(reef_id: str, researcher_id: Optional[str] = None) -> Dict[str, Any]:
     global _custom_monitored_reefs
     before = len(_custom_monitored_reefs)
     _custom_monitored_reefs = [r for r in _custom_monitored_reefs if r.get("id") != reef_id]
     removed = len(_custom_monitored_reefs) < before
     if removed:
         _delete_monitored_reef_from_db(reef_id)
+
+    # Remove reef from researcher profile's active_reef_ids if researcher_id provided
+    if researcher_id:
+        try:
+            profile = _get_or_create_researcher_profile(researcher_id)
+            current_ids: List[str] = json.loads(profile.get("active_reef_ids") or "[]")
+            if reef_id in current_ids:
+                current_ids.remove(reef_id)
+                _update_researcher_active_reefs(researcher_id, current_ids)
+        except Exception as _rp_err:
+            print(f"[monitor] researcher profile remove failed (non-fatal): {_rp_err}")
+
     print(f"[monitor] removed id={reef_id} (removed={removed}, remaining={len(_custom_monitored_reefs)})")
     return {"removed": removed}
 
@@ -4419,7 +6689,7 @@ async def reef_stations() -> List[Dict[str, Any]]:
 @app.get("/api/reefs/stations/readings")
 async def reef_station_readings() -> List[Dict[str, Any]]:
     now = utc_now()
-    source_reefs: List[Dict[str, Any]] = _cache_get(_NOAA_CACHE, "live:list") or _STATIC_LIVE_REEFS
+    source_reefs: List[Dict[str, Any]] = _cache_get(_NOAA_CACHE, "live:list") or _snapshot_fallback_reefs()
     return [
         {
             "id": reef.get("id"),
@@ -4675,22 +6945,53 @@ async def historical_trends() -> Dict[str, Any]:
 
 
 @app.get("/api/settings")
-async def get_settings() -> Dict[str, Any]:
+async def get_settings(researcher_id: Optional[str] = None) -> Dict[str, Any]:
+    if researcher_id:
+        profile = _get_or_create_researcher_profile(researcher_id)
+        if profile:
+            return {
+                "notification_email": profile["notification_email"],
+                "anomaly_threshold": str(profile["anomaly_threshold"]),
+                "critical_alerts_enabled": str(profile["critical_alerts_enabled"]).lower(),
+                "temp_anomaly_alerts_enabled": str(profile["anomaly_alerts_enabled"]).lower(),
+                "weekly_summary_enabled": str(profile["weekly_summary_enabled"]).lower(),
+            }
     return dict(_SETTINGS_STORE)
 
 
 @app.post("/api/settings")
 async def post_settings(request: Request) -> Dict[str, Any]:
     body = await request.json()
+    researcher_id = body.get("researcher_id") if isinstance(body, dict) else None
     settings = body.get("settings") if isinstance(body, dict) else None
+    if researcher_id and settings and isinstance(settings, dict):
+        print(f"[settings] saving researcher={researcher_id[:8]}… keys={list(settings.keys())}")
+        _update_researcher_settings(researcher_id, settings)
+        return {"success": True}
     if settings and isinstance(settings, dict):
+        print(f"[settings] no researcher_id — updating _SETTINGS_STORE only (no GCS write)")
         _SETTINGS_STORE.update(settings)
         return {"success": True}
     key = body.get("key") if isinstance(body, dict) else None
     if key:
         _SETTINGS_STORE[key] = body.get("value")
         return {"success": True}
-    return JSONResponse(status_code=400, content={"success": False, "message": "Provide key/value or settings object."})
+    return JSONResponse(status_code=400, content={"success": False, "message": "Provide researcher_id+settings, key/value, or settings object."})
+
+
+@app.put("/api/researcher/active-reefs")
+async def update_researcher_active_reefs_endpoint(request: Request) -> Dict[str, Any]:
+    """Sync the researcher's active reef IDs to their profile. Called on every activeReefIds change."""
+    body = await request.json()
+    researcher_id = body.get("researcher_id") if isinstance(body, dict) else None
+    reef_ids = body.get("reef_ids") if isinstance(body, dict) else None
+    if not researcher_id:
+        return JSONResponse(status_code=400, content={"success": False, "message": "researcher_id required"})
+    if not isinstance(reef_ids, list):
+        return JSONResponse(status_code=400, content={"success": False, "message": "reef_ids must be an array"})
+    print(f"[active-reefs:backend] received researcher_id={researcher_id[:8]}… reef_ids({len(reef_ids)}): {reef_ids}")
+    ok = _update_researcher_active_reefs(researcher_id, [str(r) for r in reef_ids])
+    return {"success": ok}
 
 
 @app.get("/api/agent/activity")
@@ -4739,6 +7040,7 @@ async def agent_activity() -> List[Dict[str, Any]]:
             "metadata": None,
             "timestamp": now,
         })
+    events = list(_demo_alert_events) + events
     return events[:50]
 
 
@@ -4849,9 +7151,17 @@ def _build_alert_html(reef: Dict[str, Any], body: str) -> str:
     """
 
 
-def _send_alert_email(reef: Dict[str, Any]) -> bool:
-    if not ALERT_EMAIL_FROM or not ALERT_EMAIL_TO or not ALERT_EMAIL_PASSWORD:
-        print("[alert] email not configured — set ALERT_EMAIL_FROM, ALERT_EMAIL_TO, ALERT_EMAIL_PASSWORD")
+def _send_alert_email(reef: Dict[str, Any], recipient: Optional[str] = None) -> bool:
+    """Send a critical alert email. recipient must be provided; returns False if missing."""
+    if recipient is None:
+        print("[alert] no recipient email — configure one in Settings")
+        return False
+    recipient = recipient.strip()
+    if not ALERT_EMAIL_FROM or not ALERT_EMAIL_PASSWORD:
+        print("[alert] SMTP sender not configured — set ALERT_EMAIL_FROM and ALERT_EMAIL_PASSWORD")
+        return False
+    if not recipient:
+        print("[alert] no recipient email — configure one in Settings")
         return False
     name = reef.get("name", "Unknown Reef")
     risk = reef.get("riskScore") or reef.get("risk_score", 0)
@@ -4862,99 +7172,303 @@ def _send_alert_email(reef: Dict[str, Any]) -> bool:
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"CRITICAL ALERT: {name} — {risk}% Bleaching Risk"
     msg["From"] = f'"ReefWatch AI \U0001fab8" <{ALERT_EMAIL_FROM}>'
-    msg["To"] = ALERT_EMAIL_TO
+    msg["To"] = recipient
     msg.attach(MIMEText(body, "plain"))
     msg.attach(MIMEText(html, "html"))
     try:
         with smtplib.SMTP("smtp.gmail.com", 587) as server:
             server.starttls()
             server.login(ALERT_EMAIL_FROM, ALERT_EMAIL_PASSWORD)
-            server.sendmail(ALERT_EMAIL_FROM, ALERT_EMAIL_TO, msg.as_string())
-        print(f"[alert] sent email for {name} to {ALERT_EMAIL_TO}")
+            server.sendmail(ALERT_EMAIL_FROM, recipient, msg.as_string())
+        print(f"[alert] sent email for {name} to {_mask_email(recipient)}")
         return True
     except Exception as exc:
         print(f"[alert] email send failed for {name}: {type(exc).__name__}: {exc}")
         return False
 
 
+def _send_demo_alert_email(reef: Dict[str, Any], recipient: str) -> bool:
+    """Send a demo alert email with a banner and 🚨 DEMO ALERT: subject prefix."""
+    recipient = recipient.strip()
+    if not ALERT_EMAIL_FROM or not ALERT_EMAIL_PASSWORD:
+        print("[alert] SMTP sender not configured — set ALERT_EMAIL_FROM and ALERT_EMAIL_PASSWORD")
+        return False
+    if not recipient:
+        print("[alert] no recipient email — configure one in Settings")
+        return False
+    name = reef.get("name", "Unknown Reef")
+    risk = reef.get("riskScore") or reef.get("risk_score", 0)
+    if isinstance(risk, float) and risk <= 1.0:
+        risk = round(risk * 100)
+    sst = reef.get("seaSurfaceTemp") or reef.get("sst")
+    anomaly = reef.get("tempAnomaly") or reef.get("sst_anomaly")
+    dhw = reef.get("degreeHeatingWeeks") or reef.get("dhw")
+    alert = reef.get("bleachingAlertLevel") or reef.get("alert_level")
+
+    def esc(v: Any) -> str:
+        return str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    def fmt(v: Any, suffix: str = "") -> str:
+        return f"{esc(v)}{suffix}" if v is not None else "Unavailable"
+
+    plain = "\n".join([
+        "⚠️  DEMONSTRATION ALERT — This alert was manually triggered for demonstration purposes using live reef data.",
+        "",
+        f"Reef: {name}",
+        f"Bleaching Risk: {risk}%",
+        f"Sea Surface Temp: {fmt(sst, '°C')}",
+        f"SST Anomaly: {fmt(anomaly, '°C')}",
+        f"Degree Heating Weeks: {fmt(dhw)}",
+        f"Risk Level: {fmt(alert)}",
+        "",
+        "This is a live-data demo. No immediate conservation action is required unless you choose to act on the values above.",
+    ])
+    html = f"""
+      <div style="font-family:sans-serif;max-width:600px;margin:0 auto">
+        <div style="background:#dc2626;color:white;padding:20px;border-radius:8px 8px 0 0">
+          <h1 style="margin:0">&#x1F6A8; DEMO ALERT — Critical Reef Alert</h1>
+          <p style="margin:8px 0 0">ReefWatch AI Autonomous Monitoring System</p>
+        </div>
+        <div style="background:#78350f;color:#fef3c7;padding:14px 20px;border-left:4px solid #f59e0b;font-size:14px">
+          &#9888;&#65039; This alert was manually triggered for demonstration purposes using live reef data.
+        </div>
+        <div style="background:#1e293b;color:#e2e8f0;padding:20px">
+          <h2 style="color:#f87171">{esc(name)}</h2>
+          <table style="width:100%;border-collapse:collapse">
+            <tr><td style="padding:8px;color:#94a3b8">Bleaching Risk</td>
+                <td style="padding:8px;color:#f87171;font-weight:bold">{fmt(risk, '%')}</td></tr>
+            <tr><td style="padding:8px;color:#94a3b8">Sea Surface Temp</td>
+                <td style="padding:8px">{fmt(sst, '°C')}</td></tr>
+            <tr><td style="padding:8px;color:#94a3b8">SST Anomaly</td>
+                <td style="padding:8px">{fmt(anomaly, '°C')}</td></tr>
+            <tr><td style="padding:8px;color:#94a3b8">Degree Heating Weeks</td>
+                <td style="padding:8px">{fmt(dhw)}</td></tr>
+            <tr><td style="padding:8px;color:#94a3b8">Risk Level</td>
+                <td style="padding:8px">{fmt(alert)}</td></tr>
+          </table>
+        </div>
+        <div style="background:#0f172a;color:#475569;padding:12px;text-align:center;font-size:12px;border-radius:0 0 8px 8px">
+          Generated by ReefWatch AI • Autonomous Coral Reef Monitoring
+        </div>
+      </div>
+    """
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = f"🚨 DEMO ALERT: {name} — {risk}% Bleaching Risk"
+    msg["From"] = f'"ReefWatch AI \U0001fab8" <{ALERT_EMAIL_FROM}>'
+    msg["To"] = recipient
+    msg.attach(MIMEText(plain, "plain"))
+    msg.attach(MIMEText(html, "html"))
+    try:
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.starttls()
+            server.login(ALERT_EMAIL_FROM, ALERT_EMAIL_PASSWORD)
+            server.sendmail(ALERT_EMAIL_FROM, recipient, msg.as_string())
+        print(f"[alert] sent demo email for {name} to {_mask_email(recipient)}")
+        return True
+    except Exception as exc:
+        print(f"[alert] demo email send failed for {name}: {type(exc).__name__}: {exc}")
+        return False
+
+
 async def _run_alert_check() -> Dict[str, Any]:
     print("[alert-scheduler] running alert check")
+
+    profiles = _list_researcher_profiles_with_alerts()
+    if not profiles:
+        print("[alert-scheduler] no researcher profiles with email + active reefs — skipping")
+        return {
+            "reefs_checked": 0, "alerts_sent": 0,
+            "message": "No researchers have configured email and active reefs.",
+            "checked_at": utc_now(),
+        }
+
+    # Build reef lookup from NOAA cache + custom-monitored reefs (avoids extra API calls)
+    cached_live: List[Dict[str, Any]] = _cache_get(_NOAA_CACHE, "live:list") or []
+    reef_by_id: Dict[str, Dict[str, Any]] = {r["id"]: r for r in cached_live if r.get("id")}
+    for r in _custom_monitored_reefs:
+        if r.get("id"):
+            reef_by_id[r["id"]] = r
+
     reefs_checked = 0
     alerts_sent = 0
     skipped_cooldown = 0
     skipped_threshold = 0
     errors: List[str] = []
 
-    # Only alert on reefs the user has explicitly registered for active monitoring.
-    # If no reefs are registered, skip entirely — never send emails for zero-selection state.
-    if not _custom_monitored_reefs:
-        print("[alert-scheduler] no user-registered reefs — skipping alert check")
-        return {
-            "reefs_checked": 0, "alerts_sent": 0,
-            "message": "No active monitored reefs registered. Add reefs to enable alerts.",
-            "checked_at": utc_now(),
-        }
+    for profile in profiles:
+        researcher_id = profile["researcher_id"]
+        email = profile["notification_email"]
+        try:
+            active_reef_ids: List[str] = json.loads(profile["active_reef_ids_json"] or "[]")
+        except Exception:
+            active_reef_ids = []
 
-    try:
-        reefs = list(_custom_monitored_reefs)  # Only user-registered reefs, not all base reefs
-    except Exception as exc:
-        msg = f"Failed to access monitored reefs: {type(exc).__name__}: {exc}"
-        print(f"[alert-scheduler] {msg}")
-        return {"error": msg, "reefs_checked": 0, "checked_at": utc_now()}
-
-    for reef in reefs:
-        reef_id = reef.get("id") or reef.get("name", "unknown")
-        reefs_checked += 1
-        if not _is_alert_worthy(reef):
-            skipped_threshold += 1
-            continue
-        if _is_in_cooldown(reef_id):
-            sent_at_str = _alert_last_sent.get(reef_id, "")
-            try:
-                elapsed_hours = (
-                    datetime.now(timezone.utc) - datetime.fromisoformat(sent_at_str)
-                ).total_seconds() / 3600
-            except Exception:
-                elapsed_hours = 0.0
-            print(f"[alert] Skipping duplicate alert for {reef.get('name')} — last sent {elapsed_hours:.1f} hours ago")
-            skipped_cooldown += 1
-            continue
-        sent = _send_alert_email(reef)
-        if sent:
-            _alert_last_sent[reef_id] = utc_now()
-            alerts_sent += 1
-        else:
-            errors.append(f"email send failed for {reef.get('name')}")
+        for reef_id in active_reef_ids:
+            reef = reef_by_id.get(reef_id)
+            if not reef:
+                continue
+            reefs_checked += 1
+            cooldown_key = f"{researcher_id}:{reef_id}"
+            if not _is_alert_worthy(reef):
+                skipped_threshold += 1
+                continue
+            if _is_in_cooldown(cooldown_key):
+                skipped_cooldown += 1
+                continue
+            if _send_alert_email(reef, recipient=email):
+                _alert_last_sent[cooldown_key] = utc_now()
+                alerts_sent += 1
+            else:
+                errors.append(f"email send failed for {reef.get('name')} → {_mask_email(email)}")
 
     result: Dict[str, Any] = {
         "checked_at": utc_now(),
+        "researchers_checked": len(profiles),
         "reefs_checked": reefs_checked,
         "alerts_sent": alerts_sent,
         "skipped_cooldown": skipped_cooldown,
         "skipped_threshold": skipped_threshold,
-        "cooldown_state": {k: v for k, v in _alert_last_sent.items()},
         "errors": errors,
     }
-    print(f"[alert-scheduler] done — sent={alerts_sent} cooldown={skipped_cooldown} below_threshold={skipped_threshold}")
+    print(f"[alert-scheduler] done — researchers={len(profiles)} reefs={reefs_checked} sent={alerts_sent}")
     return result
 
 
 @app.post("/api/alerts/trigger")
-async def trigger_alert_check() -> Dict[str, Any]:
-    """Manually trigger a reef alert check (bypasses the 24-hour schedule, respects cooldown)."""
+async def trigger_alert_check(request: Request) -> Dict[str, Any]:
+    """Manually trigger a reef alert check across all researcher profiles."""
     return await _run_alert_check()
 
 
-@app.get("/api/alerts/status")
-async def alert_status() -> Dict[str, Any]:
-    """Return the current per-reef cooldown state."""
-    return {
-        "cooldown_hours": ALERT_COOLDOWN_HOURS,
-        "email_configured": bool(ALERT_EMAIL_FROM and ALERT_EMAIL_TO and ALERT_EMAIL_PASSWORD),
-        "last_sent": {
-            reef_id: {"sent_at": sent_at, "in_cooldown": _is_in_cooldown(reef_id)}
-            for reef_id, sent_at in _alert_last_sent.items()
+@app.post("/api/alerts/test")
+async def test_alert(request: Request) -> Dict[str, Any]:
+    """Send a demo alert email using the highest-risk live reef from NOAA-backed data.
+
+    Body (all optional):
+        researcher_id: str  — look up email from researcher profile
+        reefId: str         — prefer a specific reef id if available
+    """
+    body: Dict[str, Any] = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+
+    researcher_id = body.get("researcher_id") if isinstance(body, dict) else None
+    reef_id = body.get("reefId") if isinstance(body, dict) else None
+
+    # Resolve recipient email from researcher profile
+    email = ""
+    if researcher_id:
+        profile = _get_or_create_researcher_profile(researcher_id)
+        email = profile.get("notification_email", "").strip()
+
+    if not email:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "emailSent": False,
+                "message": "No notification email configured. Add one in Settings first.",
+            },
+        )
+
+    # Build a combined reef lookup from live NOAA cache + custom-monitored reefs
+    cached_live: List[Dict[str, Any]] = _cache_get(_NOAA_CACHE, "live:list") or []
+    reef_by_id: Dict[str, Dict[str, Any]] = {r["id"]: r for r in cached_live if r.get("id")}
+    for r in _custom_monitored_reefs:
+        if r.get("id"):
+            reef_by_id[r["id"]] = r
+
+    all_live: List[Dict[str, Any]] = list(reef_by_id.values())
+
+    def _risk_value(r: Dict[str, Any]) -> float:
+        raw = r.get("riskScore") or r.get("risk_score") or 0
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            return 0.0
+        return val * 100 if val <= 1.0 else val
+
+    # Filter out reefs with 0% risk, then pick the highest-risk one
+    live_with_risk = [r for r in all_live if _risk_value(r) > 0]
+
+    # If a specific reefId was requested, prefer it (only if it has real risk data)
+    reef: Optional[Dict[str, Any]] = None
+    if reef_id:
+        candidate = reef_by_id.get(reef_id)
+        if candidate and _risk_value(candidate) > 0:
+            reef = candidate
+
+    if not reef and live_with_risk:
+        reef = max(live_with_risk, key=_risk_value)
+
+    if not reef:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "success": False,
+                "emailSent": False,
+                "message": "No live reef data with valid risk scores is available. Try again after NOAA data refreshes.",
+            },
+        )
+
+    sent = _send_demo_alert_email(reef, recipient=email)
+    if sent:
+        reef_name = reef.get("name", "Unknown Reef")
+        risk_pct = round(_risk_value(reef))
+        event: Dict[str, Any] = {
+            "id": f"demo-alert-{utc_now()}",
+            "event_type": "alert",
+            "description": "Demo alert triggered using live reef data.",
+            "reef_name": reef_name,
+            "metadata": json.dumps({"risk": risk_pct, "reef_id": reef.get("id")}),
+            "timestamp": utc_now(),
+        }
+        _demo_alert_events.insert(0, event)
+        if len(_demo_alert_events) > 20:
+            _demo_alert_events.pop()
+        return {
+            "success": True,
+            "emailSent": True,
+            "message": f"Demo alert sent for {reef_name} ({risk_pct}% bleaching risk)",
+            "sentTo": _mask_email(email),
+            "reef": reef_name,
+        }
+    return JSONResponse(
+        status_code=502,
+        content={
+            "success": False,
+            "emailSent": False,
+            "message": "SMTP send failed — check ALERT_EMAIL_FROM and ALERT_EMAIL_PASSWORD in Cloud Run environment.",
         },
+    )
+
+
+@app.get("/api/alerts/status")
+async def alert_status(researcher_id: Optional[str] = None) -> Dict[str, Any]:
+    """Return alert readiness for a specific researcher, or global state if no researcher_id."""
+    smtp_ready = bool(ALERT_EMAIL_FROM and ALERT_EMAIL_PASSWORD)
+    if researcher_id:
+        profile = _get_or_create_researcher_profile(researcher_id)
+        email = profile.get("notification_email", "")
+        prefix = f"{researcher_id}:"
+        return {
+            "researcher_id": researcher_id,
+            "smtp_ready": smtp_ready,
+            "email_configured": bool(email),
+            "cooldown_hours": ALERT_COOLDOWN_HOURS,
+            "last_sent": {
+                k[len(prefix):]: {"sent_at": v, "in_cooldown": _is_in_cooldown(k)}
+                for k, v in _alert_last_sent.items()
+                if k.startswith(prefix)
+            },
+        }
+    return {
+        "smtp_ready": smtp_ready,
+        "cooldown_hours": ALERT_COOLDOWN_HOURS,
+        "researchers_with_alerts": len(_list_researcher_profiles_with_alerts()),
+        "last_sent_keys": list(_alert_last_sent.keys()),
     }
 
 
