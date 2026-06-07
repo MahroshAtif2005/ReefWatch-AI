@@ -49,9 +49,7 @@ Interactive Google Maps visualization of 221 NOAA monitoring stations worldwide.
 Every active reef is analyzed by Gemini 2.5 Flash using live NOAA data. The AI produces a structured assessment including risk score (0–100), confidence level, threat summary, recommended actions, and historical context — automatically, on every data refresh.
 
 ### 🔁 Self-Improvement Loop
-The most important feature. A nightly evaluation pipeline uses **Gemini as an LLM as a Judge** to score recent reef assessments on accuracy, specificity, actionability, and hallucination avoidance. When quality drops below threshold, the system **automatically rewrites its own prompts**. No human intervention required. The agent gets better by itself.
-
-The loop actively triggered during submission week — scores dipped to 39%, the system detected the drop, a prompt rewrite was triggered, and scores recovered to 66% Quality · 90% Specificity.
+ReefWatch AI includes an autonomous self-improvement pipeline powered by Arize Phoenix observability and Gemini LLM-as-a-Judge evaluations. The system continuously analyzes real production traces, builds benchmark datasets from historical reef assessments, identifies recurring failure patterns, and generates candidate prompt improvements. Every candidate is tested against the production prompt in controlled benchmark experiments and is only promoted if it demonstrably outperforms the current version. Failed candidates are automatically rejected, and every decision—evaluations, experiments, promotions, and rejections—is recorded in a persistent audit trail. This creates a measurable, accountable feedback loop where improvements are earned through evidence rather than assumed.
 
 ### 🔍 Phoenix MCP Runtime Introspection
 The Gemini agent is configured with **Arize Phoenix MCP as a callable function tool**. At runtime, when the agent needs to reason about its own performance, it calls `query_phoenix_traces` and `query_phoenix_quality_metrics` directly — retrieving its own operational data mid-inference. Every MCP tool call is logged with timestamp, tool name, and retrieved data, visible in the Arize Monitoring dashboard. This is not just observability. This is **self-awareness**.
@@ -109,11 +107,114 @@ Every Gemini call is automatically traced by OpenInference instrumentation and l
 **4. Phoenix MCP Runtime Introspection**
 The agent is configured with the Phoenix MCP server as callable function tools. When the self-improvement loop runs — or when a researcher asks about system performance — the agent calls `query_phoenix_traces` and `query_phoenix_quality_metrics` at runtime, retrieving its own operational data to inform its reasoning. This closes the loop: the agent doesn't just produce data for observability. It reads that data back and uses it.
 
-**5. Self-Evaluation & Prompt Rewriting**
-The LLM-as-a-Judge pipeline queries Phoenix for recent traces, scores each assessment across four quality dimensions, and automatically rewrites the system prompt when quality drops below threshold. Prompt version history is maintained. Improvements are logged.
+**5. Self-Improvement Loop
+
+ReefWatch AI includes a production-grade autonomous improvement pipeline.
+
+Instead of blindly rewriting prompts, the system:
+
+- Evaluates real reef assessments using Gemini as an LLM-as-a-Judge
+
+- Builds benchmark datasets from production traces
+
+- Diagnoses weaknesses using Phoenix observability data
+
+- Generates candidate prompt improvements
+
+- Runs controlled benchmark experiments
+
+- Promotes only improvements that outperform production
+
+- Rejects regressions automatically
+
+- Records every decision in a persistent audit trail
+
+This creates a safe, measurable feedback loop where improvements must be earned through evaluation rather than assumed.
 
 **6. Autonomous Alerting**
 A Cloud Scheduler health ping keeps the service warm every 4 minutes. When bleaching thresholds are crossed, email alerts fire automatically with pre-generated conservation briefs attached.
+
+---
+## Arize Phoenix Integration
+
+ReefWatch AI uses Arize Phoenix as the observability and evaluation backbone of the system.
+
+### Production Tracing
+
+Every Gemini-powered reef assessment is traced through OpenInference and sent to Phoenix Cloud. This provides:
+
+- End-to-end LLM observability
+- Latency monitoring
+- Token usage tracking
+- Error rate monitoring
+- Runtime tool call visibility
+- Historical performance analysis
+
+More than 3,000 production traces have been collected and analyzed.
+
+### Phoenix MCP Runtime Introspection
+
+Phoenix is not used only for monitoring.
+
+The Researcher Workspace can query Phoenix at runtime through Phoenix MCP tools.
+
+When researchers ask operational questions such as:
+
+> "What is the current error rate?"
+>
+> "How has model quality changed recently?"
+
+The agent calls Phoenix MCP tools directly and reasons over its own operational data.
+
+This allows the agent to inspect its own behavior while generating responses.
+
+### LLM-as-a-Judge Evaluation
+
+Phoenix evaluation data powers ReefWatch AI's quality scoring pipeline.
+
+Recent reef assessments are evaluated across:
+
+- Accuracy
+- Specificity
+- Actionability
+- Scientific Reliability
+- DHW Interpretation
+- Uncertainty Communication
+- Hallucination Avoidance
+
+These scores are stored and tracked over time, allowing the system to detect regressions automatically.
+
+### Autonomous Improvement Pipeline
+
+Phoenix traces are converted into benchmark cases built from real production activity.
+
+The improvement cycle:
+
+1. Observe production traces
+2. Extract benchmark datasets
+3. Diagnose failure patterns
+4. Generate candidate prompt improvements
+5. Run controlled benchmark experiments
+6. Compare candidate vs production prompt
+7. Promote only if performance improves
+8. Record the decision in an audit trail
+
+Candidate prompts must outperform the production prompt by more than 1% while exceeding quality thresholds before promotion is allowed.
+
+Poor-performing candidates are automatically rejected.
+
+### Auditability
+
+Every improvement cycle creates a persistent audit record containing:
+
+- Benchmark results
+- Experiment outcomes
+- Promotion decisions
+- Rejection reasons
+- Quality metrics
+- Timestamped evaluation history
+
+This ensures every change the system makes to itself is fully traceable.
 
 ---
 
