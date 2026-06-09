@@ -138,7 +138,7 @@ are invoked at runtime — not mocked, not simulated.
 - ✅ `"model": "gemini-2.5-flash"` — Gemini invoked at runtime, not a wrapper
 - ✅ Trace IDs with timestamps of `2026-06-09T07:28:xx` — real Phoenix 
   production traces retrieved live via MCP, not cached or mocked
-- ✅ Deployed at https://reefwatch-ai-service-pqso4oqu5q-uc.a.run.app
+- ✅ Deployed at https://project-9b3e2672-8819-4fa5-afe.web.app/
 - ✅ All three required technologies verified in production: 
   Gemini, Google Cloud ADK, and Phoenix MCP
 
