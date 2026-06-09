@@ -3,6 +3,7 @@ uvicorn
 python-dotenv
 google-generativeai
 google-cloud-storage
+google-adk
 arize-phoenix
 arize-phoenix-otel
 openinference-instrumentation-vertexai
