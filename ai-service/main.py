@@ -3143,6 +3143,23 @@ def _restore_scores_from_history() -> None:
                 "last_experiment_rejected_score": None,
             }
             print(f"[startup] restored scores from GCS/SQLite history: avg={run.get('average_score')} date={run.get('date')}")
+            # Restore rejection cooldown: if the most recent experiment was rejected within
+            # the cooldown window, reload that timestamp so the guard survives container restarts.
+            try:
+                recent_exps = _load_recent_experiments_from_gcs(limit=5)
+                for exp in recent_exps:
+                    if not exp.get("promoted", True):
+                        ts_str = exp.get("timestamp")
+                        if ts_str:
+                            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                            hours_since = (datetime.now(timezone.utc) - ts).total_seconds() / 3600
+                            if hours_since < _REJECTION_COOLDOWN_HOURS:
+                                _last_self_improvement_scores["last_experiment_rejected_at"] = ts_str
+                                _last_self_improvement_scores["last_experiment_rejected_score"] = exp.get("baseline_score")
+                                print(f"[startup] restored rejection cooldown: last rejection {round(hours_since, 1)}h ago")
+                        break
+            except Exception as e:
+                print(f"[startup] could not restore rejection cooldown: {e}")
             _persist_scores_to_disk()
             return
 

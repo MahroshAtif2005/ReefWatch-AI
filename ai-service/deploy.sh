@@ -40,7 +40,7 @@ gcloud run deploy "${SERVICE_NAME}" \
   --memory 1Gi \
   --cpu 1 \
   --port 8000 \
-  --timeout 300 \
+  --timeout 3600 \
   --cpu-boost \
   --update-env-vars "SELF_IMPROVEMENT_STORAGE=GCS,SELF_IMPROVEMENT_GCS_BUCKET=${SI_BUCKET}"
 
@@ -106,7 +106,7 @@ if gcloud scheduler jobs describe "${SI_JOB_NAME}" \
     --http-method POST \
     --update-headers "Content-Type=application/json" \
     --message-body "{}" \
-    --attempt-deadline 270s
+    --attempt-deadline 900s
 else
   echo "    Creating new job"
   gcloud scheduler jobs create http "${SI_JOB_NAME}" \
@@ -117,7 +117,7 @@ else
     --http-method POST \
     --update-headers "Content-Type=application/json" \
     --message-body "{}" \
-    --attempt-deadline 270s \
+    --attempt-deadline 900s \
     --time-zone "UTC" \
     --description "Nightly self-improvement — health check + optional Gemini eval at 2 AM UTC"
 fi
