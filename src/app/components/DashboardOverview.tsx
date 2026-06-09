@@ -193,8 +193,9 @@ export function DashboardOverview({ onNavigate }: DashboardOverviewProps) {
             </div>
           )}
 
-          {/* Loading banner — shown while reef data is in flight */}
-          {!dataReady && (
+          {/* Loading banner — only shown when reefs are selected and data is still in flight.
+               Never shown when activeReefIds is empty — there's nothing to load yet. */}
+          {!dataReady && activeReefIds.length > 0 && (
             <motion.div
               initial={{ opacity: 0, y: 10 }}
               animate={{ opacity: 1, y: 0 }}
@@ -222,8 +223,9 @@ export function DashboardOverview({ onNavigate }: DashboardOverviewProps) {
             </motion.div>
           )}
 
-          {/* Onboarding card — shown when no reefs are active after data has loaded */}
-          {reefStats.total === 0 && dataReady && (
+          {/* Onboarding card — shown immediately when no reefs are selected (no waiting for
+               dataReady). First-time users and incognito sessions see this right away. */}
+          {activeReefIds.length === 0 && (
             <motion.div
               initial={{ opacity: 0, y: 10 }}
               animate={{ opacity: 1, y: 0 }}
@@ -235,10 +237,34 @@ export function DashboardOverview({ onNavigate }: DashboardOverviewProps) {
                   <Radio className="h-6 w-6 text-cyan-glow" />
                 </div>
                 <div className="flex-1 min-w-0">
-                  <h3 className="text-xl text-white mb-3">No reefs are currently being actively monitored.</h3>
-                  <p className="text-sm text-gray-light leading-relaxed mb-6 max-w-2xl">
-                    Open the Live Reef Map and select the reefs you want ReefWatch AI to track. Once added, the system will continuously monitor those reefs, generate AI assessments, and send email alerts when bleaching risk or thermal stress reaches critical levels.
-                  </p>
+                  <h3 className="text-xl text-white mb-1">No reefs being monitored yet</h3>
+                  <p className="text-sm text-gray-muted mb-6">To start monitoring coral reefs:</p>
+
+                  <ol className="mb-6 space-y-2 text-sm text-gray-light">
+                    <li className="flex items-start gap-3">
+                      <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-cyan-glow/40 bg-cyan-glow/10 text-xs text-cyan-glow font-medium">1</span>
+                      Open the <button onClick={() => onNavigate('map')} className="text-cyan-glow underline underline-offset-2 hover:text-cyan-bright transition-colors">Live Reef Map</button>
+                    </li>
+                    <li className="flex items-start gap-3">
+                      <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-cyan-glow/40 bg-cyan-glow/10 text-xs text-cyan-glow font-medium">2</span>
+                      Select one or more reef stations
+                    </li>
+                    <li className="flex items-start gap-3">
+                      <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-cyan-glow/40 bg-cyan-glow/10 text-xs text-cyan-glow font-medium">3</span>
+                      Click <span className="rounded-md border border-gray-border/50 bg-ocean-medium/60 px-1.5 py-0.5 text-xs text-white">Save Monitoring Selection</span>
+                    </li>
+                  </ol>
+
+                  <div className="mb-6 rounded-xl border border-cyan-glow/15 bg-ocean-deep/40 px-4 py-3">
+                    <p className="mb-2 text-xs text-gray-muted">ReefWatch AI will then:</p>
+                    <ul className="space-y-1.5 text-sm text-gray-light">
+                      <li className="flex items-center gap-2"><span className="text-cyan-glow">•</span> Track those reefs on the dashboard</li>
+                      <li className="flex items-center gap-2"><span className="text-cyan-glow">•</span> Generate AI risk assessments</li>
+                      <li className="flex items-center gap-2"><span className="text-cyan-glow">•</span> Include them in conservation reports</li>
+                      <li className="flex items-center gap-2"><span className="text-cyan-glow">•</span> Send alerts when risk becomes critical</li>
+                    </ul>
+                  </div>
+
                   <button
                     onClick={() => onNavigate('map')}
                     className="inline-flex items-center gap-2 rounded-xl border border-cyan-glow/50 bg-cyan-glow/15 px-5 py-2.5 text-sm text-cyan-glow transition hover:bg-cyan-glow/25 hover:border-cyan-glow/70"
@@ -247,13 +273,24 @@ export function DashboardOverview({ onNavigate }: DashboardOverviewProps) {
                     Go to Live Reef Map
                     <ArrowRight className="h-4 w-4" />
                   </button>
+
+                  {/* Private-browsing note embedded in onboarding card */}
+                  {!storageAvailable && (
+                    <div className="mt-5 flex items-start gap-3 rounded-xl border border-coral-warning/30 bg-coral-warning/6 px-4 py-3">
+                      <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-coral-warning" />
+                      <p className="text-sm text-gray-light leading-relaxed">
+                        <span className="font-medium text-coral-warning">Private browsing detected.</span>{' '}
+                        Monitoring selections may not persist — local storage is disabled or cleared automatically in private mode.
+                      </p>
+                    </div>
+                  )}
                 </div>
               </div>
             </motion.div>
           )}
 
-          {/* Note 2: private/incognito browsing — localStorage unavailable */}
-          {!storageAvailable && (
+          {/* Private-browsing warning for users who already have reefs selected */}
+          {activeReefIds.length > 0 && !storageAvailable && (
             <motion.div
               initial={{ opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}
