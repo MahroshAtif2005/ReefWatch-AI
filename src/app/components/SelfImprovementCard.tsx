@@ -12,11 +12,13 @@ import {
 } from 'recharts';
 import { AlertTriangle, BrainCircuit, CheckCircle2, Database, FlaskConical, Loader2, Play, RefreshCw, Sparkles, TrendingUp } from 'lucide-react';
 import {
+  fetchCostTelemetry,
   fetchLatestSelfImprovementRun,
   fetchSelfImprovementHistory,
   fetchSelfImprovementV2Status,
   runSelfEvaluationNow,
   SELF_EVALUATION_SLOW_MESSAGE,
+  type CostTelemetry,
   type SelfImprovementHistory,
   type SelfImprovementRun,
   type SelfImprovementV2Status,
@@ -240,6 +242,7 @@ export function SelfImprovementCard() {
   const [isShowingCachedData, setIsShowingCachedData] = useState(() => !!loadStoredRun());
   const [history, setHistory] = useState<SelfImprovementHistory | null>(null);
   const [v2Status, setV2Status] = useState<SelfImprovementV2Status | null>(null);
+  const [costTelemetry, setCostTelemetry] = useState<CostTelemetry | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isRunning, setIsRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -262,11 +265,13 @@ export function SelfImprovementCard() {
         return null;
       }),
       fetchSelfImprovementV2Status().catch(() => null),
+      fetchCostTelemetry().catch(() => null),
     ]);
 
-    doFetch().then(([latestRun, hist, v2]) => {
+    doFetch().then(([latestRun, hist, v2, cost]) => {
       if (!isMounted) return;
       if (v2) setV2Status(v2);
+      if (cost) setCostTelemetry(cost);
       const hasScores = latestRun && (
         typeof latestRun.average_score === 'number' ||
         latestRun.status === 'healthy' ||
@@ -278,7 +283,7 @@ export function SelfImprovementCard() {
         retryScheduled = true;
         setTimeout(() => {
           if (!isMounted) return;
-          doFetch().then(([retryRun, retryHist, retryV2]) => {
+          doFetch().then(([retryRun, retryHist, retryV2, retryCost]) => {
             if (!isMounted) return;
             const retryHasScores = retryRun && (
               typeof retryRun.average_score === 'number' ||
@@ -291,6 +296,7 @@ export function SelfImprovementCard() {
               setIsShowingCachedData(false);
             }
             if (retryV2) setV2Status(retryV2);
+            if (retryCost) setCostTelemetry(retryCost);
             setHistory(retryHist);
             setError(null);
             setNotice(null);
@@ -541,6 +547,18 @@ export function SelfImprovementCard() {
 
   const hasPreviousScore = typeof previousScore === 'number';
   const hasBeforeAfter = typeof previousScore === 'number' && typeof latestScore === 'number';
+
+  // Show an explanatory notice when the latest fresh-sample score is below threshold
+  // but the stable benchmark score (from the last experiment's baseline) is still healthy.
+  // A single fresh sample is noisy — do not treat it as a production quality regression.
+  const benchmarkScore = v2Status?.benchmark_score ?? null;
+  const freshSampleScore = run?.average_score ?? null;
+  const freshSampleDroppedButBenchmarkHealthy = (
+    typeof benchmarkScore === 'number' &&
+    benchmarkScore >= 0.75 &&
+    typeof freshSampleScore === 'number' &&
+    freshSampleScore < benchmarkScore - 0.03   // at least 3pp below benchmark
+  );
   const historyPoints = history?.history ?? [];
   const shouldAppendManualRun =
     (run?.status === 'completed' || run?.status === 'improved') &&
@@ -864,6 +882,42 @@ export function SelfImprovementCard() {
               </div>
             ))}
           </div>
+        </div>
+      )}
+
+      {/* Fresh-sample vs benchmark explanatory notice */}
+      {freshSampleDroppedButBenchmarkHealthy && (
+        <div className="flex items-start gap-3 rounded-xl border border-cyan-glow/25 bg-cyan-glow/5 px-5 py-4">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-cyan-glow" />
+          <div className="space-y-1 text-sm">
+            <p className="text-white">
+              Fresh sample found weaknesses — production prompt retained pending benchmark validation.
+            </p>
+            <p className="text-gray-light leading-5">
+              Fresh eval: <span className="font-mono text-coral-warning">{formatPercent(freshSampleScore)}</span>
+              {' · '}
+              Benchmark score: <span className="font-mono text-coral-safe">{formatPercent(benchmarkScore)}</span>
+              {' · '}
+              The fresh sample evaluates a random subset of reefs each run and can vary by ±10%.
+              The benchmark score (from the last controlled experiment) is the authoritative quality signal.
+              An experiment rewrite will only be triggered if the benchmark score falls below 75%.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Cost telemetry row */}
+      {costTelemetry && (
+        <div className="flex flex-wrap items-center gap-x-5 gap-y-1 rounded-xl border border-gray-border/30 bg-ocean-deep/30 px-4 py-2.5 text-xs text-gray-muted">
+          <span className="text-gray-light">Gemini calls this session:</span>
+          <span>Eval: <span className="font-mono text-white">{costTelemetry.last_eval_calls}</span></span>
+          <span>Experiment: <span className="font-mono text-white">{costTelemetry.last_experiment_calls}</span></span>
+          <span>Total: <span className="font-mono text-white">{costTelemetry.total_calls_this_session}</span></span>
+          {costTelemetry.rejection_cooldown_active && (
+            <span className="rounded-full border border-coral-warning/30 bg-coral-warning/8 px-2 py-0.5 text-coral-warning">
+              Rejection cooldown active — retry blocked
+            </span>
+          )}
         </div>
       )}
 

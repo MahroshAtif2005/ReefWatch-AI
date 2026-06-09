@@ -48,14 +48,14 @@ const toNavigationReef = (reef: LiveReef) => ({
 export function DashboardOverview({ onNavigate }: DashboardOverviewProps) {
   const { allReefs, activeReefs, activeReefIds, storageAvailable, totalStationCount, isLoading: isLoadingReefs, error: reefError, refetch } = useReefData();
 
-  // All four stat cards reflect active monitored reefs only (personal monitoring summary).
-  // Computed only after allReefs loads so all four numbers transition atomically.
+  // total = full user selection (including reefs not yet matched to NOAA data).
+  // critical/warning/healthy are derived only from matched reefs that have live status.
   const reefStats = useMemo(() => ({
-    total: activeReefs.length,
+    total: activeReefIds.length,
     critical: activeReefs.filter((reef) => reef.status === 'critical').length,
     warning: activeReefs.filter((reef) => reef.status === 'warning').length,
     healthy: activeReefs.filter((reef) => reef.status === 'safe').length,
-  }), [activeReefs]);
+  }), [activeReefIds, activeReefs]);
 
   // UI display only — highest-risk NOAA reefs on the dashboard overview.
   const alertReefs = useMemo(() => {
@@ -113,7 +113,11 @@ export function DashboardOverview({ onNavigate }: DashboardOverviewProps) {
                 <span className="text-sm text-gray-muted">Active Monitoring</span>
               </div>
               <p className="text-5xl text-white mb-2">{statValue(reefStats.total)}</p>
-              <p className="text-sm text-gray-light">Actively monitored</p>
+              <p className="text-sm text-gray-light">
+                {orphanedCount > 0
+                  ? `${activeReefs.length} live · ${orphanedCount} pending NOAA`
+                  : 'Actively monitored'}
+              </p>
             </motion.div>
 
             <motion.div
@@ -193,7 +197,7 @@ export function DashboardOverview({ onNavigate }: DashboardOverviewProps) {
               <AlertTriangle className="h-4 w-4 shrink-0 text-coral-warning" />
               <span className="text-sm text-coral-warning">
                 {activeReefs.length} active reef{activeReefs.length !== 1 ? 's' : ''} matched live NOAA data
-                {'; '}{orphanedCount} saved reef{orphanedCount > 1 ? 's' : ''} could not be matched to current NOAA data (IDs preserved).
+                {'; '}{orphanedCount} saved reef{orphanedCount !== 1 ? 's' : ''} could not be matched (IDs preserved — selections will restore when NOAA data is available).
               </span>
             </motion.div>
           )}

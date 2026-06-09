@@ -735,7 +735,27 @@ _last_self_improvement_scores: Dict[str, Any] = {
     "prompt_updated": False,
     "updated_at": None,
     "summary": "Default baseline scores — run self-improvement to generate real evaluation data.",
+    # Rejection cooldown — set when an experiment is rejected so the next cycle
+    # does not immediately retry unless quality drops by at least REJECTION_RETRY_THRESHOLD.
+    "last_experiment_rejected_at": None,
+    "last_experiment_rejected_score": None,
 }
+
+# Gemini API call telemetry — counts calls per phase so the dashboard can show estimated cost.
+_gemini_cost_stats: Dict[str, Any] = {
+    "last_eval_calls": 0,
+    "last_experiment_calls": 0,
+    "nightly_cycle_calls": 0,
+    "total_calls_this_session": 0,
+    "last_eval_at": None,
+    "last_experiment_at": None,
+    "last_nightly_at": None,
+}
+
+# Minimum absolute drop in quality score before a rejected experiment can be retried.
+_REJECTION_RETRY_THRESHOLD = 0.05   # 5 percentage points
+# Hours after a rejection during which a retry is blocked unless score dropped enough.
+_REJECTION_COOLDOWN_HOURS = 24
 
 def _persist_scores_to_disk() -> None:
     try:
@@ -3119,6 +3139,8 @@ def _restore_scores_from_history() -> None:
                 "quota_limited": bool(run.get("quota_limited")),
                 "updated_at": run.get("last_checked") or run.get("completed_at") or run.get("date"),
                 "summary": run.get("summary", ""),
+                "last_experiment_rejected_at": None,
+                "last_experiment_rejected_score": None,
             }
             print(f"[startup] restored scores from GCS/SQLite history: avg={run.get('average_score')} date={run.get('date')}")
             _persist_scores_to_disk()
@@ -4261,7 +4283,8 @@ async def run_self_improvement(payload: Optional[SelfImprovementRequest] = None)
         span.add_event("self_improvement_loop_completed")
         span.set_status(Status(StatusCode.OK))
         if judgements:
-            # Only update cached scores when we have real judgements — never overwrite with zeros
+            # Only update cached scores when we have real judgements — never overwrite with zeros.
+            # Preserve rejection-cooldown fields so the experiment guard survives across evals.
             _last_self_improvement_scores = {
                 "date": run_date,
                 "average_score": average_overall,
@@ -4278,6 +4301,10 @@ async def run_self_improvement(payload: Optional[SelfImprovementRequest] = None)
                 "prompt_updated": prompt_updated,
                 "updated_at": utc_now(),
                 "summary": summary,
+                # Preserve rejection cooldown state from the previous value so it
+                # is not wiped out by a fresh evaluation that doesn't run experiments.
+                "last_experiment_rejected_at": _last_self_improvement_scores.get("last_experiment_rejected_at"),
+                "last_experiment_rejected_score": _last_self_improvement_scores.get("last_experiment_rejected_score"),
             }
             _persist_scores_to_disk()
             _save_run_to_history(result)
@@ -4963,6 +4990,69 @@ def _load_improvement_history_from_gcs(limit: int = 20) -> List[Dict[str, Any]]:
         return []
 
 
+def _is_in_rejection_cooldown(average_overall: float, cycle_id: str) -> bool:
+    """Return True when an experiment should be blocked by the rejection cooldown.
+
+    After a rejected experiment we require a meaningful quality drop before retrying
+    to avoid burning Gemini quota on rapid-fire rewrites that won't improve the prompt.
+    """
+    last_rejected_at = _last_self_improvement_scores.get("last_experiment_rejected_at")
+    last_rejected_score = _last_self_improvement_scores.get("last_experiment_rejected_score")
+    if not last_rejected_at:
+        return False
+    try:
+        ts = datetime.fromisoformat(last_rejected_at.replace("Z", "+00:00"))
+        hours_since = (datetime.now(timezone.utc) - ts).total_seconds() / 3600
+    except Exception:
+        return False
+
+    if hours_since >= _REJECTION_COOLDOWN_HOURS:
+        return False  # Cooldown expired — allow retry
+
+    if not isinstance(last_rejected_score, (int, float)):
+        return False
+
+    score_drop = float(last_rejected_score) - average_overall
+    if score_drop >= _REJECTION_RETRY_THRESHOLD:
+        return False  # Score dropped enough — allow retry despite cooldown
+
+    reason = (
+        f"last experiment rejected {round(hours_since)}h ago (score was {last_rejected_score:.0%}); "
+        f"current drop {score_drop:.0%} < {_REJECTION_RETRY_THRESHOLD:.0%} threshold — "
+        f"production prompt retained, no retry until score drops more or cooldown expires"
+    )
+    print(f"[autonomous-cycle:{cycle_id}] rejection cooldown active — {reason}")
+    _log_mcp_call(
+        "experiment_skipped_rejection_cooldown",
+        f"Experiment skipped — {reason}",
+        {"hours_since_rejection": round(hours_since), "score_drop": round(score_drop, 4)},
+    )
+    return True
+
+
+def _increment_gemini_cost(phase: str, amount: int = 1) -> None:
+    """Increment the in-memory Gemini call counter for a given phase."""
+    global _gemini_cost_stats
+    _gemini_cost_stats["total_calls_this_session"] = (
+        _gemini_cost_stats.get("total_calls_this_session", 0) + amount
+    )
+    if phase == "eval":
+        _gemini_cost_stats["last_eval_calls"] = (
+            _gemini_cost_stats.get("last_eval_calls", 0) + amount
+        )
+        _gemini_cost_stats["last_eval_at"] = utc_now()
+    elif phase == "experiment":
+        _gemini_cost_stats["last_experiment_calls"] = (
+            _gemini_cost_stats.get("last_experiment_calls", 0) + amount
+        )
+        _gemini_cost_stats["last_experiment_at"] = utc_now()
+    elif phase == "nightly":
+        _gemini_cost_stats["nightly_cycle_calls"] = (
+            _gemini_cost_stats.get("nightly_cycle_calls", 0) + amount
+        )
+        _gemini_cost_stats["last_nightly_at"] = utc_now()
+
+
 # ── Phase 6: Autonomous Nightly Learning Cycle ────────────────────────────────
 
 async def _run_autonomous_improvement_cycle(source: str = "nightly_scheduler") -> Dict[str, Any]:
@@ -5046,9 +5136,28 @@ async def _run_autonomous_improvement_cycle(source: str = "nightly_scheduler") -
     prompt_history = _load_prompt_history_from_gcs()
     promoted = False
 
-    if (
-        average_overall < 0.75
-        and diagnosis is not None
+    # ── Cost guard: skip all experiment phases when quality is healthy ─────────
+    # Fresh sample evals are noisy (they evaluate different random reefs each run).
+    # If the benchmark quality is already good, a drop in a single fresh sample is
+    # not evidence of real regression — do not trigger expensive Gemini experiment.
+    if average_overall >= 0.75:
+        skip_reason = f"fresh sample quality {average_overall:.0%} ≥ 75% — production prompt retained, no experiment needed"
+        audit["phases"]["experiment_skipped"] = {"reason": "skipped_healthy", "score": average_overall}
+        _log_mcp_call(
+            "experiment_skipped_healthy",
+            f"Experiment skipped — fresh sample quality {average_overall:.0%} is above threshold. "
+            f"Production prompt {current_version} is healthy. Zero experiment Gemini calls used.",
+            {"score": average_overall, "version": current_version},
+        )
+        print(f"[autonomous-cycle:{cycle_id}] step 4-7 skipped — {skip_reason}")
+
+    # ── Rejection cooldown: don't retry experiment if last one was rejected recently ──
+    elif _is_in_rejection_cooldown(average_overall, cycle_id):
+        audit["phases"]["experiment_skipped"] = {"reason": "rejection_cooldown", "score": average_overall}
+        # (logging done inside _is_in_rejection_cooldown)
+
+    elif (
+        diagnosis is not None
         and diagnosis.get("rewrite_warranted")
     ):
         print(f"[autonomous-cycle:{cycle_id}] step 4-7 — quality low ({average_overall:.0%}), running experiment pipeline")
@@ -5058,8 +5167,8 @@ async def _run_autonomous_improvement_cycle(source: str = "nightly_scheduler") -
             {"current_version": current_version, "diagnosis": diagnosis.get("diagnosis_summary")},
         )
 
-        # Load benchmark cases for experiment
-        benchmark_cases = _load_benchmark_cases_from_gcs(limit=20)
+        # Load benchmark cases for experiment (hard cap: 5 cases = max 12 Gemini calls total)
+        benchmark_cases = _load_benchmark_cases_from_gcs(limit=5)
         audit["phases"]["benchmark_loaded"] = {"count": len(benchmark_cases)}
 
         if len(benchmark_cases) >= 3:
@@ -5088,6 +5197,8 @@ async def _run_autonomous_improvement_cycle(source: str = "nightly_scheduler") -
             phoenix_failure_modes = phoenix_data.get("failure_modes", [])
             try:
                 loop = asyncio.get_running_loop()
+                # +1 Gemini call: candidate prompt generation
+                _increment_gemini_cost("experiment")
                 candidate_text = await asyncio.wait_for(
                     loop.run_in_executor(
                         None,
@@ -5114,7 +5225,8 @@ async def _run_autonomous_improvement_cycle(source: str = "nightly_scheduler") -
                         {"version": next_version, "target_dims": diagnosis.get("model_reasoning_dimensions")},
                     )
 
-                    # Run experiment
+                    # Run experiment (+N×2 analysis calls + 2 judge calls)
+                    _increment_gemini_cost("experiment", amount=len(benchmark_cases) * 2 + 2)
                     experiment_result = await run_prompt_experiment(
                         baseline_prompt=current_prompt,
                         candidate_prompt=candidate_text,
@@ -5136,6 +5248,10 @@ async def _run_autonomous_improvement_cycle(source: str = "nightly_scheduler") -
                             diagnosis_summary=diagnosis.get("diagnosis_summary"),
                         )
                         promoted = True
+                        # Clear rejection cooldown on successful promotion
+                        _last_self_improvement_scores["last_experiment_rejected_at"] = None
+                        _last_self_improvement_scores["last_experiment_rejected_score"] = None
+                        _persist_scores_to_disk()
                         _log_mcp_call(
                             "prompt_promoted",
                             f"Promoted prompt {next_version} to production. "
@@ -5144,10 +5260,15 @@ async def _run_autonomous_improvement_cycle(source: str = "nightly_scheduler") -
                             experiment_result,
                         )
                     else:
+                        # Record rejection so the cooldown guard fires next cycle
+                        _last_self_improvement_scores["last_experiment_rejected_at"] = utc_now()
+                        _last_self_improvement_scores["last_experiment_rejected_score"] = average_overall
+                        _persist_scores_to_disk()
                         _log_mcp_call(
                             "experiment_rejected",
                             f"Candidate prompt rejected — experiment delta {experiment_result.get('delta', 0):+.3f} insufficient. "
-                            f"Production prompt {current_version} preserved.",
+                            f"Production prompt {current_version} preserved. "
+                            f"Retry blocked for {_REJECTION_COOLDOWN_HOURS}h unless score drops ≥{_REJECTION_RETRY_THRESHOLD:.0%}.",
                             experiment_result,
                         )
                 else:
@@ -5185,6 +5306,9 @@ async def _run_autonomous_improvement_cycle(source: str = "nightly_scheduler") -
         "cycle_id": cycle_id,
         "status": final_status,
         "evaluation_score": average_overall,
+        # Distinguish fresh random-sample evals from stable benchmark scores.
+        # Consumers should not treat a single fresh_sample drop as a quality trend.
+        "eval_type": "fresh_sample",
         "promoted": promoted,
         "experiment": experiment_result,
         "current_prompt_version": current_version,
@@ -5237,6 +5361,11 @@ async def self_improvement_v2_status() -> Dict[str, Any]:
         ],
         "current_quality": latest_run.get("average_score") if latest_run else None,
         "current_system_status": latest_run.get("system_status") if latest_run else None,
+        # Stable benchmark score from the most recent experiment's baseline evaluation.
+        # Use this for trend comparisons — it is NOT affected by fresh-sample noise.
+        "benchmark_score": latest_exp.get("baseline_score") if latest_exp else None,
+        "fresh_sample_score": latest_run.get("average_score") if latest_run and latest_run.get("eval_type") == "fresh_sample" else None,
+        "rejection_cooldown_active": bool(_last_self_improvement_scores.get("last_experiment_rejected_at")),
         "last_updated": utc_now(),
     }
 
@@ -5289,6 +5418,33 @@ async def self_improvement_v2_audit_history(limit: int = 10) -> Dict[str, Any]:
     """Return improvement cycle audit trail."""
     entries = _load_improvement_history_from_gcs(limit=min(int(limit), 30))
     return {"entries": entries, "count": len(entries)}
+
+
+@app.get("/api/self-improvement/cost-telemetry")
+async def self_improvement_cost_telemetry() -> Dict[str, Any]:
+    """Estimated Gemini API call counts per phase for cost monitoring.
+
+    Healthy system: 0 experiment calls/day (all skipped by cost guard).
+    Unhealthy system: up to ~15 calls/cycle (1 candidate + 10 eval + 2 judge + 2 verification).
+    """
+    return {
+        "last_eval_calls": _gemini_cost_stats.get("last_eval_calls", 0),
+        "last_experiment_calls": _gemini_cost_stats.get("last_experiment_calls", 0),
+        "nightly_cycle_calls": _gemini_cost_stats.get("nightly_cycle_calls", 0),
+        "total_calls_this_session": _gemini_cost_stats.get("total_calls_this_session", 0),
+        "last_eval_at": _gemini_cost_stats.get("last_eval_at"),
+        "last_experiment_at": _gemini_cost_stats.get("last_experiment_at"),
+        "last_nightly_at": _gemini_cost_stats.get("last_nightly_at"),
+        "rejection_cooldown_active": bool(_last_self_improvement_scores.get("last_experiment_rejected_at")),
+        "last_experiment_rejected_at": _last_self_improvement_scores.get("last_experiment_rejected_at"),
+        "cost_caps": {
+            "max_benchmark_cases_per_experiment": 5,
+            "max_candidate_prompts_per_cycle": 1,
+            "max_judge_comparisons": 2,
+            "rejection_cooldown_hours": _REJECTION_COOLDOWN_HOURS,
+            "rejection_retry_threshold": _REJECTION_RETRY_THRESHOLD,
+        },
+    }
 
 
 @app.post("/api/self-improvement/nightly")
@@ -5377,9 +5533,20 @@ async def run_nightly_self_improvement() -> Dict[str, Any]:
         "promoted": cycle_result.get("promoted"),
         "experiment": cycle_result.get("experiment"),
     }
+
+    # Annotate the result so the UI can distinguish noisy fresh-sample scores
+    # from stable benchmark scores (last experiment's baseline_score).
+    full_result["eval_type"] = "fresh_sample"
+    recent_experiments = _load_recent_experiments_from_gcs(limit=1)
+    if recent_experiments:
+        full_result["benchmark_score"] = recent_experiments[0].get("baseline_score")
+    else:
+        full_result["benchmark_score"] = None
+
     print(
         f"[self-improvement] nightly completed at {utc_now()} — "
-        f"score={full_result.get('average_score')} promoted={cycle_result.get('promoted')}"
+        f"fresh_sample={full_result.get('average_score')} benchmark={full_result.get('benchmark_score')} "
+        f"promoted={cycle_result.get('promoted')}"
     )
     return full_result
 

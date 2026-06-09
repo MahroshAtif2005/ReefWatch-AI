@@ -368,6 +368,12 @@ export interface SelfImprovementV2Status {
   prompt_history: PromptVersionEntry[];
   current_quality: number | null;
   current_system_status: string | null;
+  /** Stable score from the most recent experiment's baseline — use this for trend comparisons. */
+  benchmark_score: number | null;
+  /** Score from the latest fresh random-sample evaluation — may be noisy. */
+  fresh_sample_score: number | null;
+  /** True when the last experiment was rejected and the cooldown window is still active. */
+  rejection_cooldown_active: boolean;
   last_updated: string;
 }
 
@@ -377,6 +383,31 @@ export interface BenchmarkStats {
   oldest: string | null;
   newest: string | null;
   gcs_bucket: string;
+}
+
+export interface CostTelemetry {
+  last_eval_calls: number;
+  last_experiment_calls: number;
+  nightly_cycle_calls: number;
+  total_calls_this_session: number;
+  last_eval_at: string | null;
+  last_experiment_at: string | null;
+  last_nightly_at: string | null;
+  rejection_cooldown_active: boolean;
+  last_experiment_rejected_at: string | null;
+  cost_caps: {
+    max_benchmark_cases_per_experiment: number;
+    max_candidate_prompts_per_cycle: number;
+    max_judge_comparisons: number;
+    rejection_cooldown_hours: number;
+    rejection_retry_threshold: number;
+  };
+}
+
+export async function fetchCostTelemetry(): Promise<CostTelemetry> {
+  const response = await fetch(`${REEF_API_BASE_URL}/api/self-improvement/cost-telemetry`);
+  if (!response.ok) throw new Error(`cost telemetry request failed: ${response.status}`);
+  return response.json();
 }
 
 export async function fetchSelfImprovementV2Status(): Promise<SelfImprovementV2Status> {
