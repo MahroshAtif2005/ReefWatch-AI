@@ -453,15 +453,12 @@ export function getResearcherId(): string {
 }
 
 export async function syncResearcherActiveReefs(researcherId: string, reefIds: string[]): Promise<void> {
-  try {
-    await fetch(`${REEF_API_BASE_URL}/api/researcher/active-reefs`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ researcher_id: researcherId, reef_ids: reefIds }),
-    });
-  } catch {
-    // non-critical background sync
-  }
+  await fetch(`${REEF_API_BASE_URL}/api/researcher/active-reefs`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ researcher_id: researcherId, reef_ids: reefIds }),
+  });
+  // Errors propagate to the caller — the context catches and logs them as non-fatal.
 }
 const SELF_EVALUATION_TIMEOUT_MS = 120000;
 export const SELF_EVALUATION_SLOW_MESSAGE =

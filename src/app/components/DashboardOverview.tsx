@@ -85,31 +85,47 @@ export function DashboardOverview({ onNavigate }: DashboardOverviewProps) {
       .slice(0, 3);
   }, [allReefs]);
 
-  // Single loading guard used by all four stat cards — they all show '...' until allReefs
-  // is populated, then transition to their final values at the same moment.
+  // dataReady: NOAA data has finished loading (or returned at least one reef).
+  // Used only for critical/warning/healthy counts which depend on live NOAA status.
+  // The total selection count (activeReefIds) is always available immediately from localStorage.
   const dataReady = !isLoadingReefs || allReefs.length > 0;
-  const statValue = (value: number): number | string => dataReady ? value : '...';
+  // Only the status-derived stats (critical/warning/healthy) need to wait for NOAA data.
+  const statusStatValue = (value: number): number | string => dataReady ? value : '...';
 
   // IDs that exist in localStorage but couldn't be matched to any reef returned by the backend.
-  // Only meaningful after data has loaded.
+  // Only meaningful after data has loaded. During loading: all selected IDs are "pending".
   const orphanedCount = dataReady
     ? activeReefIds.filter(id => !allReefs.find(r => r.id === id)).length
     : 0;
+  // During loading, selected IDs count as pending until NOAA data arrives.
+  const pendingCount = !dataReady ? activeReefIds.length : orphanedCount;
+  const liveCount = !dataReady ? 0 : activeReefs.length;
 
-  // Log counts and timing once data is ready so map/dashboard discrepancies are visible in DevTools
+  // Sub-label for the Active Monitoring card — shows detailed breakdown as soon as possible.
+  const activeMonitoringSubLabel = !dataReady && activeReefIds.length > 0
+    ? 'Loading live NOAA status…'
+    : pendingCount > 0
+    ? `${liveCount} live · ${pendingCount} pending NOAA`
+    : activeReefIds.length > 0
+    ? 'Actively monitored'
+    : 'No reefs selected';
+
+  // Debug logs at dashboard level
   useEffect(() => {
-    if (dataReady && allReefs.length > 0) {
-      console.log(
-        '[reefwatch:dashboard] counts —',
-        `activeMonitoring=${reefStats.total}`,
-        `critical=${reefStats.critical}`,
-        `warning=${reefStats.warning}`,
-        `healthy=${reefStats.healthy}`,
-        `orphaned=${orphanedCount}`,
-        `(activeReefIds=${activeReefIds.length}, activeReefs=${activeReefs.length})`,
-      );
+    console.log(
+      '[active-reefs] selected local ids:', activeReefIds.length, activeReefIds,
+    );
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (dataReady) {
+      const matched = activeReefs.map(r => r.id);
+      const orphaned = activeReefIds.filter(id => !allReefs.find(r => r.id === id));
+      console.log('[active-reefs] matched live ids:', matched.length, matched);
+      console.log('[active-reefs] orphan/pending ids:', orphaned.length, orphaned);
     }
-  }, [dataReady, reefStats, orphanedCount]);
+  }, [dataReady]);
 
   return (
     <div className="h-full overflow-auto">
@@ -120,7 +136,7 @@ export function DashboardOverview({ onNavigate }: DashboardOverviewProps) {
           animate={{ opacity: 1, y: 0 }}
         >
           <h1 className="text-4xl text-white mb-3">Global Reef Status</h1>
-          <p className="text-gray-muted mb-12">{totalStationCount > 0 ? totalStationCount : '...'} NOAA reef stations monitored globally · {statValue(reefStats.total)} under deep AI analysis</p>
+          <p className="text-gray-muted mb-12">{totalStationCount > 0 ? totalStationCount : '...'} NOAA reef stations monitored globally · {reefStats.total} under deep AI analysis</p>
 
           <div className="grid grid-cols-4 gap-6">
             <motion.div
@@ -132,12 +148,8 @@ export function DashboardOverview({ onNavigate }: DashboardOverviewProps) {
                 <Activity className="w-6 h-6 text-cyan-glow" />
                 <span className="text-sm text-gray-muted">Active Monitoring</span>
               </div>
-              <p className="text-5xl text-white mb-2">{statValue(reefStats.total)}</p>
-              <p className="text-sm text-gray-light">
-                {orphanedCount > 0
-                  ? `${activeReefs.length} live · ${orphanedCount} pending NOAA`
-                  : 'Actively monitored'}
-              </p>
+              <p className="text-5xl text-white mb-2">{reefStats.total}</p>
+              <p className="text-sm text-gray-light">{activeMonitoringSubLabel}</p>
             </motion.div>
 
             <motion.div
@@ -149,7 +161,7 @@ export function DashboardOverview({ onNavigate }: DashboardOverviewProps) {
                 <AlertTriangle className="w-6 h-6 text-coral-critical" />
                 <span className="text-sm text-gray-muted">Critical Risk</span>
               </div>
-              <p className="text-5xl text-coral-critical mb-2">{statValue(reefStats.critical)}</p>
+              <p className="text-5xl text-coral-critical mb-2">{statusStatValue(reefStats.critical)}</p>
               <p className="text-sm text-gray-light">Urgent attention needed</p>
             </motion.div>
 
@@ -162,7 +174,7 @@ export function DashboardOverview({ onNavigate }: DashboardOverviewProps) {
                 <TrendingUp className="w-6 h-6 text-coral-warning" />
                 <span className="text-sm text-gray-muted">Warning Level</span>
               </div>
-              <p className="text-5xl text-coral-warning mb-2">{statValue(reefStats.warning)}</p>
+              <p className="text-5xl text-coral-warning mb-2">{statusStatValue(reefStats.warning)}</p>
               <p className="text-sm text-gray-light">Elevated stress detected</p>
             </motion.div>
 
@@ -175,7 +187,7 @@ export function DashboardOverview({ onNavigate }: DashboardOverviewProps) {
                 <Droplet className="w-6 h-6 text-coral-safe" />
                 <span className="text-sm text-gray-muted">Healthy Reefs</span>
               </div>
-              <p className="text-5xl text-coral-safe mb-2">{statValue(reefStats.healthy)}</p>
+              <p className="text-5xl text-coral-safe mb-2">{statusStatValue(reefStats.healthy)}</p>
               <p className="text-sm text-gray-light">Normal conditions</p>
             </motion.div>
           </div>

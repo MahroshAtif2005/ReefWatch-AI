@@ -37,12 +37,17 @@ export function ReefDataProvider({ children }: { children: React.ReactNode }) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Persist activeReefIds to localStorage and sync to researcher profile on every change
+  // Persist activeReefIds to localStorage and sync to researcher profile on every change.
+  // localStorage write is synchronous and immediate; backend sync is fire-and-forget.
   useEffect(() => {
     const researcherId = getResearcherId();
-    console.log('[active-reefs:frontend] syncing researcher_id + ids —', `researcher_id=${researcherId.slice(0, 8)}…`, `ids(${activeReefIds.length}):`, activeReefIds);
+    console.log('[active-reefs] backend sync payload count:', activeReefIds.length, activeReefIds);
     saveActiveReefIds(activeReefIds);
-    syncResearcherActiveReefs(researcherId, activeReefIds);
+    syncResearcherActiveReefs(researcherId, activeReefIds).then(() => {
+      console.log('[active-reefs] backend sync confirmed for', activeReefIds.length, 'ids');
+    }).catch(() => {
+      console.warn('[active-reefs] backend sync failed (non-critical, localStorage is source of truth)');
+    });
   }, [activeReefIds]);
 
   const loadReefs = (isBackground = false) => {
@@ -102,16 +107,12 @@ export function ReefDataProvider({ children }: { children: React.ReactNode }) {
     const validIds = new Set(allReefs.map(r => r.id));
     const matched = activeReefIds.filter(id => validIds.has(id));
     const orphaned = activeReefIds.filter(id => !validIds.has(id));
-    console.log(
-      '[active-reefs:frontend] post-load check —',
-      `localStorage ids=${activeReefIds.length}`,
-      `matched=${matched.length}`,
-      `orphaned=${orphaned.length}`,
-      '\nlocalStorageIds:', activeReefIds,
-      '\nmatchedIds:', matched,
-    );
+    console.log('[active-reefs] selected local ids:', activeReefIds.length, activeReefIds);
+    console.log('[active-reefs] matched live ids:', matched.length, matched);
+    console.log('[active-reefs] orphan/pending ids:', orphaned.length, orphaned);
+    console.log('[active-reefs] backend restored count:', matched.length, '(from NOAA data match)');
     if (orphaned.length > 0) {
-      console.warn('[active-reefs:frontend] orphaned IDs (saved but not in current NOAA data — preserved, not deleted):', orphaned);
+      console.warn('[active-reefs] orphaned IDs preserved (not in current NOAA data — kept in localStorage):', orphaned);
     }
   }, [allReefs, activeReefIds]);
 
