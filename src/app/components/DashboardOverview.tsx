@@ -1,9 +1,29 @@
-import { useEffect, useMemo } from 'react';
+import { Component, useEffect, useMemo, type ErrorInfo, type ReactNode } from 'react';
 import { motion } from 'motion/react';
 import { AlertTriangle, TrendingUp, Droplet, Activity, ArrowRight, Loader2, MapPin, RefreshCw, Radio } from 'lucide-react';
 import { type LiveReef } from '../services/reefApi';
 import { useReefData } from '../context/ReefDataContext';
 import { SelfImprovementCard } from './SelfImprovementCard';
+
+class CardErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
+  state = { error: null };
+  static getDerivedStateFromError(error: Error) { return { error }; }
+  componentDidCatch(error: Error, info: ErrorInfo) { console.error('[CardErrorBoundary]', error, info); }
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="rounded-2xl border border-coral-critical/30 bg-coral-critical/5 p-6 text-sm text-coral-critical">
+          <div className="mb-1 flex items-center gap-2 font-semibold">
+            <AlertTriangle className="h-4 w-4" />
+            Self-Improvement card failed to load
+          </div>
+          <p className="text-gray-muted">{(this.state.error as Error).message}</p>
+        </div>
+      );
+    }
+    return this.state.error === null ? this.props.children : null;
+  }
+}
 
 interface DashboardOverviewProps {
   onNavigate: (view: string, reef?: any) => void;
@@ -256,7 +276,7 @@ export function DashboardOverview({ onNavigate }: DashboardOverviewProps) {
           animate={{ opacity: 1, y: 0 }}
           transition={{ delay: 0.08 }}
         >
-          <SelfImprovementCard />
+          <CardErrorBoundary><SelfImprovementCard /></CardErrorBoundary>
         </motion.div>
 
         {/* Critical Alerts Section */}

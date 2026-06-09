@@ -536,14 +536,19 @@ export function SelfImprovementCard() {
   const experimentNarrative = (() => {
     const exp = v2Status?.latest_experiment;
     if (!exp || exp.promoted === null) return null;
+    const version = v2Status?.prompt_version ?? 'v1';
     if (exp.promoted) {
-      return `Candidate prompt outperformed production and was promoted to ${v2Status!.prompt_version}.`;
+      return `Candidate prompt outperformed production and was promoted to ${version}.`;
     }
-    return `Candidate prompt rejected after benchmark evaluation. Production prompt ${v2Status!.prompt_version} retained.`;
+    return `Candidate prompt rejected after benchmark evaluation. Production prompt ${version} retained.`;
   })();
 
+  // Safe local alias — never null when used (hasExperimentResult guards every access).
+  const latestExp = v2Status?.latest_experiment ?? null;
   // Whether a completed experiment result exists (promoted or rejected).
-  const hasExperimentResult = v2Status?.latest_experiment?.promoted !== null && v2Status?.latest_experiment !== null;
+  // Must guard v2Status itself — when null, v2Status?.latest_experiment is
+  // undefined, which is !== null, so the old expression was always true.
+  const hasExperimentResult = v2Status != null && latestExp != null && latestExp.promoted !== null;
 
   const hasPreviousScore = typeof previousScore === 'number';
   const hasBeforeAfter = typeof previousScore === 'number' && typeof latestScore === 'number';
@@ -668,9 +673,9 @@ export function SelfImprovementCard() {
           <div
             className="inline-flex items-center justify-center gap-2 rounded-xl border px-4 py-2 text-sm"
             style={
-              hasExperimentResult && v2Status!.latest_experiment!.promoted
+              hasExperimentResult && latestExp!.promoted
                 ? { borderColor: '#10b981', backgroundColor: 'rgba(16,185,129,0.12)', color: '#10b981' }
-                : hasExperimentResult && !v2Status!.latest_experiment!.promoted
+                : hasExperimentResult && !latestExp!.promoted
                 ? { borderColor: 'rgba(234,179,8,0.4)', backgroundColor: 'rgba(234,179,8,0.1)', color: 'rgb(234,179,8)' }
                 : rewriteStatus === 'confirmed_improved'
                 ? { borderColor: '#10b981', backgroundColor: 'rgba(16,185,129,0.12)', color: '#10b981' }
@@ -681,9 +686,9 @@ export function SelfImprovementCard() {
                 : { borderColor: 'rgba(34,197,94,0.3)', backgroundColor: 'rgba(34,197,94,0.1)', color: 'rgb(34,197,94)' }
             }
           >
-            {hasExperimentResult && v2Status!.latest_experiment!.promoted ? (
+            {hasExperimentResult && latestExp!.promoted ? (
               <Sparkles className="h-4 w-4" />
-            ) : hasExperimentResult && !v2Status!.latest_experiment!.promoted ? (
+            ) : hasExperimentResult && !latestExp!.promoted ? (
               <AlertTriangle className="h-4 w-4" />
             ) : rewriteStatus === 'confirmed_improved' ? (
               <Sparkles className="h-4 w-4" />
@@ -692,9 +697,9 @@ export function SelfImprovementCard() {
             ) : (
               <CheckCircle2 className="h-4 w-4" />
             )}
-            {hasExperimentResult && v2Status!.latest_experiment!.promoted
+            {hasExperimentResult && latestExp!.promoted
               ? 'Candidate promoted'
-              : hasExperimentResult && !v2Status!.latest_experiment!.promoted
+              : hasExperimentResult && !latestExp!.promoted
               ? 'Candidate rejected'
               : rewriteStatus === 'confirmed_improved'
               ? 'Prompt improved'
@@ -998,28 +1003,28 @@ export function SelfImprovementCard() {
                 <div>
                   <p className="text-xs text-gray-muted">Baseline</p>
                   <p className="text-3xl text-white">
-                    {formatPercent(v2Status!.latest_experiment!.baseline_score)}
+                    {formatPercent(latestExp!.baseline_score)}
                   </p>
                 </div>
-                <RefreshCw className={`mb-2 h-5 w-5 ${v2Status!.latest_experiment!.promoted ? 'text-coral-safe' : 'text-coral-warning'}`} />
+                <RefreshCw className={`mb-2 h-5 w-5 ${latestExp!.promoted ? 'text-coral-safe' : 'text-coral-warning'}`} />
                 <div className="text-right">
                   <p className="text-xs text-gray-muted">Candidate</p>
                   <p className={`text-3xl ${
-                    v2Status!.latest_experiment!.delta != null && v2Status!.latest_experiment!.delta > 0
+                    latestExp!.delta != null && latestExp!.delta > 0
                       ? 'text-coral-safe'
                       : 'text-coral-warning'
                   }`}>
-                    {formatPercent(v2Status!.latest_experiment!.candidate_score)}
+                    {formatPercent(latestExp!.candidate_score)}
                   </p>
                 </div>
               </div>
-              <p className={`text-sm font-semibold ${v2Status!.latest_experiment!.promoted ? 'text-coral-safe' : 'text-coral-warning'}`}>
-                {v2Status!.latest_experiment!.promoted
-                  ? `Candidate promoted to ${v2Status!.prompt_version} ✓`
-                  : `Candidate rejected — ${v2Status!.prompt_version} retained`}
+              <p className={`text-sm font-semibold ${latestExp!.promoted ? 'text-coral-safe' : 'text-coral-warning'}`}>
+                {latestExp!.promoted
+                  ? `Candidate promoted to ${(v2Status?.prompt_version ?? 'v1')} ✓`
+                  : `Candidate rejected — ${(v2Status?.prompt_version ?? 'v1')} retained`}
               </p>
-              {v2Status!.latest_experiment!.promotion_reason && (
-                <p className="text-xs text-gray-muted">{v2Status!.latest_experiment!.promotion_reason}</p>
+              {latestExp!.promotion_reason && (
+                <p className="text-xs text-gray-muted">{latestExp!.promotion_reason}</p>
               )}
             </div>
           ) : isSkippedHealthy ? (
