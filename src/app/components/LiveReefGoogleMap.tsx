@@ -4,7 +4,6 @@ import { motion } from 'motion/react';
 import { AlertTriangle, CheckCircle2, Clock, Database, Droplet, Loader2, MapPin, Plus, Radio, Search, X } from 'lucide-react';
 import {
   addStationToActiveMonitoring,
-  fetchMonitoredReefs,
   fetchReefStationReadings,
   fetchReefStations,
   getResearcherId,
@@ -765,51 +764,28 @@ export function LiveReefGoogleMap({ onReefSelect: _onReefSelect, focusTarget }: 
   // Seed allReefs from the context so navigating from the dashboard to the map shows markers
   // immediately — the context already fetched reef data, so we avoid the 1-2 s blank-marker flash.
   // activeReefIds and setActiveReefIds are the single source of truth for monitored reef selections.
-  const { allReefs: contextAllReefs, activeReefIds, setActiveReefIds, hydrationStatus } = useReefData();
+  const { allReefs: contextAllReefs, activeReefIds, setActiveReefIds, hydrationStatus, error: reefError } = useReefData();
   const [allReefs, setAllReefs] = useState<LiveReef[]>(contextAllReefs);
   const selectedIds = useMemo(() => new Set(activeReefIds), [activeReefIds]);
   const [isAddPanelOpen, setIsAddPanelOpen] = useState(false);
   const [stations, setStations] = useState<Array<ReefStation | ReefStationReading>>([]);
   const [selectedReef, setSelectedReef] = useState<LiveReef | null>(null);
   const [selectedStation, setSelectedStation] = useState<ReefStation | ReefStationReading | null>(null);
-  // If context already has reefs, skip the initial loading spinner — data is ready immediately.
-  const [isLoadingReefs, setIsLoadingReefs] = useState(contextAllReefs.length === 0);
   const [isLoadingStations, setIsLoadingStations] = useState(true);
-  const [reefError, setReefError] = useState<string | null>(null);
   const [stationError, setStationError] = useState<string | null>(null);
   const [monitoringError, setMonitoringError] = useState<string | null>(null);
   const [monitoringToast, setMonitoringToast] = useState<string | null>(null);
   const [isAddingMonitoring, setIsAddingMonitoring] = useState(false);
   const [timeRange, setTimeRange] = useState<TimeRangeMode>('live');
 
+  // Sync map's local allReefs from the shared context so there's no duplicate API call.
+  // Context already fetches /api/monitored-reefs on mount and every 5 minutes.
+  // Keep local state so optimistic add/remove mutations still work immediately.
   useEffect(() => {
-    let isMounted = true;
-
-    async function loadReefs() {
-      try {
-        const liveReefs = await fetchMonitoredReefs();
-
-        if (isMounted) {
-          setAllReefs(liveReefs);
-          setReefError(null);
-        }
-      } catch (error) {
-        if (isMounted) {
-          setReefError('Active reef data is unavailable from the deployed ReefWatch backend.');
-        }
-      } finally {
-        if (isMounted) {
-          setIsLoadingReefs(false);
-        }
-      }
+    if (contextAllReefs.length > 0) {
+      setAllReefs(contextAllReefs);
     }
-
-    loadReefs();
-
-    return () => {
-      isMounted = false;
-    };
-  }, []);
+  }, [contextAllReefs]);
 
   useEffect(() => {
     let isMounted = true;

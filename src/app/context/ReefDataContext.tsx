@@ -35,19 +35,27 @@ export function ReefDataProvider({ children }: { children: React.ReactNode }) {
   const isFetchingRef = useRef(false);
   const pendingRefetchRef = useRef(false);
   const orphanLoggedRef = useRef(false);
+  const hydrateStartRef = useRef(performance.now());
+  const hasSyncedOnMountRef = useRef(false);
 
   // Log initial IDs loaded from localStorage once on mount
   useEffect(() => {
-    console.log('[active-reefs:frontend] localStorage ids on mount:', activeReefIds);
+    const t0 = Math.round(performance.now() - hydrateStartRef.current);
+    console.log(`[hydration] t0=+${t0}ms localStorage read → ${activeReefIds.length} ids`, activeReefIds);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Persist activeReefIds to localStorage and sync to researcher profile on every change.
-  // localStorage write is synchronous and immediate; backend sync is fire-and-forget.
+  // Persist activeReefIds to localStorage on every change, and sync to the researcher profile
+  // on user-driven changes. Skip the very first fire (mount) — the backend is already hydrated
+  // from GCS on startup, and sending the unchanged localStorage value is pure noise.
   useEffect(() => {
+    saveActiveReefIds(activeReefIds);
+    if (!hasSyncedOnMountRef.current) {
+      hasSyncedOnMountRef.current = true;
+      return;
+    }
     const researcherId = getResearcherId();
     console.log('[active-reefs] backend sync payload count:', activeReefIds.length, activeReefIds);
-    saveActiveReefIds(activeReefIds);
     syncResearcherActiveReefs(researcherId, activeReefIds).then(() => {
       console.log('[active-reefs] backend sync confirmed for', activeReefIds.length, 'ids');
     }).catch(() => {
@@ -64,14 +72,16 @@ export function ReefDataProvider({ children }: { children: React.ReactNode }) {
     if (!isBackground) setIsLoading(true);
 
     const fetchStart = performance.now();
-    console.log('[reefwatch] fetching /api/monitored-reefs…');
+    const t1 = Math.round(fetchStart - hydrateStartRef.current);
+    if (!isBackground) console.log(`[hydration] t1=+${t1}ms → fetching /api/monitored-reefs`);
 
     fetchMonitoredReefs()
       .then((data) => {
         const elapsed = Math.round(performance.now() - fetchStart);
+        const t2 = Math.round(performance.now() - hydrateStartRef.current);
         setAllReefs(data);
         setError(null);
-        console.log(`[reefwatch] loaded ${data.length} reefs in ${elapsed}ms`);
+        if (!isBackground) console.log(`[hydration] t2=+${t2}ms NOAA fetch complete (${elapsed}ms RTT) → ${data.length} reefs`);
       })
       .catch((err: unknown) => {
         const elapsed = Math.round(performance.now() - fetchStart);
@@ -107,6 +117,7 @@ export function ReefDataProvider({ children }: { children: React.ReactNode }) {
   // mark hydration ready so the UI doesn't stay in "loading" forever.
   useEffect(() => {
     if (!isLoading && allReefs.length === 0) {
+      console.log(`[hydration] ready=+${Math.round(performance.now() - hydrateStartRef.current)}ms (fallback — API error or empty response)`);
       setHydrationStatus('ready');
     }
   }, [isLoading, allReefs.length]);
@@ -123,6 +134,8 @@ export function ReefDataProvider({ children }: { children: React.ReactNode }) {
     const matched = activeReefIds.filter(id => validIds.has(id));
     const orphaned = activeReefIds.filter(id => !validIds.has(id));
 
+    const t3 = Math.round(performance.now() - hydrateStartRef.current);
+    console.log(`[hydration] t3=+${t3}ms orphan check → saved=${activeReefIds.length} matched=${matched.length} orphaned=${orphaned.length}`);
     // Structured diagnostic report visible in DevTools
     console.log(
       `[active-reefs]\nsaved=${activeReefIds.length}\nmatched=${matched.length}\nunmatched=${orphaned.length}\nexample_unmatched=${JSON.stringify(orphaned.slice(0, 3))}\nsource=localStorage`,
@@ -133,6 +146,7 @@ export function ReefDataProvider({ children }: { children: React.ReactNode }) {
     console.log('[active-reefs] backend restored count:', matched.length, '(from NOAA data match)');
 
     if (orphaned.length === 0) {
+      console.log(`[hydration] ready=+${Math.round(performance.now() - hydrateStartRef.current)}ms (no orphans)`);
       setHydrationStatus('ready');
       return;
     }
@@ -146,6 +160,7 @@ export function ReefDataProvider({ children }: { children: React.ReactNode }) {
     const recoverable = orphaned.filter(id => catalog[id]);
 
     if (recoverable.length === 0) {
+      console.log(`[hydration] ready=+${Math.round(performance.now() - hydrateStartRef.current)}ms (orphans not in catalog — unrecoverable)`);
       setHydrationStatus('ready');
       return;
     }
@@ -180,6 +195,7 @@ export function ReefDataProvider({ children }: { children: React.ReactNode }) {
     }).catch(err => {
       console.warn('[active-reefs] auto-recovery failed (will retry on next load):', (err as Error).message ?? err);
     }).finally(() => {
+      console.log(`[hydration] ready=+${Math.round(performance.now() - hydrateStartRef.current)}ms (recovery complete)`);
       setHydrationStatus('ready');
     });
   }, [allReefs, activeReefIds]);
