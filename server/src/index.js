@@ -14,6 +14,7 @@ import { refreshStationsOnStartupIfEmpty, startStationRefresh } from './services
 import { startStationEnrichment } from './services/stationEnrichmentService.js';
 import { hydrateEnrichedCacheFromDb } from './services/stationService.js';
 import { getActiveMonitoredReefs } from './db/database.js';
+import { getStoredActiveReefs } from './services/monitoringService.js';
 
 const app = express();
 const port = process.env.PORT || 4000;
@@ -35,6 +36,22 @@ app.use(express.json());
 
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true, service: 'reefwatch-ai-server' });
+});
+
+// Returns all actively monitored reefs with their latest NOAA + AI data.
+app.get('/api/monitored-reefs', (_req, res, next) => {
+  try {
+    res.json(getStoredActiveReefs());
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Acknowledges the frontend's active-reef ID sync.  A future enhancement could
+// use this payload to re-seed the DB after a Cloud Run restart.
+app.put('/api/researcher/active-reefs', (_req, res) => {
+  const { reef_ids } = _req.body || {};
+  res.json({ success: true, synced: Array.isArray(reef_ids) ? reef_ids.length : 0 });
 });
 
 app.use('/api/reefs', reefRoutes);

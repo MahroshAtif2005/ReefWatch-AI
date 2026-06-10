@@ -15,6 +15,7 @@ import {
   type ReefStationReading,
 } from '../services/reefApi';
 import { useReefData } from '../context/ReefDataContext';
+import { removeStationFromCatalog, saveStationToCatalog } from '../utils/storage';
 import type { SearchNavigationTarget } from './Header';
 
 interface LiveReefGoogleMapProps {
@@ -953,6 +954,7 @@ export function LiveReefGoogleMap({ onReefSelect: _onReefSelect, focusTarget }: 
     // Custom stations added via "Monitor Reef" need to be removed from the backend too
     if (willRemove && reef.isCustomMonitored) {
       setAllReefs((current) => current.filter((r) => r.id !== reef.id));
+      removeStationFromCatalog(reef.id);
       removeFromActiveMonitoring(reef.id, getResearcherId()).catch(() => {/* non-fatal */});
     }
   }
@@ -1016,6 +1018,14 @@ export function LiveReefGoogleMap({ onReefSelect: _onReefSelect, focusTarget }: 
         monitoredReef,
       ]);
       setActiveReefIds((prev) => [...prev.filter((id) => id !== optimisticId), monitoredReef.id]);
+      // Persist metadata so the context can re-register this station after a backend DB wipe
+      saveStationToCatalog({
+        id: monitoredReef.id,
+        name: monitoredReef.name,
+        lat: monitoredReef.lat,
+        lng: monitoredReef.lng,
+        stationId: monitoredReef.stationId,
+      });
       setSelectedReef(monitoredReef);
       setMonitoringToast(`${monitoredReef.name} is now under active AI monitoring`);
       window.setTimeout(() => setMonitoringToast(null), 4200);

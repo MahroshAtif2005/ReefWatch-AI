@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useRef, useState } from 'react';
-import { fetchMonitoredReefs, fetchReefStations, getResearcherId, syncResearcherActiveReefs, type LiveReef } from '../services/reefApi';
-import { getActiveReefIds, isStorageAvailable, saveActiveReefIds } from '../utils/storage';
+import { addStationToActiveMonitoring, fetchMonitoredReefs, fetchReefStations, getResearcherId, syncResearcherActiveReefs, type LiveReef } from '../services/reefApi';
+import { getActiveReefIds, getStationCatalog, isStorageAvailable, removeStationFromCatalog, saveActiveReefIds, saveStationToCatalog } from '../utils/storage';
 export { ACTIVE_IDS_KEY } from '../utils/storage';
 
 const REFRESH_INTERVAL_MS = 5 * 60 * 1000;
@@ -98,8 +98,9 @@ export function ReefDataProvider({ children }: { children: React.ReactNode }) {
 
   const activeReefs = allReefs.filter((reef) => activeReefIds.includes(reef.id));
 
-  // After allReefs loads: log matched vs. orphaned IDs — but NEVER delete orphaned IDs.
-  // Orphaned IDs are preserved so the user's full selection survives NOAA data gaps.
+  // After allReefs loads: log matched vs. orphaned IDs, auto-recover custom stations
+  // from the local catalog if the backend DB was wiped (Cloud Run restart/deploy).
+  // Orphaned IDs are NEVER deleted — they persist until resolved.
   useEffect(() => {
     if (allReefs.length === 0 || orphanLoggedRef.current) return;
     orphanLoggedRef.current = true;
@@ -107,13 +108,57 @@ export function ReefDataProvider({ children }: { children: React.ReactNode }) {
     const validIds = new Set(allReefs.map(r => r.id));
     const matched = activeReefIds.filter(id => validIds.has(id));
     const orphaned = activeReefIds.filter(id => !validIds.has(id));
+
+    // Structured diagnostic report visible in DevTools
+    console.log(
+      `[active-reefs]\nsaved=${activeReefIds.length}\nmatched=${matched.length}\nunmatched=${orphaned.length}\nexample_unmatched=${JSON.stringify(orphaned.slice(0, 3))}\nsource=localStorage`,
+    );
     console.log('[active-reefs] selected local ids:', activeReefIds.length, activeReefIds);
     console.log('[active-reefs] matched live ids:', matched.length, matched);
     console.log('[active-reefs] orphan/pending ids:', orphaned.length, orphaned);
     console.log('[active-reefs] backend restored count:', matched.length, '(from NOAA data match)');
-    if (orphaned.length > 0) {
-      console.warn('[active-reefs] orphaned IDs preserved (not in current NOAA data — kept in localStorage):', orphaned);
-    }
+
+    if (orphaned.length === 0) return;
+
+    console.warn('[active-reefs] orphaned IDs preserved (not in current NOAA data — kept in localStorage):', orphaned);
+
+    // Auto-recover any orphaned IDs that have catalog metadata (custom-monitored stations).
+    // This handles the case where Cloud Run's ephemeral SQLite DB was wiped — we re-register
+    // the station with the backend so it appears in the next API response.
+    const catalog = getStationCatalog();
+    const recoverable = orphaned.filter(id => catalog[id]);
+
+    if (recoverable.length === 0) return;
+
+    console.log('[active-reefs] auto-recovering', recoverable.length, 'custom station(s) from local catalog');
+
+    Promise.all(
+      recoverable.map(id => {
+        const meta = catalog[id];
+        return addStationToActiveMonitoring({
+          station_id: meta.stationId,
+          name: meta.name,
+          lat: meta.lat,
+          lng: meta.lng,
+        }).then(recovered => {
+          // Backend should produce the same deterministic ID, but handle divergence gracefully
+          if (recovered.id !== id) {
+            setActiveReefIdsState(prev => [...prev.filter(x => x !== id), recovered.id]);
+            saveStationToCatalog({ ...meta, id: recovered.id });
+            removeStationFromCatalog(id);
+          }
+          return recovered;
+        });
+      }),
+    ).then(recoveredReefs => {
+      setAllReefs(prev => {
+        const existingIds = new Set(prev.map(r => r.id));
+        return [...prev, ...recoveredReefs.filter(r => !existingIds.has(r.id))];
+      });
+      console.log('[active-reefs] auto-recovery complete:', recoveredReefs.length, 'station(s) restored to backend');
+    }).catch(err => {
+      console.warn('[active-reefs] auto-recovery failed (will retry on next load):', (err as Error).message ?? err);
+    });
   }, [allReefs, activeReefIds]);
 
   // Log whenever allReefs or activeReefIds change so ID mismatches are visible in DevTools
