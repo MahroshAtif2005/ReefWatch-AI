@@ -5,6 +5,8 @@ export { ACTIVE_IDS_KEY } from '../utils/storage';
 
 const REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 
+export type HydrationStatus = 'loading' | 'restoring' | 'ready';
+
 interface ReefDataContextValue {
   allReefs: LiveReef[];
   activeReefs: LiveReef[];
@@ -14,6 +16,8 @@ interface ReefDataContextValue {
   reefs: LiveReef[];          // alias for allReefs — backwards compat
   totalStationCount: number;
   isLoading: boolean;
+  /** loading → waiting for first API response; restoring → re-registering orphaned stations; ready → all done */
+  hydrationStatus: HydrationStatus;
   error: string | null;
   refetch: () => void;
 }
@@ -26,6 +30,7 @@ export function ReefDataProvider({ children }: { children: React.ReactNode }) {
   const [storageAvailable] = useState(isStorageAvailable);
   const [totalStationCount, setTotalStationCount] = useState(0);
   const [isLoading, setIsLoading] = useState(true);
+  const [hydrationStatus, setHydrationStatus] = useState<HydrationStatus>('loading');
   const [error, setError] = useState<string | null>(null);
   const isFetchingRef = useRef(false);
   const pendingRefetchRef = useRef(false);
@@ -98,8 +103,17 @@ export function ReefDataProvider({ children }: { children: React.ReactNode }) {
 
   const activeReefs = allReefs.filter((reef) => activeReefIds.includes(reef.id));
 
+  // Fallback: if loading finishes but allReefs is still empty (API error or no reefs),
+  // mark hydration ready so the UI doesn't stay in "loading" forever.
+  useEffect(() => {
+    if (!isLoading && allReefs.length === 0) {
+      setHydrationStatus('ready');
+    }
+  }, [isLoading, allReefs.length]);
+
   // After allReefs loads: log matched vs. orphaned IDs, auto-recover custom stations
   // from the local catalog if the backend DB was wiped (Cloud Run restart/deploy).
+  // Drives hydrationStatus: loading → restoring → ready (or loading → ready if no orphans).
   // Orphaned IDs are NEVER deleted — they persist until resolved.
   useEffect(() => {
     if (allReefs.length === 0 || orphanLoggedRef.current) return;
@@ -118,7 +132,10 @@ export function ReefDataProvider({ children }: { children: React.ReactNode }) {
     console.log('[active-reefs] orphan/pending ids:', orphaned.length, orphaned);
     console.log('[active-reefs] backend restored count:', matched.length, '(from NOAA data match)');
 
-    if (orphaned.length === 0) return;
+    if (orphaned.length === 0) {
+      setHydrationStatus('ready');
+      return;
+    }
 
     console.warn('[active-reefs] orphaned IDs preserved (not in current NOAA data — kept in localStorage):', orphaned);
 
@@ -128,8 +145,12 @@ export function ReefDataProvider({ children }: { children: React.ReactNode }) {
     const catalog = getStationCatalog();
     const recoverable = orphaned.filter(id => catalog[id]);
 
-    if (recoverable.length === 0) return;
+    if (recoverable.length === 0) {
+      setHydrationStatus('ready');
+      return;
+    }
 
+    setHydrationStatus('restoring');
     console.log('[active-reefs] auto-recovering', recoverable.length, 'custom station(s) from local catalog');
 
     Promise.all(
@@ -158,6 +179,8 @@ export function ReefDataProvider({ children }: { children: React.ReactNode }) {
       console.log('[active-reefs] auto-recovery complete:', recoveredReefs.length, 'station(s) restored to backend');
     }).catch(err => {
       console.warn('[active-reefs] auto-recovery failed (will retry on next load):', (err as Error).message ?? err);
+    }).finally(() => {
+      setHydrationStatus('ready');
     });
   }, [allReefs, activeReefIds]);
 
@@ -188,6 +211,7 @@ export function ReefDataProvider({ children }: { children: React.ReactNode }) {
       reefs: allReefs,
       totalStationCount,
       isLoading,
+      hydrationStatus,
       error,
       refetch: () => loadReefs(),
     }}>

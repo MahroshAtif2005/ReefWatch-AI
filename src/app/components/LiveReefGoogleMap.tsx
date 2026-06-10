@@ -342,12 +342,14 @@ function TimeRangeControl({
 
 function MapOverlays({
   activeCount,
+  isRestoring,
   readingCount,
   stationCount,
   timeRange,
   onTimeRangeChange,
 }: {
   activeCount: number;
+  isRestoring: boolean;
   readingCount: number;
   stationCount: number;
   timeRange: TimeRangeMode;
@@ -396,7 +398,10 @@ function MapOverlays({
         className="reef-panel-strong absolute bottom-8 left-1/2 z-10 flex -translate-x-1/2 items-center gap-3 rounded-full border border-cyan-glow/35 bg-ocean-dark/78 px-5 py-3 text-sm text-gray-light shadow-2xl backdrop-blur-2xl"
       >
         <Radio className="h-4 w-4 text-cyan-glow" />
-        <span><span className="text-white">{timeRangeLabels[timeRange]}</span> · <span className="text-white">{stationCount}</span> visible NOAA reef locations · <span className="text-white">{activeCount}</span> selected reefs monitored</span>
+        {isRestoring
+          ? <span>Restoring <span className="text-white">{activeCount}</span> selected reef{activeCount !== 1 ? 's' : ''}…</span>
+          : <span><span className="text-white">{timeRangeLabels[timeRange]}</span> · <span className="text-white">{stationCount}</span> visible NOAA reef locations · <span className="text-white">{activeCount}</span> selected reefs monitored</span>
+        }
       </motion.div>
     </>
   );
@@ -760,7 +765,7 @@ export function LiveReefGoogleMap({ onReefSelect: _onReefSelect, focusTarget }: 
   // Seed allReefs from the context so navigating from the dashboard to the map shows markers
   // immediately — the context already fetched reef data, so we avoid the 1-2 s blank-marker flash.
   // activeReefIds and setActiveReefIds are the single source of truth for monitored reef selections.
-  const { allReefs: contextAllReefs, activeReefIds, setActiveReefIds } = useReefData();
+  const { allReefs: contextAllReefs, activeReefIds, setActiveReefIds, hydrationStatus } = useReefData();
   const [allReefs, setAllReefs] = useState<LiveReef[]>(contextAllReefs);
   const selectedIds = useMemo(() => new Set(activeReefIds), [activeReefIds]);
   const [isAddPanelOpen, setIsAddPanelOpen] = useState(false);
@@ -1160,7 +1165,8 @@ export function LiveReefGoogleMap({ onReefSelect: _onReefSelect, focusTarget }: 
         Add Reef
       </motion.button>
       <MapOverlays
-        activeCount={displayedReefs.length}
+        activeCount={hydrationStatus !== 'ready' ? activeReefIds.length : displayedReefs.length}
+        isRestoring={hydrationStatus !== 'ready' && activeReefIds.length > 0}
         readingCount={readingCount}
         stationCount={stations.length + displayedReefs.length}
         timeRange={timeRange}

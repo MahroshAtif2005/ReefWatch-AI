@@ -66,7 +66,7 @@ const toNavigationReef = (reef: LiveReef) => ({
 });
 
 export function DashboardOverview({ onNavigate }: DashboardOverviewProps) {
-  const { allReefs, activeReefs, activeReefIds, storageAvailable, totalStationCount, isLoading: isLoadingReefs, error: reefError, refetch } = useReefData();
+  const { allReefs, activeReefs, activeReefIds, storageAvailable, totalStationCount, isLoading: isLoadingReefs, hydrationStatus, error: reefError, refetch } = useReefData();
 
   // total = full user selection (including reefs not yet matched to NOAA data).
   // critical/warning/healthy are derived only from matched reefs that have live status.
@@ -85,30 +85,28 @@ export function DashboardOverview({ onNavigate }: DashboardOverviewProps) {
       .slice(0, 3);
   }, [allReefs]);
 
-  // dataReady: NOAA data has finished loading (or returned at least one reef).
-  // Used only for critical/warning/healthy counts which depend on live NOAA status.
-  // The total selection count (activeReefIds) is always available immediately from localStorage.
-  const dataReady = !isLoadingReefs || allReefs.length > 0;
-  // Only the status-derived stats (critical/warning/healthy) need to wait for NOAA data.
-  const statusStatValue = (value: number): number | string => dataReady ? value : '...';
+  const isReady = hydrationStatus === 'ready';
 
-  // IDs that exist in localStorage but couldn't be matched to any reef returned by the backend.
-  // Only meaningful after data has loaded. During loading: all selected IDs are "pending".
-  const orphanedCount = dataReady
+  // Only the status-derived stats (critical/warning/healthy) need to wait for hydration to complete.
+  const statusStatValue = (value: number): number | string => isReady ? value : '...';
+
+  // Orphaned IDs are only meaningful once hydration is complete — during restoring/loading the
+  // recovery process may still resolve them.
+  const orphanedCount = isReady
     ? activeReefIds.filter(id => !allReefs.find(r => r.id === id)).length
     : 0;
-  // During loading, selected IDs count as pending until NOAA data arrives.
-  const pendingCount = !dataReady ? activeReefIds.length : orphanedCount;
-  const liveCount = !dataReady ? 0 : activeReefs.length;
+  const liveCount = isReady ? activeReefs.length : 0;
 
-  // Sub-label for the Active Monitoring card — shows detailed breakdown as soon as possible.
-  const activeMonitoringSubLabel = !dataReady && activeReefIds.length > 0
+  // Sub-label for the Active Monitoring card.
+  const activeMonitoringSubLabel = activeReefIds.length === 0
+    ? 'No reefs selected'
+    : hydrationStatus === 'restoring'
+    ? 'Restoring monitored reefs…'
+    : hydrationStatus === 'loading'
     ? 'Loading live NOAA status…'
-    : pendingCount > 0
-    ? `${liveCount} live · ${pendingCount} pending NOAA`
-    : activeReefIds.length > 0
-    ? 'Actively monitored'
-    : 'No reefs selected';
+    : orphanedCount > 0
+    ? `${liveCount} live · ${orphanedCount} pending NOAA`
+    : 'Actively monitored';
 
   // Debug logs at dashboard level
   useEffect(() => {
@@ -119,13 +117,14 @@ export function DashboardOverview({ onNavigate }: DashboardOverviewProps) {
   }, []);
 
   useEffect(() => {
-    if (dataReady) {
+    if (isReady) {
       const matched = activeReefs.map(r => r.id);
       const orphaned = activeReefIds.filter(id => !allReefs.find(r => r.id === id));
       console.log('[active-reefs] matched live ids:', matched.length, matched);
       console.log('[active-reefs] orphan/pending ids:', orphaned.length, orphaned);
     }
-  }, [dataReady]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isReady]);
 
   return (
     <div className="h-full overflow-auto">
@@ -205,9 +204,9 @@ export function DashboardOverview({ onNavigate }: DashboardOverviewProps) {
             </div>
           )}
 
-          {/* Loading banner — only shown when reefs are selected and data is still in flight.
+          {/* Loading/restoring banner — shown while hydration is in progress (loading or restoring).
                Never shown when activeReefIds is empty — there's nothing to load yet. */}
-          {!dataReady && activeReefIds.length > 0 && (
+          {!isReady && activeReefIds.length > 0 && (
             <motion.div
               initial={{ opacity: 0, y: 10 }}
               animate={{ opacity: 1, y: 0 }}
@@ -215,13 +214,17 @@ export function DashboardOverview({ onNavigate }: DashboardOverviewProps) {
               className="mt-8 flex items-center gap-4 rounded-2xl border border-cyan-glow/25 bg-ocean-medium/60 p-6"
             >
               <Loader2 className="h-5 w-5 shrink-0 animate-spin text-cyan-glow" />
-              <span className="text-sm text-gray-light">Loading reef data…</span>
+              <span className="text-sm text-gray-light">
+                {hydrationStatus === 'restoring'
+                  ? 'Restoring monitored reefs with the backend…'
+                  : 'Loading live NOAA reef data…'}
+              </span>
             </motion.div>
           )}
 
-          {/* Orphaned IDs warning — shown when some saved reef IDs couldn't be matched after loading.
-               IDs are preserved in storage; this is display-only, never a deletion. */}
-          {dataReady && orphanedCount > 0 && (
+          {/* Orphaned IDs warning — only shown after hydration completes and some IDs still
+               couldn't be matched. IDs are preserved in storage; display-only, never deleted. */}
+          {isReady && orphanedCount > 0 && (
             <motion.div
               initial={{ opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}
