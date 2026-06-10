@@ -98,7 +98,7 @@ multi-instance scale without data layer changes.|
 ## Live Runtime Verification
 
 These are real API responses from the live Cloud Run deployment, 
-captured June 9th 2026, confirming all three required technologies 
+captured June 10th 2026, confirming all three required technologies 
 are invoked at runtime — not mocked, not simulated.
 
 ---
@@ -133,15 +133,32 @@ are invoked at runtime — not mocked, not simulated.
 }
 ```
 
+**ADK Agent + Phoenix MCP — Confirmed Tool Invocation:**
+```json
+{
+  "response": "Here are the last 5 inference traces from the ReefWatch 
+  AI, retrieved from Phoenix. Timestamp: 2026-06-10T02:03:29 — 
+  Duration: 37.20 seconds. Input: coral reef AI assessments scored on 
+  7 dimensions. Output: accuracy 90, specificity 95, actionability 90, 
+  scientific_reliability 90...",
+  "session_id": "adk-1781096006256",
+  "agent": "reefwatch_agent",
+  "model": "gemini-2.5-flash",
+  "latency_ms": 4860.45,
+  "tools_called": ["query_phoenix_traces"]
+}
+```
+
 **What this proves:**
 - ✅ `"agent": "reefwatch_agent"` — Google Cloud ADK running in production
 - ✅ `"model": "gemini-2.5-flash"` — Gemini invoked at runtime, not a wrapper
-- ✅ Trace IDs with timestamps of `2026-06-09T07:28:xx` — real Phoenix 
+- ✅ Trace IDs with timestamps of `2026-06-10T02:03:xx` — real Phoenix 
   production traces retrieved live via MCP, not cached or mocked
-- ✅ Deployed at https://project-9b3e2672-8819-4fa5-afe.web.app/
+- ✅ `"tools_called": ["query_phoenix_traces"]` — Phoenix MCP genuinely 
+  invoked as a runtime tool call, not a background process
+- ✅ Deployed at https://project-9b3e2672-8819-4fa5-afe.web.app
 - ✅ All three required technologies verified in production: 
   Gemini, Google Cloud ADK, and Phoenix MCP
-
 ## How The Agent Works
 
 ReefWatch AI operates as a true multi-step autonomous agent:
