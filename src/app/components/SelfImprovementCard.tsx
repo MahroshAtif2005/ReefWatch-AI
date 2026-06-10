@@ -845,7 +845,7 @@ export function SelfImprovementCard() {
                   Production prompt {v2Status.prompt_version} active
                 </p>
               ) : v2Status.latest_experiment.promotion_reason ? (
-                <p className="text-xs text-gray-muted truncate" title={v2Status.latest_experiment.promotion_reason}>
+                <p className="text-xs text-gray-muted break-words">
                   {v2Status.latest_experiment.promotion_reason}
                 </p>
               ) : (
