@@ -7713,9 +7713,13 @@ async def adk_agent_query(request: ADKAgentRequest) -> Dict[str, Any]:
             session_id=session_id,
             new_message=message,
         ):
-            # Collect tool call names for observability
-            if hasattr(event, "tool_call") and event.tool_call:
-                tool_calls_made.append(getattr(event.tool_call, "name", "unknown"))
+            # Collect tool call names — function calls live in content.parts, not event.tool_call
+            if event.content and event.content.parts:
+                for part in event.content.parts:
+                    if hasattr(part, "function_call") and part.function_call:
+                        name = getattr(part.function_call, "name", None)
+                        if name and name not in tool_calls_made:
+                            tool_calls_made.append(name)
             # Capture final text response
             if hasattr(event, "is_final_response") and event.is_final_response():
                 if event.content and event.content.parts:
