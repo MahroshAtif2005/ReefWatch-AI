@@ -209,6 +209,7 @@ const SLOW_NOTICE_MS = 90_000;
 
 const LS_LAST_SCORES_KEY = 'reefwatch_last_scores';
 const LS_LAST_RUN_TS_KEY = 'reefwatch_si_last_run_ts';
+const LS_V2_STATUS_KEY = 'reefwatch_v2_status';
 const COOLDOWN_MS = 30 * 60 * 1000;
 
 function loadStoredRun(): SelfImprovementRun | null {
@@ -221,6 +222,18 @@ function loadStoredRun(): SelfImprovementRun | null {
 
 function saveRunToStorage(run: SelfImprovementRun) {
   try { localStorage.setItem(LS_LAST_SCORES_KEY, JSON.stringify(run)); } catch {}
+}
+
+function loadStoredV2Status(): SelfImprovementV2Status | null {
+  try {
+    const raw = localStorage.getItem(LS_V2_STATUS_KEY);
+    if (raw) return JSON.parse(raw) as SelfImprovementV2Status;
+  } catch {}
+  return null;
+}
+
+function saveV2StatusToStorage(v2: SelfImprovementV2Status) {
+  try { localStorage.setItem(LS_V2_STATUS_KEY, JSON.stringify(v2)); } catch {}
 }
 
 function cooldownRemaining(): number {
@@ -241,9 +254,9 @@ export function SelfImprovementCard() {
   const [run, setRun] = useState<SelfImprovementRun | null>(() => loadStoredRun());
   const [isShowingCachedData, setIsShowingCachedData] = useState(() => !!loadStoredRun());
   const [history, setHistory] = useState<SelfImprovementHistory | null>(null);
-  const [v2Status, setV2Status] = useState<SelfImprovementV2Status | null>(null);
+  const [v2Status, setV2Status] = useState<SelfImprovementV2Status | null>(() => loadStoredV2Status());
   const [costTelemetry, setCostTelemetry] = useState<CostTelemetry | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
+  const [isLoading, setIsLoading] = useState(() => !loadStoredRun());
   const [isRunning, setIsRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -253,7 +266,7 @@ export function SelfImprovementCard() {
   const refresh = () => {
     let isMounted = true;
     let retryScheduled = false;
-    setIsLoading(true);
+    if (!loadStoredRun()) setIsLoading(true);
 
     const doFetch = () => Promise.all([
       fetchLatestSelfImprovementRun().catch((err: unknown) => {
@@ -270,7 +283,7 @@ export function SelfImprovementCard() {
 
     doFetch().then(([latestRun, hist, v2, cost]) => {
       if (!isMounted) return;
-      if (v2) setV2Status(v2);
+      if (v2) { setV2Status(v2); saveV2StatusToStorage(v2); }
       if (cost) setCostTelemetry(cost);
       const hasScores = latestRun && (
         typeof latestRun.average_score === 'number' ||
@@ -295,7 +308,7 @@ export function SelfImprovementCard() {
               if (typeof retryRun!.average_score === 'number') saveRunToStorage(retryRun!);
               setIsShowingCachedData(false);
             }
-            if (retryV2) setV2Status(retryV2);
+            if (retryV2) { setV2Status(retryV2); saveV2StatusToStorage(retryV2); }
             if (retryCost) setCostTelemetry(retryCost);
             setHistory(retryHist);
             setError(null);
