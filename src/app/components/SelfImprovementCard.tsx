@@ -1234,6 +1234,25 @@ export function SelfImprovementCard() {
               const isPromptRewrite = Boolean(check.prompt_updated) && !isSkipped;
               const score = typeof check.average_score === 'number' ? check.average_score : null;
 
+              // Build a clean label from structured dimension data instead of truncating the summary string.
+              const dimEntries: [string, number | null][] = [
+                ['Scientific Reliability', check.scientific_reliability ?? null],
+                ['Uncertainty Communication', check.uncertainty_communication ?? null],
+                ['DHW Interpretation', check.dhw_interpretation ?? check.dhw_interpretation_accuracy ?? null],
+                ['Hallucination Avoidance', check.hallucination_avoidance ?? null],
+              ];
+              const scoredDims = dimEntries
+                .filter((e): e is [string, number] => e[1] !== null)
+                .sort((a, b) => a[1] - b[1])
+                .slice(0, 2);
+              const evalRowLabel = isSkipped
+                ? (check.skip_reason ?? 'quality above target — evaluation skipped')
+                : scoredDims.length > 0
+                ? `Lowest scoring dimensions: ${scoredDims.map(([n, s]) => `${n} (${formatPercent(s)})`).join(', ')}.`
+                : score !== null
+                ? 'Evaluation completed.'
+                : st;
+
               // Human-readable run type label
               const runTypeLabel = isSkipped
                 ? 'skipped healthy'
@@ -1271,9 +1290,7 @@ export function SelfImprovementCard() {
                     {runTypeLabel}
                   </span>
                   <span className={`flex-1 truncate text-xs ${isSkipped ? 'text-gray-muted' : scoreBadge(score)}`}>
-                    {isSkipped
-                      ? (check.skip_reason ?? 'quality above target — evaluation skipped')
-                      : check.summary?.slice(0, 60) || st}
+                    {evalRowLabel}
                   </span>
                   <span className={`w-12 shrink-0 text-right font-mono text-sm ${scoreBadge(score)}`}>
                     {score !== null ? formatPercent(score) : '—'}
