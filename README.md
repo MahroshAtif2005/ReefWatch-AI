@@ -9,6 +9,7 @@
 [![Cloud Run](https://img.shields.io/badge/Deployed-Google%20Cloud%20Run-orange)](https://cloud.google.com/run)
 
 **Live demo:** https://project-9b3e2672-8819-4fa5-afe.web.app
+!! Note: The live agent is currently paused to keep hosting costs down, so the demo shows the interface rather than live NOAA data. Screenshots of the agent running, along with Arize Phoenix traces, are below. Happy to redeploy it on request.
 
 ---
 
