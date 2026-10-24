@@ -288,9 +288,7 @@ This ensures every change the system makes to itself is fully traceable.
 
 ---
 
-## Judging Criteria Alignment (Arize Track)
-
-| Criterion | How ReefWatch AI Addresses It |
+|           |                             |
 |-----------|------------------------------|
 | **Gemini Agent** | Built with Google Cloud ADK — official ADK Agent class registered in Agent Platform Registry. Researcher Workspace routes through ADK natively. Multi-step reasoning, autonomous alerting, 24/7 operation |
 | **Phoenix Observability** | 3,392+ traces, LLM latency tracked, token usage visible, input/output logged, cache hit rate monitored |
